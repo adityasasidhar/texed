@@ -1,0 +1,20 @@
+[package]
+name = "texed"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aditya Sasidhar telikicherlaadityasasidhar@gmail.com"]
+description = "A CLI tool to convert LaTeX documents to Markdown"
+license = "MIT"
+repository = "https://github.com/adityasasidhar/texed"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.10"
+thiserror = "1.0"
+anyhow = "1.0"
+chrono = "0.4"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.10"
