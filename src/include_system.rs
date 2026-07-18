@@ -126,7 +126,7 @@ impl IncludeSystem {
 
         // Read file content
         let content = fs::read_to_string(&resolved_path)
-            .map_err(|e| TexedError::InputFileError(e))?;
+            .map_err(TexedError::InputFileError)?;
 
         // Cache file content
         state.file_contents.insert(path_str, content.clone());
@@ -203,7 +203,7 @@ impl IncludeSystem {
 
                 // Read package content
                 let content = fs::read_to_string(&path)
-                    .map_err(|e| TexedError::InputFileError(e))?;
+                    .map_err(TexedError::InputFileError)?;
 
                 // Cache package content
                 state.file_contents.insert(path_str, content.clone());

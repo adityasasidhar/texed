@@ -36,6 +36,9 @@ pub struct ParserState {
     /// Theorem-like environment definitions
     pub theorem_envs: HashMap<String, TheoremEnvDef>,
 
+    /// User-defined environments (\newenvironment)
+    pub environments: HashMap<String, EnvironmentDef>,
+
     /// Theorem-like counters
     pub theorem_counters: HashMap<String, usize>,
     
@@ -62,9 +65,12 @@ pub struct ParserState {
     
     /// Bibliography entries
     pub bibliography: Vec<String>,
-    
+
     /// Citation style
     pub citation_style: CitationStyle,
+
+    /// Conversion diagnostics (unknown commands, unresolved refs, ...)
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +107,15 @@ pub struct TheoremEnvDef {
     pub within: Option<String>,
 }
 
+/// User-defined environment from \newenvironment{name}[n]{begin}{end}
+#[derive(Debug, Clone)]
+pub struct EnvironmentDef {
+    pub num_params: usize,
+    pub optional_param: Option<String>,
+    pub begin_def: String,
+    pub end_def: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CitationStyle {
     Numeric,
@@ -122,6 +137,7 @@ impl ParserState {
             current_section_number: String::new(),
             macros: HashMap::new(),
             theorem_envs: default_theorem_envs(),
+            environments: HashMap::new(),
             theorem_counters: HashMap::new(),
             toggles: HashMap::new(),
             file_contents: HashMap::new(),
@@ -132,7 +148,12 @@ impl ParserState {
             metadata: HashMap::new(),
             bibliography: Vec::new(),
             citation_style: CitationStyle::Numeric,
+            warnings: Vec::new(),
         }
+    }
+
+    pub fn warn(&mut self, message: String) {
+        self.warnings.push(message);
     }
 
     pub fn increment_section(&mut self, level: usize) {

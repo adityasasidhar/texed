@@ -18,7 +18,7 @@ fn test_version_command() {
     cmd.arg("--version");
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains("0.2.0"));
 }
 
 #[test]
@@ -440,6 +440,188 @@ fn test_providecommand_does_not_override_existing_macro() {
     let output = fs::read_to_string(&output_file).unwrap();
     assert!(output.contains("Alice"));
     assert!(!output.contains("Bob"));
+}
+
+#[test]
+fn test_author_year_citation_style() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    let output_file = temp_dir.path().join("output.md");
+    let bib_file = temp_dir.path().join("refs.bib");
+
+    let latex = r#"
+As \citet{knuth84} showed, typesetting is hard \citep{lamport94}.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+"#;
+
+    // Single-line entries exercise the character-level BibTeX parser
+    let bibtex = concat!(
+        "@book{knuth84, author = {Donald E. Knuth}, title = {The {TeX}book}, publisher = {Addison-Wesley}, year = {1984} }\n",
+        "@book{lamport94, author = {Leslie Lamport}, title = {LaTeX}, publisher = {Addison-Wesley}, year = {1994} }\n",
+    );
+
+    fs::write(&input_file, latex).unwrap();
+    fs::write(&bib_file, bibtex).unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("-o").arg(&output_file);
+    cmd.assert().success();
+
+    let output = fs::read_to_string(&output_file).unwrap();
+    assert!(output.contains("Knuth (1984)"), "got: {}", output);
+    assert!(output.contains("(Lamport, 1994)"), "got: {}", output);
+    assert!(output.contains("## References"), "got: {}", output);
+    assert!(output.contains("The TeXbook"), "got: {}", output);
+}
+
+#[test]
+fn test_batch_conversion_writes_sibling_md_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let a = temp_dir.path().join("a.tex");
+    let b = temp_dir.path().join("b.tex");
+    fs::write(&a, "\\section{Alpha}").unwrap();
+    fs::write(&b, "\\section{Beta}").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&a).arg(&b);
+    cmd.assert().success();
+
+    let out_a = fs::read_to_string(temp_dir.path().join("a.md")).unwrap();
+    let out_b = fs::read_to_string(temp_dir.path().join("b.md")).unwrap();
+    assert!(out_a.contains("## Alpha"));
+    assert!(out_b.contains("## Beta"));
+}
+
+#[test]
+fn test_batch_conversion_into_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let a = temp_dir.path().join("a.tex");
+    let b = temp_dir.path().join("b.tex");
+    let out_dir = temp_dir.path().join("out");
+    fs::write(&a, "one").unwrap();
+    fs::write(&b, "two").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&a).arg(&b).arg("-o").arg(&out_dir);
+    cmd.assert().success();
+
+    assert!(out_dir.join("a.md").exists());
+    assert!(out_dir.join("b.md").exists());
+}
+
+#[test]
+fn test_batch_continues_past_failures_and_exits_nonzero() {
+    let temp_dir = TempDir::new().unwrap();
+    let good = temp_dir.path().join("good.tex");
+    let missing = temp_dir.path().join("missing.tex");
+    fs::write(&good, "fine").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&good).arg(&missing);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("1 of 2 file(s) failed"));
+
+    // The good file still converted
+    assert!(temp_dir.path().join("good.md").exists());
+}
+
+#[test]
+fn test_check_mode_reports_warnings_and_exits_nonzero() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    fs::write(&input_file, "Uses \\weirdcmd here. See \\ref{sec:nowhere}.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("--check");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown command `\\weirdcmd`"))
+        .stderr(predicate::str::contains("unresolved reference"));
+
+    // --check must not write output
+    assert!(!temp_dir.path().join("input.md").exists());
+}
+
+#[test]
+fn test_check_mode_clean_file_exits_zero() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    fs::write(&input_file, "\\section{Clean}\nJust \\textbf{fine} text.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("--check");
+    cmd.assert().success();
+}
+
+#[test]
+fn test_strict_mode_fails_on_warnings() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    let output_file = temp_dir.path().join("output.md");
+    fs::write(&input_file, "Uses \\weirdcmd here.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("-o").arg(&output_file).arg("--strict");
+    cmd.assert().failure();
+
+    // Output is still written (strict fails the run, not the conversion)
+    assert!(output_file.exists());
+}
+
+#[test]
+fn test_no_frontmatter_flag() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    fs::write(&input_file, "\\title{My Doc}\nBody text.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("--no-frontmatter");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Body text."))
+        .stdout(predicate::str::contains("---").not());
+}
+
+#[test]
+fn test_quiet_suppresses_warnings() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    fs::write(&input_file, "Uses \\weirdcmd here.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("--quiet");
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("warning").not());
+}
+
+#[test]
+fn test_stats_flag_prints_statistics() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    let output_file = temp_dir.path().join("output.md");
+    fs::write(&input_file, "\\section{One}\nText with $x$ math.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("-o").arg(&output_file).arg("--stats");
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("headings"))
+        .stderr(predicate::str::contains("time"));
+}
+
+#[test]
+fn test_completions_generation() {
+    for shell in ["bash", "zsh", "fish"] {
+        let mut cmd = Command::cargo_bin("texed").unwrap();
+        cmd.arg("--completions").arg(shell);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("texed"));
+    }
 }
 
 #[test]

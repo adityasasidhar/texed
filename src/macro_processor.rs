@@ -19,18 +19,14 @@ impl MacroProcessor {
     }
 
     fn register_builtins(&mut self) {
-        // Common LaTeX macros
+        // Common LaTeX macros. Layout commands (\par, \newline, \smallskip, ...)
+        // are intentionally NOT defined here: the parser gives them structural
+        // meaning, which text substitution would destroy.
         self.define_builtin("LaTeX", 0, "LaTeX");
         self.define_builtin("TeX", 0, "TeX");
-        self.define_builtin("newline", 0, "\n");
-        self.define_builtin("noindent", 0, "");
-        self.define_builtin("par", 0, "\n\n");
-        
-        // Spacing
-        self.define_builtin("smallskip", 0, "\n");
-        self.define_builtin("medskip", 0, "\n\n");
-        self.define_builtin("bigskip", 0, "\n\n\n");
-        
+        self.define_builtin("LaTeXe", 0, "LaTeX2e");
+        self.define_builtin("BibTeX", 0, "BibTeX");
+
         // Common abbreviations
         self.define_builtin("ie", 0, "i.e.");
         self.define_builtin("eg", 0, "e.g.");
@@ -271,7 +267,7 @@ impl MacroProcessor {
                 let mut arg = String::new();
                 let mut depth = 1;
                 
-                while let Some(ch) = chars.next() {
+                for ch in chars.by_ref() {
                     consumed += 1;
                     match ch {
                         '[' => {

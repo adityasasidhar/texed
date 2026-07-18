@@ -10,10 +10,15 @@ mod macro_processor;
 mod parser;
 mod state;
 
-use anyhow::Result;
 use cli::Cli;
+use std::io::IsTerminal;
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse_args();
-    cli.run()
+    if let Err(error) = cli.run() {
+        let red = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        let prefix = if red { "\x1b[1;31merror:\x1b[0m" } else { "error:" };
+        eprintln!("{} {:#}", prefix, error);
+        std::process::exit(1);
+    }
 }

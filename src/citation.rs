@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::state::{CitationStyle, ParserState};
+use crate::state::CitationStyle;
 use std::collections::HashMap;
 
 /// Citation and bibliography management system
@@ -55,6 +55,14 @@ impl CitationManager {
     /// Add a bibliography entry
     pub fn add_entry(&mut self, entry: BibEntry) {
         self.bibliography.insert(entry.key.clone(), entry);
+    }
+
+    pub fn has_entries(&self) -> bool {
+        !self.bibliography.is_empty()
+    }
+
+    pub fn has_entry(&self, key: &str) -> bool {
+        self.bibliography.contains_key(key)
     }
 
     /// Parse a .bib file content
@@ -138,11 +146,15 @@ impl CitationManager {
             .iter()
             .map(|key| {
                 if let Some(entry) = self.bibliography.get(key) {
-                    let author = entry.fields.get("author").map(|s| s.as_str()).unwrap_or(key);
+                    let author = entry
+                        .fields
+                        .get("author")
+                        .map(|names| short_author_names(names))
+                        .unwrap_or_else(|| key.clone());
                     let year = entry.fields.get("year").map(|s| s.as_str()).unwrap_or("n.d.");
-                    
+
                     match mode {
-                        CitationMode::Author => author.to_string(),
+                        CitationMode::Author => author,
                         CitationMode::Year => year.to_string(),
                         CitationMode::YearPar => format!("({})", year),
                         CitationMode::Textual => format!("{} ({})", author, year),
@@ -162,7 +174,7 @@ impl CitationManager {
                 let mut result = String::from("(");
                 if let Some(pre) = prenote {
                     result.push_str(pre);
-                    result.push_str("; ");
+                    result.push(' ');
                 }
                 result.push_str(&citation_text);
                 if let Some(post) = postnote {
@@ -221,7 +233,12 @@ impl CitationManager {
     }
 
     fn format_full_citation(&self, entry: &BibEntry) -> String {
-        let author = entry.fields.get("author").map(|s| s.as_str()).unwrap_or("");
+        let author = entry
+            .fields
+            .get("author")
+            .map(|names| format_author_list(names))
+            .unwrap_or_default();
+        let author = author.as_str();
         let title = entry.fields.get("title").map(|s| s.as_str()).unwrap_or("");
         let year = entry.fields.get("year").map(|s| s.as_str()).unwrap_or("");
 
@@ -240,20 +257,41 @@ impl CitationManager {
 
     /// Generate bibliography in Markdown format
     pub fn generate_bibliography(&self) -> String {
-        let mut entries: Vec<_> = self.bibliography.values().collect();
-        entries.sort_by_key(|e| &e.key);
-
         let mut result = String::from("## References\n\n");
 
         match self.style {
             CitationStyle::Numeric => {
-                for entry in entries {
-                    if let Some(&num) = self.citation_numbers.get(&entry.key) {
-                        result.push_str(&format!("[{}] {}\n\n", num, self.format_full_citation(entry)));
-                    }
+                // Only cited entries appear, in citation-number order
+                let mut cited: Vec<_> = self
+                    .bibliography
+                    .values()
+                    .filter_map(|entry| {
+                        self.citation_numbers
+                            .get(&entry.key)
+                            .map(|&num| (num, entry))
+                    })
+                    .collect();
+                cited.sort_by_key(|(num, _)| *num);
+                for (num, entry) in cited {
+                    result.push_str(&format!(
+                        "[{}] {}\n\n",
+                        num,
+                        self.format_full_citation(entry)
+                    ));
                 }
             }
             CitationStyle::AuthorYear | CitationStyle::Note => {
+                let mut entries: Vec<_> = self.bibliography.values().collect();
+                entries.sort_by_key(|entry| {
+                    (
+                        entry
+                            .fields
+                            .get("author")
+                            .map(|author| surname(author.split(" and ").next().unwrap_or(author)))
+                            .unwrap_or_else(|| entry.key.clone()),
+                        entry.fields.get("year").cloned().unwrap_or_default(),
+                    )
+                });
                 for entry in entries {
                     result.push_str(&format!("- {}\n\n", self.format_full_citation(entry)));
                 }
@@ -264,81 +302,203 @@ impl CitationManager {
     }
 }
 
-/// Parse BibTeX content
+/// Render a BibTeX author field ("A and B and C") as a readable list
+/// ("A, B, and C"), normalizing "Last, First" to "First Last".
+fn format_author_list(field: &str) -> String {
+    let authors: Vec<String> = field
+        .split(" and ")
+        .map(|name| {
+            let name = name.trim();
+            if let Some((last, first)) = name.split_once(',') {
+                format!("{} {}", first.trim(), last.trim())
+            } else {
+                name.to_string()
+            }
+        })
+        .collect();
+    match authors.len() {
+        0 => String::new(),
+        1 => authors[0].clone(),
+        2 => format!("{} and {}", authors[0], authors[1]),
+        _ => format!(
+            "{}, and {}",
+            authors[..authors.len() - 1].join(", "),
+            authors[authors.len() - 1]
+        ),
+    }
+}
+
+/// Reduce a BibTeX author field to citation-style surnames:
+/// one author "Knuth", two "Knuth and Lamport", three+ "Knuth et al."
+fn short_author_names(field: &str) -> String {
+    let authors: Vec<&str> = field.split(" and ").map(str::trim).collect();
+    let surnames: Vec<String> = authors.iter().map(|name| surname(name)).collect();
+    match surnames.len() {
+        0 => String::new(),
+        1 => surnames[0].clone(),
+        2 => format!("{} and {}", surnames[0], surnames[1]),
+        _ => format!("{} et al.", surnames[0]),
+    }
+}
+
+/// Extract the surname from "First Last" or "Last, First" BibTeX name forms.
+fn surname(name: &str) -> String {
+    if let Some((last, _)) = name.split_once(',') {
+        last.trim().to_string()
+    } else {
+        name.split_whitespace()
+            .last()
+            .unwrap_or(name)
+            .to_string()
+    }
+}
+
+/// Parse BibTeX content. Character-level parser: handles single-line and
+/// multi-line entries, nested braces in values ({The {LaTeX} Companion}),
+/// quoted and bare values, and @comment/@preamble/@string blocks.
 fn parse_bibtex(content: &str) -> Result<Vec<BibEntry>> {
+    let chars: Vec<char> = content.chars().collect();
     let mut entries = Vec::new();
-    let mut current_entry: Option<BibEntry> = None;
-    let mut in_entry = false;
-    let mut brace_depth = 0;
+    let mut i = 0;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
+    while i < chars.len() {
+        if chars[i] != '@' {
+            i += 1;
+            continue;
+        }
+        i += 1;
 
-        if trimmed.starts_with('@') {
-            // Start of new entry
-            if let Some(entry) = current_entry.take() {
-                entries.push(entry);
-            }
+        // Entry type
+        let start = i;
+        while i < chars.len() && chars[i].is_alphabetic() {
+            i += 1;
+        }
+        let entry_type: String = chars[start..i].iter().collect::<String>().to_lowercase();
 
-            let parts: Vec<&str> = trimmed[1..].splitn(2, '{').collect();
-            if parts.len() == 2 {
-                let entry_type = parts[0].trim().to_lowercase();
-                let key = parts[1].trim_end_matches(',').trim().to_string();
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() || (chars[i] != '{' && chars[i] != '(') {
+            continue;
+        }
+        let close = if chars[i] == '{' { '}' } else { ')' };
+        i += 1;
 
-                current_entry = Some(BibEntry {
-                    entry_type,
-                    key,
-                    fields: HashMap::new(),
-                });
-                in_entry = true;
-                brace_depth = 1;
-            }
-        } else if in_entry {
-            // Count braces
-            for ch in trimmed.chars() {
-                match ch {
-                    '{' => brace_depth += 1,
-                    '}' => {
-                        brace_depth -= 1;
-                        if brace_depth == 0 {
-                            in_entry = false;
-                            if let Some(entry) = current_entry.take() {
-                                entries.push(entry);
-                            }
-                            break;
-                        }
-                    }
+        // Non-entry blocks: skip to the matching close delimiter
+        if matches!(entry_type.as_str(), "comment" | "preamble" | "string") {
+            let mut depth = 1;
+            while i < chars.len() && depth > 0 {
+                match chars[i] {
+                    '{' => depth += 1,
+                    '}' if close == '}' => depth -= 1,
+                    ')' if close == ')' => depth -= 1,
                     _ => {}
                 }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Citation key (up to first comma)
+        let start = i;
+        while i < chars.len() && chars[i] != ',' && chars[i] != close {
+            i += 1;
+        }
+        let key = chars[start..i].iter().collect::<String>().trim().to_string();
+
+        let mut fields = HashMap::new();
+
+        // Fields: name = value pairs separated by commas
+        while i < chars.len() && chars[i] != close {
+            if chars[i] == ',' || chars[i].is_whitespace() {
+                i += 1;
+                continue;
             }
 
-            // Parse field
-            if in_entry && trimmed.contains('=') {
-                let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
-                if parts.len() == 2 {
-                    let field_name = parts[0].trim().to_lowercase();
-                    let field_value = parts[1]
-                        .trim()
-                        .trim_end_matches(',')
-                        .trim_matches('{')
-                        .trim_matches('}')
-                        .trim_matches('"')
-                        .to_string();
+            let start = i;
+            while i < chars.len() && chars[i] != '=' && chars[i] != close {
+                i += 1;
+            }
+            if i >= chars.len() || chars[i] == close {
+                break;
+            }
+            let name: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_lowercase();
+            i += 1; // consume '='
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
 
-                    if let Some(ref mut entry) = current_entry {
-                        entry.fields.insert(field_name, field_value);
+            let mut value = String::new();
+            if i < chars.len() && chars[i] == '{' {
+                let mut depth = 1;
+                i += 1;
+                while i < chars.len() && depth > 0 {
+                    match chars[i] {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        ch => value.push(ch),
                     }
+                    i += 1;
+                }
+            } else if i < chars.len() && chars[i] == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    value.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    i += 1;
+                }
+            } else {
+                while i < chars.len() && chars[i] != ',' && chars[i] != close {
+                    value.push(chars[i]);
+                    i += 1;
                 }
             }
+
+            if !name.is_empty() {
+                fields.insert(name, normalize_bib_value(&value));
+            }
+        }
+        if i < chars.len() {
+            i += 1; // consume the closing delimiter
+        }
+
+        if !key.is_empty() {
+            entries.push(BibEntry {
+                entry_type,
+                key,
+                fields,
+            });
         }
     }
 
-    // Add last entry if exists
-    if let Some(entry) = current_entry {
-        entries.push(entry);
-    }
-
     Ok(entries)
+}
+
+/// Clean a raw BibTeX field value for Markdown output: collapse whitespace,
+/// resolve TeX ties/dashes/escapes.
+fn normalize_bib_value(value: &str) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+        .replace('~', "\u{00A0}")
+        .replace("---", "\u{2014}")
+        .replace("--", "\u{2013}")
+        .replace("\\&", "&")
+        .replace("\\%", "%")
+        .replace("\\_", "_")
+        .replace("\\$", "$")
+        .replace("\\#", "#")
 }
 
 /// Parse citation command arguments

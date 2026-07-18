@@ -21,8 +21,12 @@ pub enum Token {
     RightBracket,                 // ]
     
     // Math mode
-    InlineMath(String),           // $...$
+    InlineMath(String),           // $...$ or \(...\)
     DisplayMath(String),          // $$...$$ or \[...\]
+
+    // Verbatim
+    Verb(String),                 // \verb|...| / \lstinline|...|
+    VerbatimEnv { name: String, content: String }, // verbatim/lstlisting/minted captured raw
     
     // Special characters
     Ampersand,                    // & (table separator)
@@ -180,11 +184,54 @@ impl Lexer {
             return Ok(Some(Token::Text(String::from("\\]"))));
         }
 
+        // \( ... \) inline math
+        if ch == '(' {
+            self.advance();
+            let content = self.read_until_sequence("\\)");
+            return Ok(Some(Token::InlineMath(content)));
+        }
+        if ch == ')' {
+            self.advance();
+            return Ok(None);
+        }
+
+        // Escaped literal characters: \% \$ \& \# \_ \{ \}
+        if matches!(ch, '%' | '$' | '&' | '#' | '_' | '{' | '}') {
+            self.advance();
+            return Ok(Some(Token::Text(ch.to_string())));
+        }
+
+        // Accent and spacing control symbols: emitted as single-char commands,
+        // resolved by the parser (\' \` \^ \" \~ \= \. accents; \, \; \: \! spacing)
+        if matches!(ch, '\'' | '`' | '^' | '"' | '~' | '=' | '.' | ',' | ';' | ':' | '!') {
+            self.advance();
+            return Ok(Some(Token::Command(ch.to_string())));
+        }
+
+        // Explicit interword space: "\ " or backslash before line end
+        if ch == ' ' || ch == '\t' || ch == '\n' {
+            self.advance();
+            return Ok(Some(Token::Whitespace(String::from(" "))));
+        }
+
+        // Discretionary hyphen \-, italic correction \/, spacing factor \@: no output
+        if matches!(ch, '-' | '/' | '@' | '*') {
+            self.advance();
+            return Ok(None);
+        }
+
         // Lex command name
         let cmd_name = self.lex_command_name();
 
         if cmd_name.is_empty() {
-            return Ok(Some(Token::Text(String::from("\\"))));
+            // Unknown control symbol: keep the symbol itself as text
+            self.advance();
+            return Ok(Some(Token::Text(ch.to_string())));
+        }
+
+        // \verb|...| and friends capture raw content with arbitrary delimiters
+        if cmd_name == "verb" || cmd_name == "lstinline" || cmd_name == "Verb" {
+            return self.lex_verb();
         }
 
         // Handle specific commands
@@ -193,7 +240,9 @@ impl Lexer {
             "end" => self.lex_end_environment(),
             "item" => Ok(Some(Token::Item)),
             "label" => self.lex_label(),
-            "ref" | "eqref" | "autoref" | "nameref" | "pageref" => self.lex_ref(&cmd_name),
+            "ref" | "eqref" | "autoref" | "nameref" | "pageref" | "cref" | "Cref" | "vref" => {
+                self.lex_ref(&cmd_name)
+            }
             "cite" | "citep" | "citet" | "citealt" | "citealp" | "citeauthor" | "citeyear"
             | "citeyearpar" | "autocite" | "textcite" | "parencite" | "footcite" => {
                 self.lex_cite(&cmd_name)
@@ -202,10 +251,37 @@ impl Lexer {
             "subsection" => self.lex_section(2),
             "subsubsection" => self.lex_section(3),
             "chapter" => self.lex_section(0),
+            "part" => self.lex_section(0),
             "paragraph" => self.lex_section(4),
             "subparagraph" => self.lex_section(5),
             _ => Ok(Some(Token::Command(cmd_name))),
         }
+    }
+
+    fn lex_verb(&mut self) -> Result<Option<Token>> {
+        // Optional star variant (\verb*)
+        if !self.is_at_end() && self.current_char() == '*' {
+            self.advance();
+        }
+
+        if self.is_at_end() {
+            return Ok(Some(Token::Command(String::from("verb"))));
+        }
+
+        let delim = self.current_char();
+        self.advance();
+        let close = if delim == '{' { '}' } else { delim };
+
+        let mut content = String::new();
+        while !self.is_at_end() && self.current_char() != close {
+            content.push(self.current_char());
+            self.advance();
+        }
+        if !self.is_at_end() {
+            self.advance(); // consume closing delimiter
+        }
+
+        Ok(Some(Token::Verb(content)))
     }
 
     fn lex_command_name(&mut self) -> String {
@@ -226,19 +302,30 @@ impl Lexer {
 
     fn lex_begin_environment(&mut self) -> Result<Option<Token>> {
         // Don't skip whitespace - let it be tokenized separately
-        
+
         if self.is_at_end() || self.current_char() != '{' {
             return Ok(Some(Token::Command(String::from("begin"))));
         }
 
         self.advance(); // consume '{'
         let env_name = self.read_until('}');
-        
+
         if self.is_at_end() || self.current_char() != '}' {
             return Err(TexedError::UnbalancedBraces);
         }
-        
+
         self.advance(); // consume '}'
+
+        // Verbatim-like environments capture their body raw so that %, $, \ etc.
+        // inside code are not interpreted as LaTeX.
+        if is_verbatim_environment(&env_name) {
+            let content = self.read_until_sequence(&format!("\\end{{{}}}", env_name));
+            return Ok(Some(Token::VerbatimEnv {
+                name: env_name,
+                content,
+            }));
+        }
+
         Ok(Some(Token::BeginEnvironment(env_name)))
     }
 
@@ -261,8 +348,15 @@ impl Lexer {
     }
 
     fn lex_section(&mut self, level: u8) -> Result<Option<Token>> {
-        // Don't skip whitespace initially - let it be tokenized separately
-        
+        // Starred variant (\section*) — unnumbered, same heading
+        if !self.is_at_end() && self.current_char() == '*' {
+            self.advance();
+        }
+
+        if self.is_at_end() {
+            return Ok(Some(Token::Command(String::from("section"))));
+        }
+
         // Handle optional argument [short title]
         if self.current_char() == '[' {
             self.advance();
@@ -273,19 +367,51 @@ impl Lexer {
             self.skip_whitespace();
         }
 
-        // Read section title
-        if self.current_char() != '{' {
+        // Read section title (brace-aware: titles may contain nested groups)
+        if self.is_at_end() || self.current_char() != '{' {
             return Ok(Some(Token::Command(String::from("section"))));
         }
 
         self.advance(); // consume '{'
-        let title = self.read_until('}');
-        
-        if !self.is_at_end() && self.current_char() == '}' {
+        let title = self.read_balanced_braces_content();
+
+        Ok(Some(Token::Section(level, title)))
+    }
+
+    /// Read content up to the matching closing brace, assuming the opening
+    /// brace has already been consumed. Handles nesting and escaped braces.
+    fn read_balanced_braces_content(&mut self) -> String {
+        let mut content = String::new();
+        let mut depth: usize = 1;
+
+        while !self.is_at_end() {
+            let ch = self.current_char();
+
+            if ch == '\\' {
+                content.push(ch);
+                self.advance();
+                if !self.is_at_end() {
+                    content.push(self.current_char());
+                    self.advance();
+                }
+                continue;
+            }
+
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    self.advance();
+                    break;
+                }
+            }
+
+            content.push(ch);
             self.advance();
         }
 
-        Ok(Some(Token::Section(level, title)))
+        content
     }
 
     fn lex_label(&mut self) -> Result<Option<Token>> {
@@ -432,6 +558,24 @@ impl Lexer {
     fn lex_comment(&mut self) -> Result<Option<Token>> {
         self.advance(); // consume '%'
         let comment = self.read_until('\n');
+
+        // In TeX, % consumes the line terminator too, joining the lines.
+        // But keep the newline when a blank line follows, so paragraph
+        // breaks around full-line comments are preserved.
+        if !self.is_at_end() && self.current_char() == '\n' {
+            let mut lookahead = self.position + 1;
+            while lookahead < self.input.len()
+                && matches!(self.input[lookahead], ' ' | '\t' | '\r')
+            {
+                lookahead += 1;
+            }
+            let blank_line_follows =
+                lookahead >= self.input.len() || self.input[lookahead] == '\n';
+            if !blank_line_follows {
+                self.advance();
+            }
+        }
+
         Ok(Some(Token::Comment(comment)))
     }
 
@@ -475,9 +619,9 @@ impl Lexer {
         while !self.is_at_end() {
             let ch = self.current_char();
 
-            if ch == '\\' || ch == '{' || ch == '}' || ch == '[' || ch == ']' 
-                || ch == '$' || ch == '%' || ch == '&' || ch == '~' || ch == '\n' 
-                || ch == ' ' || ch == '\t' || ch == '\r' {
+            if ch == '\\' || ch == '{' || ch == '}' || ch == '[' || ch == ']'
+                || ch == '$' || ch == '%' || ch == '&' || ch == '~' || ch == '\n'
+                || ch == ' ' || ch == '\t' || ch == '\r' || ch == '\'' || ch == '`' {
                 break;
             }
 
@@ -488,6 +632,10 @@ impl Lexer {
         if text.is_empty() {
             Ok(None)
         } else {
+            // TeX ligatures: --- em dash, -- en dash
+            if text.contains("--") {
+                text = text.replace("---", "\u{2014}").replace("--", "\u{2013}");
+            }
             Ok(Some(Token::Text(text)))
         }
     }
@@ -567,6 +715,24 @@ impl Lexer {
     fn is_at_end(&self) -> bool {
         self.position >= self.input.len()
     }
+}
+
+/// Environments whose body must be captured raw at lex time so LaTeX special
+/// characters inside them (%, $, &, \, ...) are not interpreted.
+pub fn is_verbatim_environment(name: &str) -> bool {
+    matches!(
+        name,
+        "verbatim"
+            | "verbatim*"
+            | "Verbatim"
+            | "BVerbatim"
+            | "lstlisting"
+            | "minted"
+            | "alltt"
+            | "comment"
+            | "filecontents"
+            | "filecontents*"
+    )
 }
 
 #[cfg(test)]

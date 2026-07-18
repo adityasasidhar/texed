@@ -4,25 +4,48 @@ use std::fmt::Write;
 
 pub struct MarkdownConverter {
     output: String,
-    list_depth: usize,
     in_table: bool,
+    frontmatter: bool,
 }
 
 impl MarkdownConverter {
     pub fn new() -> Self {
         Self {
             output: String::new(),
-            list_depth: 0,
             in_table: false,
+            frontmatter: true,
         }
+    }
+
+    /// Disable the YAML frontmatter block (title/author/date metadata).
+    pub fn with_frontmatter(mut self, enabled: bool) -> Self {
+        self.frontmatter = enabled;
+        self
+    }
+
+    /// Render a slice of inlines to a standalone Markdown string.
+    /// Used by the parser for footnote texts, metadata values, etc.
+    pub fn render_inlines_fragment(inlines: &[Inline]) -> String {
+        let mut converter = Self::new();
+        let _ = converter.convert_inlines(inlines);
+        converter.output.trim().to_string()
     }
 
     pub fn convert(&mut self, document: Document) -> Result<String> {
         // Add metadata as YAML frontmatter if present
-        if !document.metadata.is_empty() {
+        if self.frontmatter && !document.metadata.is_empty() {
             self.output.push_str("---\n");
-            for (key, value) in &document.metadata {
-                writeln!(self.output, "{}: {}", key, value).unwrap();
+            // Stable, reader-friendly key order
+            let mut keys: Vec<&String> = document.metadata.keys().collect();
+            keys.sort_by_key(|key| match key.as_str() {
+                "title" => (0, key.as_str()),
+                "author" => (1, key.as_str()),
+                "date" => (2, key.as_str()),
+                other => (3, other),
+            });
+            for key in keys {
+                let value = &document.metadata[key];
+                writeln!(self.output, "{}: {}", key, yaml_scalar(value)).unwrap();
             }
             self.output.push_str("---\n\n");
         }
@@ -31,12 +54,14 @@ impl MarkdownConverter {
         for block in document.blocks {
             self.convert_block(&block)?;
         }
-        
+
         // Add footnotes at the end if any exist
         if !document.footnotes.is_empty() {
             self.output.push_str("\n---\n\n");
-            for (num, text) in &document.footnotes {
-                writeln!(self.output, "[^{}]: {}", num, text).unwrap();
+            let mut numbers: Vec<&usize> = document.footnotes.keys().collect();
+            numbers.sort();
+            for num in numbers {
+                writeln!(self.output, "[^{}]: {}", num, document.footnotes[num]).unwrap();
             }
         }
 
@@ -121,16 +146,17 @@ impl MarkdownConverter {
     }
 
     fn convert_section(&mut self, level: u8, title: &[Inline], label: Option<&str>) -> Result<()> {
-        // Convert level to markdown heading level (1-6)
-        // LaTeX \section is level 1, should map to # (md_level 1)
-        let md_level = level.min(6);
+        // H1 is reserved for the document title (\maketitle / \chapter / \part),
+        // so \section (level 1) maps to ##, \subsection to ###, and so on.
+        let md_level = (level + 1).min(6);
 
         for _ in 0..md_level {
             self.output.push('#');
         }
         self.output.push(' ');
 
-        self.convert_inlines(title)?;
+        let heading = self.render_inlines_trimmed(title)?;
+        self.output.push_str(&heading);
 
         if let Some(label) = label {
             write!(self.output, " {{#{}}}", label).unwrap();
@@ -154,76 +180,67 @@ impl MarkdownConverter {
     }
 
     fn convert_bullet_list(&mut self, items: &[Vec<Block>]) -> Result<()> {
-        self.list_depth += 1;
-
         for item in items {
-            let indent = "  ".repeat(self.list_depth - 1);
-            self.output.push_str(&indent);
-            self.output.push_str("- ");
-
-            // Convert item blocks inline
-            for (i, block) in item.iter().enumerate() {
-                if i > 0 {
-                    // Add proper indentation for continuation
-                    self.output.push_str(&indent);
-                    self.output.push_str("  ");
-                }
-                
-                match block {
-                    Block::Paragraph(inlines) => {
-                        let text = self.render_inlines_trimmed(inlines)?;
-                        self.output.push_str(&text);
-                    }
-                    _ => {
-                        self.convert_block(block)?;
-                    }
-                }
-            }
-            
-            self.output.push('\n');
+            self.convert_list_item("- ", item)?;
         }
-
-        self.list_depth -= 1;
         self.output.push('\n');
         Ok(())
     }
 
     fn convert_ordered_list(&mut self, start: usize, items: &[Vec<Block>]) -> Result<()> {
-        self.list_depth += 1;
-
         for (i, item) in items.iter().enumerate() {
-            let indent = "  ".repeat(self.list_depth - 1);
-            self.output.push_str(&indent);
-            write!(self.output, "{}. ", start + i).unwrap();
+            let marker = format!("{}. ", start + i);
+            self.convert_list_item(&marker, item)?;
+        }
+        self.output.push('\n');
+        Ok(())
+    }
 
-            // Convert item blocks
-            let saved_output = self.output.clone();
-            self.output.clear();
+    /// Render one list item: first line after the marker, continuation lines
+    /// (further paragraphs, nested lists, code blocks) indented to align.
+    fn convert_list_item(&mut self, marker: &str, blocks: &[Block]) -> Result<()> {
+        let saved_output = std::mem::take(&mut self.output);
 
-            for block in item {
-                self.convert_block(block)?;
-            }
-
-            let item_content = self.output.trim_end().to_string();
-            self.output = saved_output;
-
-            // Handle multi-line items
-            let lines: Vec<&str> = item_content.lines().collect();
-            if let Some(first) = lines.first() {
-                self.output.push_str(first);
-                self.output.push('\n');
-
-                for line in lines.iter().skip(1) {
-                    self.output.push_str(&indent);
-                    self.output.push_str("   ");
-                    self.output.push_str(line);
-                    self.output.push('\n');
+        for (i, block) in blocks.iter().enumerate() {
+            // A nested list directly after the item text stays tight
+            if i > 0
+                && matches!(block, Block::BulletList(_) | Block::OrderedList { .. })
+                && matches!(blocks[i - 1], Block::Paragraph(_))
+            {
+                while self.output.ends_with('\n') {
+                    self.output.pop();
                 }
+                self.output.push('\n');
             }
+            self.convert_block(block)?;
         }
 
-        self.list_depth -= 1;
-        self.output.push('\n');
+        let item_content = self.output.trim_end().to_string();
+        self.output = saved_output;
+
+        let indent = " ".repeat(marker.len());
+        self.output.push_str(marker);
+
+        let mut lines = item_content.lines();
+        match lines.next() {
+            Some(first) => {
+                self.output.push_str(first);
+                self.output.push('\n');
+            }
+            None => {
+                self.output.push('\n');
+                return Ok(());
+            }
+        }
+        for line in lines {
+            if line.is_empty() {
+                self.output.push('\n');
+            } else {
+                self.output.push_str(&indent);
+                self.output.push_str(line);
+                self.output.push('\n');
+            }
+        }
         Ok(())
     }
 
@@ -266,9 +283,13 @@ impl MarkdownConverter {
         self.output = saved_output;
 
         for line in quote_content.lines() {
-            self.output.push_str("> ");
-            self.output.push_str(line);
-            self.output.push('\n');
+            if line.is_empty() {
+                self.output.push_str(">\n");
+            } else {
+                self.output.push_str("> ");
+                self.output.push_str(line);
+                self.output.push('\n');
+            }
         }
 
         self.output.push('\n');
@@ -308,54 +329,115 @@ impl MarkdownConverter {
 
         // Caption before table
         if let Some(cap) = caption {
-            self.output.push_str("**");
-            self.convert_inlines(cap)?;
-            self.output.push_str("**\n\n");
+            let text = self.render_inlines_trimmed(cap)?;
+            if !text.is_empty() {
+                self.output.push_str("**");
+                self.output.push_str(&text);
+                self.output.push_str("**\n\n");
+            }
         }
 
-        // Headers
-        if !headers.is_empty() {
-            self.output.push('|');
-            for cell in headers {
-                self.output.push(' ');
-                self.convert_table_cell(cell)?;
-                self.output.push_str(" |");
-            }
-            self.output.push('\n');
+        // Render every cell up front so columns can be padded for readability
+        let header_cells: Vec<String> = headers
+            .iter()
+            .map(|cell| self.render_table_cell(cell))
+            .collect::<Result<_>>()?;
+        let body_cells: Vec<Vec<String>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| self.render_table_cell(cell))
+                    .collect::<Result<_>>()
+            })
+            .collect::<Result<_>>()?;
 
-            // Separator
-            self.output.push('|');
-            for (i, _) in headers.iter().enumerate() {
-                let align = alignments.get(i).unwrap_or(&Alignment::AlignDefault);
-                match align {
-                    Alignment::AlignLeft => self.output.push_str(" :--- |"),
-                    Alignment::AlignRight => self.output.push_str(" ---: |"),
-                    Alignment::AlignCenter => self.output.push_str(" :---: |"),
-                    Alignment::AlignDefault => self.output.push_str(" --- |"),
+        self.in_table = false;
+
+        let num_columns = header_cells
+            .len()
+            .max(body_cells.iter().map(|row| row.len()).max().unwrap_or(0));
+        if num_columns == 0 {
+            return Ok(());
+        }
+
+        let mut widths = vec![3usize; num_columns];
+        for (i, cell) in header_cells.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+        for row in &body_cells {
+            for (i, cell) in row.iter().enumerate() {
+                widths[i] = widths[i].max(cell.chars().count());
+            }
+        }
+
+        let alignment_of = |i: usize| alignments.get(i).unwrap_or(&Alignment::AlignDefault);
+
+        let write_row = |output: &mut String, cells: &[String]| {
+            output.push('|');
+            for (i, width) in widths.iter().enumerate() {
+                let empty = String::new();
+                let cell = cells.get(i).unwrap_or(&empty);
+                let pad = width.saturating_sub(cell.chars().count());
+                match alignment_of(i) {
+                    Alignment::AlignRight => {
+                        output.push(' ');
+                        for _ in 0..pad {
+                            output.push(' ');
+                        }
+                        output.push_str(cell);
+                        output.push_str(" |");
+                    }
+                    Alignment::AlignCenter => {
+                        let left = pad / 2;
+                        output.push(' ');
+                        for _ in 0..left {
+                            output.push(' ');
+                        }
+                        output.push_str(cell);
+                        for _ in 0..(pad - left) {
+                            output.push(' ');
+                        }
+                        output.push_str(" |");
+                    }
+                    _ => {
+                        output.push(' ');
+                        output.push_str(cell);
+                        for _ in 0..pad {
+                            output.push(' ');
+                        }
+                        output.push_str(" |");
+                    }
                 }
             }
-            self.output.push('\n');
-        }
+            output.push('\n');
+        };
 
-        // Rows
-        for row in rows {
+        // GFM requires a header row; fall back to an empty one
+        write_row(&mut self.output, &header_cells);
+
+        self.output.push('|');
+        for (i, &width) in widths.iter().enumerate() {
+            let bar = match alignment_of(i) {
+                Alignment::AlignLeft => format!(":{}", "-".repeat(width + 1)),
+                Alignment::AlignRight => format!("{}:", "-".repeat(width + 1)),
+                Alignment::AlignCenter => format!(":{}:", "-".repeat(width)),
+                Alignment::AlignDefault => "-".repeat(width + 2),
+            };
+            self.output.push_str(&bar);
             self.output.push('|');
-            for cell in row {
-                self.output.push(' ');
-                self.convert_table_cell(cell)?;
-                self.output.push_str(" |");
-            }
-            self.output.push('\n');
+        }
+        self.output.push('\n');
+
+        for row in &body_cells {
+            write_row(&mut self.output, row);
         }
 
         self.output.push('\n');
-        self.in_table = false;
         Ok(())
     }
 
-    fn convert_table_cell(&mut self, blocks: &[Block]) -> Result<()> {
-        let saved_output = self.output.clone();
-        self.output.clear();
+    fn render_table_cell(&mut self, blocks: &[Block]) -> Result<String> {
+        let saved_output = std::mem::take(&mut self.output);
 
         for block in blocks {
             self.convert_block(block)?;
@@ -363,9 +445,7 @@ impl MarkdownConverter {
 
         let cell_content = self.output.trim().replace('\n', " ");
         self.output = saved_output;
-        self.output.push_str(&cell_content);
-
-        Ok(())
+        Ok(cell_content)
     }
 
     fn convert_figure(&mut self, caption: Option<&Vec<Inline>>, path: &str, label: Option<&str>) -> Result<()> {
@@ -413,15 +493,14 @@ impl MarkdownConverter {
             self.output.push_str(t);
             self.output.push(')');
         }
-        
-        self.output.push_str("**\n>\n");
+
+        self.output.push_str("**");
 
         if let Some(label) = label {
-            self.output.push_str("> ");
-            write!(self.output, "{{#{}}}", label).unwrap();
-            self.output.push('\n');
-            self.output.push_str(">\n");
+            write!(self.output, " {{#{}}}", label).unwrap();
         }
+
+        self.output.push_str("\n>\n");
 
         // Convert content as quoted
         let saved_output = self.output.clone();
@@ -463,21 +542,27 @@ impl MarkdownConverter {
     fn convert_inline(&mut self, inline: &Inline) -> Result<()> {
         match inline {
             Inline::Text(text) => {
-                // Escape markdown special characters if not in table
-                if self.in_table {
-                    self.output.push_str(&text.replace('|', "\\|"));
-                } else {
-                    self.output.push_str(text);
-                }
+                let escaped = escape_markdown_text(text, self.in_table);
+                self.output.push_str(&escaped);
             }
             Inline::Space => {
-                self.output.push(' ');
+                // Collapse runs of whitespace
+                if !self.output.is_empty()
+                    && !self.output.ends_with(' ')
+                    && !self.output.ends_with('\n')
+                {
+                    self.output.push(' ');
+                }
             }
             Inline::SoftBreak => {
                 self.output.push('\n');
             }
             Inline::LineBreak => {
-                self.output.push_str("  \n");
+                if self.in_table {
+                    self.output.push_str("<br>");
+                } else {
+                    self.output.push_str("  \n");
+                }
             }
             Inline::Emph(content) => {
                 self.output.push('*');
@@ -517,13 +602,30 @@ impl MarkdownConverter {
                 self.output.push_str("</span>");
             }
             Inline::Code(code) => {
-                self.output.push('`');
-                self.output.push_str(code);
-                self.output.push('`');
+                let code = if self.in_table {
+                    code.replace('|', "\\|")
+                } else {
+                    code.clone()
+                };
+                // Code containing backticks needs a longer fence and padding
+                if code.contains('`') {
+                    self.output.push_str("`` ");
+                    self.output.push_str(&code);
+                    self.output.push_str(" ``");
+                } else {
+                    self.output.push('`');
+                    self.output.push_str(&code);
+                    self.output.push('`');
+                }
             }
             Inline::InlineMath(math) => {
+                let math = if self.in_table {
+                    math.replace('|', "\\|")
+                } else {
+                    math.clone()
+                };
                 self.output.push('$');
-                self.output.push_str(math);
+                self.output.push_str(math.trim());
                 self.output.push('$');
             }
             Inline::Link { text, url, title } => {
@@ -550,7 +652,9 @@ impl MarkdownConverter {
                 }
                 self.output.push(')');
             }
-            Inline::Cite { citations, content } => {
+            Inline::Cite {
+                citations, content, ..
+            } => {
                 if !content.is_empty() {
                     self.convert_inlines(content)?;
                 } else {
@@ -565,11 +669,11 @@ impl MarkdownConverter {
                     self.output.push(']');
                 }
             }
-            Inline::Ref(reference) => {
+            Inline::Ref { label, .. } => {
                 self.output.push('[');
-                self.output.push_str(reference);
+                self.output.push_str(label);
                 self.output.push_str("](#");
-                self.output.push_str(reference);
+                self.output.push_str(label);
                 self.output.push(')');
             }
             Inline::RawInline(content) => {
@@ -610,46 +714,307 @@ impl Default for MarkdownConverter {
     }
 }
 
+/// Escape characters that would otherwise be interpreted as Markdown syntax.
+/// Kept minimal: only characters that realistically appear in LaTeX text and
+/// change Markdown semantics.
+fn escape_markdown_text(text: &str, in_table: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '*' | '_' | '`' | '$' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '|' if in_table => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Quote a YAML scalar when needed.
+fn yaml_scalar(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value.contains(": ")
+        || value.ends_with(':')
+        || value.contains('#')
+        || value.contains('"')
+        || value.starts_with(['\'', '"', '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`', '[', ']', '{', '}'])
+        || value.starts_with(' ')
+        || value.ends_with(' ');
+    if needs_quoting {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    #[test]
-    fn test_convert_paragraph() {
-        let latex = "Hello world";
+    fn convert(latex: &str) -> String {
         let mut lexer = Lexer::new(latex);
         let tokens = lexer.tokenize().unwrap();
         let mut parser = Parser::new(tokens);
         let doc = parser.parse().unwrap();
         let mut converter = MarkdownConverter::new();
-        let markdown = converter.convert(doc).unwrap();
-        assert!(markdown.contains("Hello world"));
+        converter.convert(doc).unwrap()
+    }
+
+    #[test]
+    fn test_convert_paragraph() {
+        assert!(convert("Hello world").contains("Hello world"));
     }
 
     #[test]
     fn test_convert_section() {
-        let latex = "\\section{Introduction}";
-        let mut lexer = Lexer::new(latex);
-        let tokens = lexer.tokenize().unwrap();
-        let mut parser = Parser::new(tokens);
-        let doc = parser.parse().unwrap();
-        let mut converter = MarkdownConverter::new();
-        let markdown = converter.convert(doc).unwrap();
-        assert!(markdown.contains("## Introduction"));
+        assert!(convert("\\section{Introduction}").contains("## Introduction"));
+    }
+
+    #[test]
+    fn test_heading_levels() {
+        let md = convert("\\chapter{C}\n\\section{S}\n\\subsection{SS}\n\\subsubsection{SSS}\n\\paragraph{P}");
+        assert!(md.contains("# C"));
+        assert!(md.contains("## S"));
+        assert!(md.contains("### SS"));
+        assert!(md.contains("#### SSS"));
+        assert!(md.contains("##### P"));
     }
 
     #[test]
     fn test_convert_emphasis() {
-        let latex = "\\textit{italic} and \\textbf{bold}";
-        let mut lexer = Lexer::new(latex);
-        let tokens = lexer.tokenize().unwrap();
-        let mut parser = Parser::new(tokens);
-        let doc = parser.parse().unwrap();
-        let mut converter = MarkdownConverter::new();
-        let markdown = converter.convert(doc).unwrap();
+        let markdown = convert("\\textit{italic} and \\textbf{bold}");
         assert!(markdown.contains("*italic*"));
         assert!(markdown.contains("**bold**"));
+    }
+
+    #[test]
+    fn test_section_title_with_formatting_and_label() {
+        let md = convert("\\section{The \\texttt{code} story\\label{sec:x}}\nSee \\ref{sec:x}.");
+        assert!(md.contains("## The `code` story {#sec:x}"), "got: {}", md);
+        assert!(md.contains("See 1."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_escaped_special_characters() {
+        let md = convert("50\\% of R\\&D \\$5 \\#1 a\\_b \\{x\\}");
+        assert!(md.contains("50% of R&D"), "got: {}", md);
+        assert!(md.contains("\\$5"), "got: {}", md);
+        assert!(md.contains("#1"), "got: {}", md);
+        assert!(md.contains("a\\_b"), "got: {}", md);
+        assert!(md.contains("{x}"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_escaped_percent_does_not_eat_line() {
+        let md = convert("Save 10\\% today and tomorrow.");
+        assert!(md.contains("Save 10% today and tomorrow."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_accents() {
+        let md = convert("Caf\\'e na\\\"ive fa\\c{c}ade Erd\\H{o}s \\v{S}koda \\~nino");
+        assert!(md.contains("Café"), "got: {}", md);
+        assert!(md.contains("naïve"), "got: {}", md);
+        assert!(md.contains("façade"), "got: {}", md);
+        assert!(md.contains("Erdős"), "got: {}", md);
+        assert!(md.contains("ñino"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_smart_quotes_and_dashes() {
+        let md = convert("``double'' `single' a--b c---d");
+        assert!(md.contains("\u{201C}double\u{201D}"), "got: {}", md);
+        assert!(md.contains("\u{2018}single\u{2019}"), "got: {}", md);
+        assert!(md.contains("a\u{2013}b"), "got: {}", md);
+        assert!(md.contains("c\u{2014}d"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_special_char_commands() {
+        let md = convert("\\ldots\\ \\S5 \\copyright\\ \\ss\\ \\ae");
+        assert!(md.contains("\u{2026}"), "got: {}", md);
+        assert!(md.contains("§5"), "got: {}", md);
+        assert!(md.contains("©"), "got: {}", md);
+        assert!(md.contains("ß"), "got: {}", md);
+        assert!(md.contains("æ"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_verb_command() {
+        let md = convert("Use \\verb|x_1 & y| here and \\verb+a|b+ too.");
+        assert!(md.contains("`x_1 & y`"), "got: {}", md);
+        assert!(md.contains("`a|b`"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_verbatim_preserves_latex_specials() {
+        let md = convert("\\begin{verbatim}\n% not a comment $x$ \\cmd\n\\end{verbatim}");
+        assert!(md.contains("% not a comment $x$ \\cmd"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_lstlisting_language() {
+        let md = convert("\\begin{lstlisting}[language=Python]\nprint(1)\n\\end{lstlisting}");
+        assert!(md.contains("```python"), "got: {}", md);
+        assert!(md.contains("print(1)"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_table_with_rules_and_alignment() {
+        let md = convert(
+            "\\begin{tabular}{lcr}\n\\hline\nA & B & C \\\\\n\\hline\n1 & 2 & 3 \\\\\n\\hline\n\\end{tabular}",
+        );
+        assert!(md.contains("| A"), "got: {}", md);
+        assert!(md.contains("| 1"), "got: {}", md);
+        assert!(md.contains(":--"), "got: {}", md);
+        assert!(md.contains("--:"), "got: {}", md);
+        assert!(!md.contains("hline"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_table_multicolumn_pads_cells() {
+        let md = convert(
+            "\\begin{tabular}{lll}\nA & B & C \\\\\n\\multicolumn{2}{c}{span} & z \\\\\n\\end{tabular}",
+        );
+        let span_row = md.lines().find(|l| l.contains("span")).unwrap();
+        assert_eq!(span_row.matches('|').count(), 4, "got: {}", md);
+    }
+
+    #[test]
+    fn test_nested_lists_are_tight() {
+        let md = convert(
+            "\\begin{itemize}\n\\item Top\n\\begin{itemize}\n\\item Nested\n\\end{itemize}\n\\item Next\n\\end{itemize}",
+        );
+        assert!(md.contains("- Top\n  - Nested\n- Next"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_align_env_wrapped_for_renderers() {
+        let md = convert("\\begin{align*}\na &= b \\\\\nc &= d\n\\end{align*}");
+        assert!(md.contains("\\begin{aligned}"), "got: {}", md);
+        assert!(md.contains("a &= b"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_equation_label_becomes_tag_and_eqref_resolves() {
+        let md = convert(
+            "\\begin{equation}\\label{eq:1}\nx = y\n\\end{equation}\nBy \\eqref{eq:1} we win.",
+        );
+        assert!(md.contains("\\tag{1}"), "got: {}", md);
+        assert!(md.contains("By (1) we win."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_forward_references_resolve() {
+        let md = convert("See \\ref{sec:later} now.\n\\section{Later}\\label{sec:later}");
+        assert!(md.contains("See 1 now."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_macro_with_formatting_body() {
+        let md = convert("\\newcommand{\\hi}[1]{\\textbf{hi #1}}\n\\hi{there}");
+        assert!(md.contains("**hi there**"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_math_macro_expansion() {
+        let md = convert("\\newcommand{\\R}{\\mathbb{R}}\nSet $\\R^n$ here.");
+        assert!(md.contains("$\\mathbb{R}^n$"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_declaration_groups() {
+        let md = convert("{\\bf bold run} and {\\em emphasis run}");
+        assert!(md.contains("**bold run**"), "got: {}", md);
+        assert!(md.contains("*emphasis run*"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_noop_commands_are_silent() {
+        let md = convert("\\centering\\vspace{1em}\\hspace*{2cm}Text\\clearpage done.\\pagestyle{empty}");
+        assert!(md.contains("Text"), "got: {}", md);
+        assert!(md.contains("done."), "got: {}", md);
+        assert!(!md.contains("\\centering"), "got: {}", md);
+        assert!(!md.contains("1em"), "got: {}", md);
+        assert!(!md.contains("2cm"), "got: {}", md);
+        assert!(!md.contains("empty"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_maketitle_renders_title_block() {
+        let md = convert("\\title{My Paper}\n\\author{A \\and B}\n\\date{2026}\n\\maketitle");
+        assert!(md.contains("# My Paper"), "got: {}", md);
+        assert!(md.contains("A, B"), "got: {}", md);
+        assert!(md.contains("2026"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_footnote_with_formatting() {
+        let md = convert("Claim\\footnote{See \\textit{elsewhere}.} stands.");
+        assert!(md.contains("Claim[^1] stands."), "got: {}", md);
+        assert!(md.contains("[^1]: See *elsewhere*."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_thebibliography() {
+        let md = convert(
+            "As \\cite{a1} shows.\n\\begin{thebibliography}{9}\n\\bibitem{a1} Author One. Title. 2020.\n\\end{thebibliography}",
+        );
+        assert!(md.contains("As [1] shows."), "got: {}", md);
+        assert!(md.contains("## References"), "got: {}", md);
+        assert!(md.contains("[1] Author One. Title. 2020."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_inline_math_paren_syntax() {
+        let md = convert("Math \\(a+b\\) inline.");
+        assert!(md.contains("$a+b$"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_center_environment_is_transparent() {
+        let md = convert("\\begin{center}\nCentered text\n\\end{center}");
+        assert!(md.contains("Centered text"), "got: {}", md);
+        assert!(!md.contains("\\begin{center}"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_comment_at_line_end_joins_words() {
+        let md = convert("super% comment\nglue");
+        assert!(md.contains("superglue"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_paragraph_break_preserved_around_full_line_comment() {
+        let md = convert("one\n\n% comment\n\ntwo");
+        assert!(md.contains("one\n\ntwo"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_nonbreaking_space() {
+        let md = convert("Figure~1");
+        assert!(md.contains("Figure\u{00A0}1"), "got: {}", md);
+    }
+
+    #[test]
+    fn test_newenvironment_expansion() {
+        let md = convert(
+            "\\newenvironment{note}[1]{\\begin{quote}\\textbf{Note (#1):} }{\\end{quote}}\n\\begin{note}{key}\nBody text.\n\\end{note}",
+        );
+        assert!(md.contains("> **Note (key):** Body text."), "got: {}", md);
+    }
+
+    #[test]
+    fn test_newenvironment_empty_defs_passthrough() {
+        let md = convert("\\newenvironment{boxed}{}{}\n\\begin{boxed}\nInside.\n\\end{boxed}");
+        assert!(md.contains("Inside."), "got: {}", md);
+        assert!(!md.contains("\\begin{boxed}"), "got: {}", md);
     }
 }
