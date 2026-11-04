@@ -132,7 +132,21 @@ impl Cli {
         let mut total_warnings = 0usize;
         let mut failures = 0usize;
         for job in &jobs {
-            match self.convert_one(job, multi) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.convert_one(job, multi)
+            }))
+            .unwrap_or_else(|panic| {
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                Err(anyhow::anyhow!(
+                    "internal error while converting (please report this input): {}",
+                    detail
+                ))
+            });
+            match outcome {
                 Ok(warnings) => total_warnings += warnings,
                 Err(error) => {
                     failures += 1;
@@ -388,13 +402,13 @@ impl Cli {
                 if self.verbose {
                     eprintln!("Reading from stdin...");
                 }
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
                 io::stdin()
-                    .read_to_string(&mut buffer)
+                    .read_to_end(&mut buffer)
                     .context("Failed to read from stdin")?;
-                Ok(buffer)
+                Ok(crate::decode::decode_bytes(&buffer))
             }
-            InputSource::File(path) => fs::read_to_string(path)
+            InputSource::File(path) => crate::decode::read_file(path)
                 .with_context(|| format!("Failed to read input file: {}", path.display())),
         }
     }
@@ -402,9 +416,14 @@ impl Cli {
     fn write_output(&self, output: &OutputTarget, content: &str) -> anyhow::Result<()> {
         match output {
             OutputTarget::Stdout => {
-                io::stdout()
-                    .write_all(content.as_bytes())
-                    .context("Failed to write to stdout")?;
+                let mut stdout = io::stdout().lock();
+                match stdout.write_all(content.as_bytes()).and_then(|_| stdout.flush()) {
+                    Ok(()) => {}
+                    // Downstream closed the pipe (e.g. `texed x.tex | head`):
+                    // not an error, just stop quietly like other Unix tools.
+                    Err(e) if e.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+                    Err(e) => return Err(e).context("Failed to write to stdout"),
+                }
             }
             OutputTarget::File(path) => {
                 if path.exists() && !self.force {

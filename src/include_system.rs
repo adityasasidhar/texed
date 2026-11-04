@@ -125,7 +125,7 @@ impl IncludeSystem {
         state.mark_file_included(path_str.clone());
 
         // Read file content
-        let content = fs::read_to_string(&resolved_path)
+        let content = crate::decode::read_file(&resolved_path)
             .map_err(TexedError::InputFileError)?;
 
         // Cache file content
@@ -202,7 +202,7 @@ impl IncludeSystem {
                 }
 
                 // Read package content
-                let content = fs::read_to_string(&path)
+                let content = crate::decode::read_file(&path)
                     .map_err(TexedError::InputFileError)?;
 
                 // Cache package content

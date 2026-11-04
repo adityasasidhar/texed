@@ -72,7 +72,7 @@ impl MarkdownConverter {
             self.output.push_str(bibliography);
         }
 
-        Ok(self.output.clone())
+        Ok(std::mem::take(&mut self.output))
     }
 
     fn convert_block(&mut self, block: &Block) -> Result<()> {
@@ -255,8 +255,7 @@ impl MarkdownConverter {
             for block in description {
                 self.output.push_str(": ");
                 
-                let saved_output = self.output.clone();
-                self.output.clear();
+                let saved_output = std::mem::take(&mut self.output);
                 self.convert_block(block)?;
                 let desc_content = self.output.trim_end().to_string();
                 self.output = saved_output;
@@ -272,8 +271,7 @@ impl MarkdownConverter {
     }
 
     fn convert_quote(&mut self, blocks: &[Block]) -> Result<()> {
-        let saved_output = self.output.clone();
-        self.output.clear();
+        let saved_output = std::mem::take(&mut self.output);
 
         for block in blocks {
             self.convert_block(block)?;
@@ -503,8 +501,7 @@ impl MarkdownConverter {
         self.output.push_str("\n>\n");
 
         // Convert content as quoted
-        let saved_output = self.output.clone();
-        self.output.clear();
+        let saved_output = std::mem::take(&mut self.output);
 
         for block in content {
             self.convert_block(block)?;
@@ -531,8 +528,7 @@ impl MarkdownConverter {
     }
 
     fn render_inlines_trimmed(&mut self, inlines: &[Inline]) -> Result<String> {
-        let saved_output = self.output.clone();
-        self.output.clear();
+        let saved_output = std::mem::take(&mut self.output);
         self.convert_inlines(inlines)?;
         let text = self.output.trim().to_string();
         self.output = saved_output;

@@ -29,6 +29,9 @@ pub struct ParserState {
     
     /// Current section number as dotted string
     pub current_section_number: String,
+
+    /// Level of the most recent sectioning command
+    pub current_level: usize,
     
     /// Macro definitions (name -> (params, body))
     pub macros: HashMap<String, MacroDef>,
@@ -71,6 +74,16 @@ pub struct ParserState {
 
     /// Conversion diagnostics (unknown commands, unresolved refs, ...)
     pub warnings: Vec<String>,
+
+    /// After `\appendix`: top-level sectioning is numbered A, B, C, ...
+    pub appendix: bool,
+
+    /// Document has chapters (book/report class, or a `\chapter` was seen):
+    /// figures, tables and equations are then numbered per chapter.
+    pub has_chapters: bool,
+
+    /// `\numberwithin{counter}{parent}` overrides (counter -> parent).
+    pub numberwithin: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +148,7 @@ impl ParserState {
             equation_counter: 0,
             section_counters: vec![0; 6], // 6 levels
             current_section_number: String::new(),
+            current_level: 1,
             macros: HashMap::new(),
             theorem_envs: default_theorem_envs(),
             environments: HashMap::new(),
@@ -149,6 +163,117 @@ impl ParserState {
             bibliography: Vec::new(),
             citation_style: CitationStyle::Numeric,
             warnings: Vec::new(),
+            appendix: false,
+            has_chapters: false,
+            numberwithin: HashMap::new(),
+        }
+    }
+
+    /// Enter appendix mode (`\appendix`): the top-level sectioning counter
+    /// restarts and is rendered as a letter.
+    pub fn start_appendix(&mut self) {
+        self.appendix = true;
+        let top = self.top_level();
+        self.section_counters[top] = 0;
+        for i in (top + 1)..self.section_counters.len() {
+            self.section_counters[i] = 0;
+        }
+        self.update_section_number();
+    }
+
+    /// Index of the top-level numbered sectioning unit (0 = chapter, 1 = section).
+    fn top_level(&self) -> usize {
+        if self.has_chapters {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// Set a counter from `\setcounter{name}{value}` (value is the number of
+    /// the *last* item, as in LaTeX).
+    pub fn set_counter(&mut self, name: &str, value: usize) {
+        match name {
+            "chapter" => self.section_counters[0] = value,
+            "section" => self.section_counters[1] = value,
+            "subsection" => self.section_counters[2] = value,
+            "subsubsection" => self.section_counters[3] = value,
+            "paragraph" => self.section_counters[4] = value,
+            "subparagraph" => self.section_counters[5] = value,
+            "equation" => self.equation_counter = value,
+            "figure" => self.figure_counter = value,
+            "table" => self.table_counter = value,
+            "footnote" => self.footnote_counter = value,
+            _ => return,
+        }
+        self.update_section_number();
+    }
+
+    /// Parent sectioning level a float/equation counter is numbered within.
+    fn counter_parent_level(&self, counter: &str) -> Option<usize> {
+        if let Some(parent) = self.numberwithin.get(counter) {
+            return level_of_sectioning(parent);
+        }
+        if self.has_chapters && matches!(counter, "equation" | "figure" | "table") {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    /// Step a float/equation counter and return its formatted number
+    /// (e.g. `3`, or `2.3` when numbered within chapters).
+    pub fn next_counter(&mut self, counter: &str) -> String {
+        let value = match counter {
+            "equation" => {
+                self.equation_counter += 1;
+                self.equation_counter
+            }
+            "figure" => {
+                self.figure_counter += 1;
+                self.figure_counter
+            }
+            "table" => {
+                self.table_counter += 1;
+                self.table_counter
+            }
+            _ => return String::new(),
+        };
+        match self.counter_parent_level(counter) {
+            Some(level) => {
+                let prefix = self.section_number_up_to(level);
+                if prefix.is_empty() {
+                    value.to_string()
+                } else {
+                    format!("{}.{}", prefix, value)
+                }
+            }
+            None => value.to_string(),
+        }
+    }
+
+    /// Formatted section number including levels 0..=max_level.
+    fn section_number_up_to(&self, max_level: usize) -> String {
+        let top = self.top_level();
+        let mut parts = Vec::new();
+        for (level, &count) in self.section_counters.iter().enumerate().take(max_level + 1) {
+            if level < top && count == 0 {
+                continue;
+            }
+            parts.push(self.format_level(level, count));
+        }
+        // Trailing zero levels (e.g. "2.0") are dropped
+        while parts.len() > 1 && parts.last().map(String::as_str) == Some("0") {
+            parts.pop();
+        }
+        parts.join(".")
+    }
+
+    fn format_level(&self, level: usize, count: usize) -> String {
+        if self.appendix && level == self.top_level() && count > 0 {
+            alpha_number(count, true)
+        } else {
+            count.to_string()
         }
     }
 
@@ -158,47 +283,45 @@ impl ParserState {
 
     pub fn increment_section(&mut self, level: usize) {
         if level < self.section_counters.len() {
+            if level == 0 {
+                self.has_chapters = true;
+            }
             self.section_counters[level] += 1;
-            
+
             // Reset lower levels
             for i in (level + 1)..self.section_counters.len() {
                 self.section_counters[i] = 0;
             }
-            
-            // Update current section number
+
+            // Reset counters numbered within this level
+            for counter in ["equation", "figure", "table"] {
+                if let Some(parent) = self.counter_parent_level(counter) {
+                    if parent >= level {
+                        match counter {
+                            "equation" => self.equation_counter = 0,
+                            "figure" => self.figure_counter = 0,
+                            _ => self.table_counter = 0,
+                        }
+                    }
+                }
+            }
+
+            self.current_level = level;
             self.update_section_number();
         }
     }
 
     fn update_section_number(&mut self) {
-        let mut parts = Vec::new();
-        let mut started = false;
-        for &count in &self.section_counters {
-            if count > 0 {
-                started = true;
-                parts.push(count.to_string());
-            } else if started {
-                break;
-            }
-        }
-        self.current_section_number = parts.join(".");
+        let level = self.current_level;
+        self.current_section_number = self.section_number_up_to(level);
     }
 
     pub fn add_label(&mut self, label: String, label_type: LabelType, title: Option<String>) {
         let number = match label_type {
             LabelType::Section => self.current_section_number.clone(),
-            LabelType::Figure => {
-                self.figure_counter += 1;
-                self.figure_counter.to_string()
-            }
-            LabelType::Table => {
-                self.table_counter += 1;
-                self.table_counter.to_string()
-            }
-            LabelType::Equation => {
-                self.equation_counter += 1;
-                self.equation_counter.to_string()
-            }
+            LabelType::Figure => self.next_counter("figure"),
+            LabelType::Table => self.next_counter("table"),
+            LabelType::Equation => self.next_counter("equation"),
             _ => String::new(),
         };
 
@@ -323,13 +446,7 @@ impl ParserState {
             return self.current_section_number.clone();
         };
 
-        let mut parts = Vec::new();
-        for count in self.section_counters.iter().take(max_level + 1) {
-            if *count > 0 {
-                parts.push(count.to_string());
-            }
-        }
-        parts.join(".")
+        self.section_number_up_to(max_level)
     }
 
     pub fn set_toggle(&mut self, name: String, value: bool) {
@@ -366,6 +483,54 @@ impl ParserState {
 
     pub fn mark_file_included(&mut self, path: String) {
         self.included_files.push(path);
+    }
+}
+
+/// Sectioning level of a counter name (`chapter` = 0, `section` = 1, ...).
+pub fn level_of_sectioning(name: &str) -> Option<usize> {
+    match name.trim() {
+        "part" | "chapter" => Some(0),
+        "section" => Some(1),
+        "subsection" => Some(2),
+        "subsubsection" => Some(3),
+        "paragraph" => Some(4),
+        "subparagraph" => Some(5),
+        _ => None,
+    }
+}
+
+/// Render a counter value as a letter sequence: 1 -> a/A, 26 -> z/Z, 27 -> aa/AA.
+pub fn alpha_number(mut n: usize, upper: bool) -> String {
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        let base = if upper { b'A' } else { b'a' };
+        out.push((base + (n % 26) as u8) as char);
+        n /= 26;
+    }
+    out.iter().rev().collect()
+}
+
+/// Render a counter value as a Roman numeral.
+pub fn roman_number(mut n: usize, upper: bool) -> String {
+    if n == 0 || n >= 4000 {
+        return n.to_string();
+    }
+    let table = [
+        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+        (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+    ];
+    let mut out = String::new();
+    for (value, numeral) in table {
+        while n >= value {
+            out.push_str(numeral);
+            n -= value;
+        }
+    }
+    if upper {
+        out.to_uppercase()
+    } else {
+        out
     }
 }
 

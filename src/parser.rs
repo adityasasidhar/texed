@@ -11,9 +11,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Upper bound on macro expansions per document, guarding against
-/// self-referential macro definitions blowing up the token stream.
-const MAX_MACRO_EXPANSIONS: usize = 10_000;
+/// Baseline budget of macro expansions per document, guarding against
+/// self-referential macro definitions looping forever. The effective budget
+/// also grows with document size (see `macro_budget`).
+const MAX_MACRO_EXPANSIONS: usize = 100_000;
+
+/// Hard cap on pending tokens; an expansion that would grow the stream past
+/// this is refused (exponentially self-replicating macros).
+const MAX_PENDING_TOKENS: usize = 20_000_000;
+
+/// Maximum recursion depth of block/inline parsing. Real documents nest a
+/// few dozen levels at most; beyond this the input is pathological and is
+/// flattened instead of recursed into, so the parser never overflows its stack.
+const MAX_NESTING_DEPTH: usize = 200;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -134,8 +144,13 @@ pub struct Document {
 }
 
 pub struct Parser {
+    /// Remaining tokens, stored *reversed* (the current token is the last
+    /// element) so that advancing is a pop and splicing a macro expansion in
+    /// front of the cursor is O(expansion length) rather than O(document).
     tokens: Vec<Token>,
-    position: usize,
+    /// Nesting depth of parse_block/parse_inline recursion; bounded by
+    /// MAX_NESTING_DEPTH so pathological input cannot overflow the stack.
+    depth: usize,
     metadata: HashMap<String, String>,
     state: ParserState,
     citation_manager: CitationManager,
@@ -144,6 +159,9 @@ pub struct Parser {
     command_registry: CommandRegistry,
     base_path: Option<std::path::PathBuf>,
     macro_expansions: usize,
+    macro_budget: usize,
+    /// Start number for the next enumerate list (from \setcounter{enumi}).
+    pending_enum_start: Option<usize>,
     /// Footnote bodies kept as inlines until end of parse so forward
     /// references inside them can be resolved.
     footnote_inlines: HashMap<usize, Vec<Inline>>,
@@ -159,10 +177,11 @@ enum MacroDefinitionMode {
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         use crate::state::CitationStyle;
-        
+        let macro_budget = MAX_MACRO_EXPANSIONS.saturating_add(tokens.len().saturating_mul(4));
+
         Self {
-            tokens,
-            position: 0,
+            tokens: reverse_tokens(tokens),
+            depth: 0,
             metadata: HashMap::new(),
             state: ParserState::new(),
             citation_manager: CitationManager::new(CitationStyle::Numeric),
@@ -171,6 +190,8 @@ impl Parser {
             command_registry: CommandRegistry::new(),
             base_path: None,
             macro_expansions: 0,
+            macro_budget,
+            pending_enum_start: None,
             footnote_inlines: HashMap::new(),
         }
     }
@@ -356,7 +377,7 @@ impl Parser {
         for bib_spec in self.state.bibliography.clone() {
             for bib_name in bib_spec.split(',').map(str::trim).filter(|name| !name.is_empty()) {
                 if let Some(path) = self.resolve_bibliography_path(bib_name) {
-                    if let Ok(content) = fs::read_to_string(path) {
+                    if let Ok(content) = crate::decode::read_file(&path) {
                         let _ = self.citation_manager.parse_bib_file(&content);
                     }
                 }
@@ -408,6 +429,7 @@ impl Parser {
         matches!(
             cmd,
             "documentclass"
+                | "documentstyle"
                 | "par"
                 | "noindent"
                 | "hline"
@@ -439,6 +461,35 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Option<Block>> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Ok(self.flatten_current_token().map(|inline| Block::Paragraph(vec![inline])));
+        }
+        self.depth += 1;
+        let result = self.parse_block_inner();
+        self.depth -= 1;
+        result
+    }
+
+    /// Past the nesting limit: consume one token and render it literally,
+    /// guaranteeing progress without further recursion.
+    fn flatten_current_token(&mut self) -> Option<Inline> {
+        let token = self.current_token().clone();
+        self.advance();
+        match token {
+            Token::Text(text) => Some(Inline::Text(text)),
+            Token::Whitespace(_) | Token::Newline | Token::ParBreak => Some(Inline::Space),
+            Token::InlineMath(math) => Some(Inline::InlineMath(math)),
+            Token::Verb(code) => Some(Inline::Code(code)),
+            Token::LeftBrace | Token::RightBrace | Token::Comment(_) | Token::Eof => None,
+            Token::BeginEnvironment(_) | Token::EndEnvironment(_) | Token::Item => None,
+            other => {
+                let text = self.token_to_string(&other);
+                (!text.is_empty()).then_some(Inline::Text(text))
+            }
+        }
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Option<Block>> {
         let token = self.current_token();
 
         match token {
@@ -457,11 +508,14 @@ impl Parser {
                     self.parse_paragraph()
                 }
             }
-            Token::Section(level, title) => {
+            Token::Section(level, title, flags) => {
                 let level = *level;
+                let flags = *flags;
                 let title_text = title.clone();
                 self.advance();
-                self.state.increment_section(level as usize);
+                if !flags.starred && !flags.part {
+                    self.state.increment_section(level as usize);
+                }
 
                 // Titles may contain formatting commands and an embedded \label
                 let (title_inlines, mut label) = self.parse_inline_fragment(&title_text)?;
@@ -507,6 +561,12 @@ impl Parser {
                 let content = content.clone();
                 self.advance();
                 Ok(self.verbatim_env_to_block(&name, content))
+            }
+            Token::MathEnv { name, content } => {
+                let name = name.clone();
+                let content = content.clone();
+                self.advance();
+                Ok(Some(self.math_env_block(&name, &content)))
             }
             Token::Text(_)
             | Token::InlineMath(_)
@@ -671,7 +731,7 @@ impl Parser {
         if matches!(tokens.last(), Some(Token::Eof)) {
             tokens.pop();
         }
-        self.tokens.splice(self.position..self.position, tokens);
+        self.push_front(tokens);
         Ok(())
     }
 
@@ -790,83 +850,131 @@ impl Parser {
     }
 
     fn parse_itemize(&mut self) -> Result<Option<Block>> {
-        let mut items = Vec::new();
+        self.parse_list("itemize", false)
+    }
 
-        // Optional list options: \begin{itemize}[noitemsep]
+    fn parse_enumerate(&mut self) -> Result<Option<Block>> {
+        self.parse_list("enumerate", true)
+    }
+
+    /// Parse itemize/enumerate-like environments. Custom item labels
+    /// (`\item[(iii)]`) are kept as leading text of the item, since Markdown
+    /// lists cannot express arbitrary markers.
+    fn parse_list(&mut self, env_name: &str, ordered: bool) -> Result<Option<Block>> {
+        let mut items: Vec<Vec<Block>> = Vec::new();
+        let mut custom_labels = 0usize;
+        let mut start = 1usize;
+        self.pending_enum_start = None;
+
+        // Optional list options: \begin{enumerate}[label=(\alph*), start=3]
         self.skip_whitespace_and_comments();
         if matches!(self.current_token(), Token::LeftBracket) {
-            let _ = self.parse_bracketed_text()?;
+            let options = self.parse_bracketed_text()?;
+            for option in options.split(',') {
+                let mut parts = option.splitn(2, '=');
+                if parts.next().map(str::trim) == Some("start") {
+                    if let Some(n) = parts.next().and_then(|v| v.trim().parse::<usize>().ok()) {
+                        start = n;
+                    }
+                }
+            }
         }
 
         while !self.is_at_end() {
             self.skip_whitespace_and_comments();
 
-            if let Token::EndEnvironment(env) = self.current_token() {
-                if env == "itemize" {
+            match self.current_token() {
+                Token::EndEnvironment(env) if env == env_name => {
                     self.advance();
                     break;
                 }
-            }
-
-            if matches!(self.current_token(), Token::Item) {
-                self.advance();
-                self.skip_item_marker()?;
-                let item_blocks = self.parse_item_content("itemize")?;
-                items.push(item_blocks);
-            } else {
-                self.advance();
+                // A mismatched \end closes the list too (unbalanced input)
+                Token::EndEnvironment(env)
+                    if !self.state.environments.contains_key(env) =>
+                {
+                    break;
+                }
+                Token::Item => {
+                    self.advance();
+                    let label = self.parse_item_label()?;
+                    if items.is_empty() {
+                        if let Some(n) = self.pending_enum_start.take() {
+                            start = n;
+                        }
+                    }
+                    let mut item_blocks = self.parse_item_content(env_name)?;
+                    if let Some(label) = label.filter(|l| !l.is_empty()) {
+                        custom_labels += 1;
+                        prepend_item_label(&mut item_blocks, label);
+                    }
+                    items.push(item_blocks);
+                }
+                Token::Command(_) => {
+                    // Content before the first \item (\setcounter, \small, ...)
+                    let _ = self.parse_inline()?;
+                }
+                Token::BeginEnvironment(_) | Token::MathEnv { .. } | Token::VerbatimEnv { .. }
+                | Token::DisplayMath(_) => {
+                    // Blocks before the first \item: attach to a leading item
+                    if let Some(block) = self.parse_block()? {
+                        match items.last_mut() {
+                            Some(item) => item.push(block),
+                            None => items.push(vec![block]),
+                        }
+                    }
+                }
+                _ => self.advance(),
             }
         }
 
-        Ok(Some(Block::BulletList(items)))
+        if ordered && (custom_labels == 0 || custom_labels < items.len()) {
+            Ok(Some(Block::OrderedList { start, items }))
+        } else {
+            Ok(Some(Block::BulletList(items)))
+        }
     }
 
-    /// Skip a custom item marker: \item[--]
-    fn skip_item_marker(&mut self) -> Result<()> {
-        let mut lookahead = self.position;
+    /// Parse an optional `[label]` right after `\item` as inlines.
+    fn parse_item_label(&mut self) -> Result<Option<Vec<Inline>>> {
+        let mut lookahead = 0;
         while matches!(
-            self.tokens.get(lookahead),
+            self.peek_at(lookahead),
             Some(Token::Whitespace(_)) | Some(Token::Newline)
         ) {
             lookahead += 1;
         }
-        if matches!(self.tokens.get(lookahead), Some(Token::LeftBracket)) {
-            self.position = lookahead;
-            let _ = self.parse_bracketed_text()?;
+        if !matches!(self.peek_at(lookahead), Some(Token::LeftBracket)) {
+            return Ok(None);
         }
-        Ok(())
+        self.skip_n(lookahead);
+        let tokens = self.collect_bracketed_tokens();
+        let (inlines, _) = self.parse_inline_fragment_tokens(tokens)?;
+        Ok(Some(trim_inline_whitespace(inlines)))
     }
 
-    fn parse_enumerate(&mut self) -> Result<Option<Block>> {
-        let mut items = Vec::new();
-
-        // Optional list options: \begin{enumerate}[label=...]
-        self.skip_whitespace_and_comments();
-        if matches!(self.current_token(), Token::LeftBracket) {
-            let _ = self.parse_bracketed_text()?;
+    /// Collect the raw tokens of a `[...]` group (brace-aware), consuming it.
+    fn collect_bracketed_tokens(&mut self) -> Vec<Token> {
+        if !matches!(self.current_token(), Token::LeftBracket) {
+            return Vec::new();
         }
-
+        self.advance();
+        let mut depth = 0usize;
+        let mut tokens = Vec::new();
         while !self.is_at_end() {
-            self.skip_whitespace_and_comments();
-
-            if let Token::EndEnvironment(env) = self.current_token() {
-                if env == "enumerate" {
+            match self.current_token() {
+                Token::RightBracket if depth == 0 => {
                     self.advance();
                     break;
                 }
+                Token::ParBreak => break,
+                Token::LeftBrace => depth += 1,
+                Token::RightBrace => depth = depth.saturating_sub(1),
+                _ => {}
             }
-
-            if matches!(self.current_token(), Token::Item) {
-                self.advance();
-                self.skip_item_marker()?;
-                let item_blocks = self.parse_item_content("enumerate")?;
-                items.push(item_blocks);
-            } else {
-                self.advance();
-            }
+            tokens.push(self.current_token().clone());
+            self.advance();
         }
-
-        Ok(Some(Block::OrderedList { start: 1, items }))
+        tokens
     }
 
     fn parse_description(&mut self) -> Result<Option<Block>> {
@@ -957,6 +1065,8 @@ impl Parser {
                 Token::ParBreak
                 | Token::BeginEnvironment(_)
                 | Token::DisplayMath(_)
+                | Token::MathEnv { .. }
+                | Token::Section(..)
                 | Token::VerbatimEnv { .. } => break,
                 _ => {
                     if let Some(inline) = self.parse_inline()? {
@@ -1043,16 +1153,10 @@ impl Parser {
     }
 
     fn parse_math_environment(&mut self, env_name: &str) -> Result<Option<Block>> {
-        // alignat takes a {n} argument specifying the number of columns
-        if env_name.starts_with("alignat") {
-            self.skip_whitespace_and_comments();
-            let _ = self.parse_braced_text()?;
-        }
-
+        // Token-based fallback (the lexer normally captures math environments
+        // raw as Token::MathEnv; this path handles bodies assembled from
+        // macro/environment expansions).
         let mut content = String::new();
-        let mut has_label = false;
-        let mut label = String::new();
-
         while !self.is_at_end() {
             if let Token::EndEnvironment(env) = self.current_token() {
                 if env == env_name {
@@ -1060,58 +1164,127 @@ impl Parser {
                     break;
                 }
             }
-
-            // Check for label
-            if let Token::Label(lbl) = self.current_token() {
-                label = lbl.clone();
-                has_label = true;
-                self.advance();
-
-                // Add label to state for equation numbering
-                let is_numbered = !env_name.ends_with('*');
-                if is_numbered {
-                    use crate::state::LabelType;
-                    self.state.add_label(label.clone(), LabelType::Equation, None);
-                }
-                continue;
-            }
-
-            // Numbering suppression has no meaning in Markdown math
-            if let Token::Command(cmd) = self.current_token() {
-                if cmd == "nonumber" || cmd == "notag" {
-                    self.advance();
-                    continue;
-                }
-            }
-
             content.push_str(&self.token_to_string(self.current_token()));
             self.advance();
         }
+        Ok(Some(self.math_env_block(env_name, &content)))
+    }
 
-        let mut content = self.expand_macros_in_math(content.trim());
+    /// Convert the raw body of a display-math environment into a block:
+    /// assigns equation numbers (per row for align-like environments),
+    /// registers \label targets, strips constructs Markdown math renderers
+    /// reject, and wraps multi-row environments in aligned/gathered.
+    fn math_env_block(&mut self, env_name: &str, raw: &str) -> Block {
+        let base = env_name.trim_end_matches('*');
+        let starred = env_name.ends_with('*');
+        let mut body = raw.trim().to_string();
 
-        // For numbered environments with a label, add the equation number
-        let is_numbered = !env_name.ends_with('*');
-        if is_numbered && has_label {
-            if let Some(label_info) = self.state.get_label(&label) {
-                if !label_info.number.is_empty() {
-                    content = format!("{}\\tag{{{}}}", content, label_info.number);
+        // alignat{n} / flalign column count argument
+        if base == "alignat" {
+            if let (Some(_), rest) = split_leading_brace_group(&body) {
+                body = rest.trim().to_string();
+            }
+        }
+
+        let numbered = !starred && !matches!(base, "displaymath" | "math");
+        let per_row = matches!(base, "align" | "gather" | "eqnarray" | "flalign" | "alignat");
+
+        let mut rows = split_math_rows(&body);
+        // A trailing \\ leaves an empty final row that LaTeX does not number
+        if rows.len() > 1 && rows.last().is_some_and(|(row, _)| row.trim().is_empty()) {
+            rows.pop();
+        }
+
+        let mut tags: Vec<String> = Vec::new();
+        let mut whole_labels: Vec<String> = Vec::new();
+        let mut whole_nonumber = false;
+        let mut whole_tag: Option<String> = None;
+        let mut out_rows: Vec<(String, String)> = Vec::new();
+
+        for (row, sep) in rows {
+            let mut row_info = strip_math_row_markup(&row);
+            if base == "eqnarray" {
+                row_info.text = eqnarray_row_to_aligned(&row_info.text);
+            }
+            if per_row {
+                let has_content = !row_info.text.trim().is_empty();
+                if let Some(tag) = row_info.tag.take() {
+                    for label in &row_info.labels {
+                        self.state.add_label_with_number(label.clone(), LabelType::Equation, tag.clone(), None);
+                    }
+                    tags.push(tag);
+                } else if numbered && !row_info.nonumber && has_content {
+                    let number = self.state.next_counter("equation");
+                    if !row_info.labels.is_empty() {
+                        for label in &row_info.labels {
+                            self.state.add_label_with_number(label.clone(), LabelType::Equation, number.clone(), None);
+                        }
+                        tags.push(number);
+                    }
+                } else {
+                    for label in &row_info.labels {
+                        self.state.add_label_with_number(label.clone(), LabelType::Equation, String::new(), None);
+                    }
+                }
+            } else {
+                whole_labels.extend(row_info.labels.drain(..));
+                whole_nonumber |= row_info.nonumber;
+                if row_info.tag.is_some() {
+                    whole_tag = row_info.tag.take();
+                }
+            }
+            out_rows.push((row_info.text, sep));
+        }
+
+        if !per_row {
+            if let Some(tag) = whole_tag {
+                for label in &whole_labels {
+                    self.state.add_label_with_number(label.clone(), LabelType::Equation, tag.clone(), None);
+                }
+                tags.push(tag);
+            } else if numbered && !whole_nonumber {
+                let number = self.state.next_counter("equation");
+                for label in &whole_labels {
+                    self.state.add_label_with_number(label.clone(), LabelType::Equation, number.clone(), None);
+                }
+                if !whole_labels.is_empty() {
+                    tags.push(number);
+                }
+            } else {
+                for label in &whole_labels {
+                    self.state.add_label_with_number(label.clone(), LabelType::Equation, String::new(), None);
                 }
             }
         }
 
-        // Multi-line alignment environments keep their structure by being
-        // wrapped in aligned/gathered, which MathJax/KaTeX render natively.
-        let base = env_name.trim_end_matches('*');
-        let content = match base {
-            "align" | "alignat" | "flalign" | "eqnarray" | "split" | "multline" => {
-                format!("\\begin{{aligned}}\n{}\n\\end{{aligned}}", content)
+        let multi_row = out_rows.len() > 1;
+        let mut joined = String::new();
+        for (i, (row, sep)) in out_rows.iter().enumerate() {
+            let row = row.trim();
+            joined.push_str(row);
+            if i + 1 < out_rows.len() {
+                joined.push(' ');
+                joined.push_str(sep);
+                joined.push('\n');
             }
-            "gather" => format!("\\begin{{gathered}}\n{}\n\\end{{gathered}}", content),
-            _ => content,
-        };
+        }
+        let mut content = self.expand_macros_in_math(joined.trim());
 
-        Ok(Some(Block::DisplayMath(content)))
+        let wrapper = match base {
+            "align" | "alignat" | "flalign" | "eqnarray" => Some("aligned"),
+            "multline" => Some("gathered"),
+            "gather" => Some("gathered"),
+            _ => None,
+        };
+        if let Some(wrapper) = wrapper {
+            if multi_row || content.contains('&') {
+                content = format!("\\begin{{{}}}\n{}\n\\end{{{}}}", wrapper, content, wrapper);
+            }
+        }
+        if !tags.is_empty() {
+            content = format!("{}\n\\tag{{{}}}", content, tags.join(", "));
+        }
+        Block::DisplayMath(content)
     }
 
     fn parse_table_environment(&mut self, env_name: &str) -> Result<Option<Block>> {
@@ -1172,21 +1345,20 @@ impl Parser {
             self.advance();
         }
 
+        // \caption steps the table counter (labels refer to it)
+        let number = caption.as_ref().map(|_| self.state.next_counter("table"));
+        if let Some(table_label) = &label {
+            let title = caption
+                .as_ref()
+                .map(|inlines| self.inlines_to_plain_text(inlines))
+                .filter(|text| !text.is_empty());
+            let number = number
+                .clone()
+                .unwrap_or_else(|| self.state.current_section_number.clone());
+            self.state
+                .add_label_with_number(table_label.clone(), LabelType::Table, number, title);
+        }
         if let Some(Block::Table { alignments, headers, rows, .. }) = tabular_block {
-            if let Some(table_label) = &label {
-                let next_number = self.state.table_counter + 1;
-                let title = caption
-                    .as_ref()
-                    .map(|inlines| self.inlines_to_plain_text(inlines))
-                    .filter(|text| !text.is_empty());
-                self.state.add_label_with_number(
-                    table_label.clone(),
-                    LabelType::Table,
-                    next_number.to_string(),
-                    title,
-                );
-                self.state.table_counter = next_number;
-            }
             Ok(Some(Block::Table {
                 caption,
                 alignments,
@@ -1487,19 +1659,18 @@ impl Parser {
             self.advance();
         }
 
+        // \caption steps the figure counter (labels refer to it)
+        let number = caption.as_ref().map(|_| self.state.next_counter("figure"));
         if let Some(figure_label) = &label {
-            let next_number = self.state.figure_counter + 1;
             let title = caption
                 .as_ref()
                 .map(|inlines| self.inlines_to_plain_text(inlines))
                 .filter(|text| !text.is_empty());
-            self.state.add_label_with_number(
-                figure_label.clone(),
-                LabelType::Figure,
-                next_number.to_string(),
-                title,
-            );
-            self.state.figure_counter = next_number;
+            let number = number
+                .clone()
+                .unwrap_or_else(|| self.state.current_section_number.clone());
+            self.state
+                .add_label_with_number(figure_label.clone(), LabelType::Figure, number, title);
         }
 
         match paths.len() {
@@ -1621,8 +1792,9 @@ impl Parser {
             match token {
                 Token::ParBreak
                 | Token::BeginEnvironment(_)
-                | Token::Section(_, _)
+                | Token::Section(..)
                 | Token::DisplayMath(_)
+                | Token::MathEnv { .. }
                 | Token::VerbatimEnv { .. } => {
                     break;
                 }
@@ -1657,6 +1829,16 @@ impl Parser {
     }
 
     fn parse_inline(&mut self) -> Result<Option<Inline>> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Ok(self.flatten_current_token());
+        }
+        self.depth += 1;
+        let result = self.parse_inline_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_inline_inner(&mut self) -> Result<Option<Inline>> {
         let token = self.current_token();
 
         match token {
@@ -1777,6 +1959,59 @@ impl Parser {
         // Check if it's a user-defined macro
         if self.macro_processor.is_defined(&self.state, &cmd) {
             return self.parse_macro_expansion(&cmd);
+        }
+
+        // Counter manipulation affects numbering of later sections, floats,
+        // equations and list items
+        match cmd.as_str() {
+            "appendix" => {
+                self.state.start_appendix();
+                return Ok(None);
+            }
+            "setcounter" | "addtocounter" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_and_comments();
+                let value_text = self.parse_braced_text()?;
+                let value = value_text.trim().parse::<i64>().unwrap_or(0);
+                let current = self.counter_value(&name) as i64;
+                let new_value = if cmd == "setcounter" { value } else { current + value };
+                let new_value = new_value.clamp(0, 1_000_000) as usize;
+                if name.starts_with("enum") {
+                    self.pending_enum_start = Some(new_value + 1);
+                } else {
+                    self.state.set_counter(&name, new_value);
+                }
+                return Ok(None);
+            }
+            "stepcounter" | "refstepcounter" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                match name.as_str() {
+                    "equation" | "figure" | "table" => {
+                        let _ = self.state.next_counter(&name);
+                    }
+                    _ => {
+                        let value = self.counter_value(&name);
+                        self.state.set_counter(&name, value + 1);
+                    }
+                }
+                return Ok(None);
+            }
+            "numberwithin" => {
+                self.skip_whitespace_and_comments();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                let counter = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_and_comments();
+                let parent = self.parse_braced_text()?.trim().to_string();
+                if !counter.is_empty() && crate::state::level_of_sectioning(&parent).is_some() {
+                    self.state.numberwithin.insert(counter, parent);
+                }
+                return Ok(None);
+            }
+            _ => {}
         }
 
         // Accents: \'e, \"o, \c{c}, ...
@@ -2185,7 +2420,14 @@ impl Parser {
     fn parse_macro_expansion(&mut self, cmd: &str) -> Result<Option<Inline>> {
         let args = self.parse_macro_arguments(cmd)?;
 
-        if self.macro_expansions >= MAX_MACRO_EXPANSIONS {
+        if self.macro_expansions >= self.macro_budget || self.tokens.len() > MAX_PENDING_TOKENS {
+            if self.macro_expansions != usize::MAX {
+                self.state.warn(format!(
+                    "macro expansion limit reached at `\\{}` (recursive definition?) — further expansion stopped",
+                    cmd
+                ));
+                self.macro_expansions = usize::MAX;
+            }
             return Ok(Some(Inline::Text(format!("\\{}", cmd))));
         }
 
@@ -2198,7 +2440,7 @@ impl Parser {
             if matches!(tokens.last(), Some(Token::Eof)) {
                 tokens.pop();
             }
-            self.tokens.splice(self.position..self.position, tokens);
+            self.push_front(tokens);
             Ok(None)
         } else {
             Ok(Some(Inline::Text(format!("\\{}", cmd))))
@@ -2211,14 +2453,14 @@ impl Parser {
         // Font declarations at group start style the whole group: {\bf text}
         let mut styles = Vec::new();
         loop {
-            let mut lookahead = self.position;
-            while matches!(self.tokens.get(lookahead), Some(Token::Whitespace(_))) {
+            let mut lookahead = 0;
+            while matches!(self.peek_at(lookahead), Some(Token::Whitespace(_))) {
                 lookahead += 1;
             }
-            match self.tokens.get(lookahead) {
+            match self.peek_at(lookahead) {
                 Some(Token::Command(cmd)) => match declaration_style(cmd) {
                     Some(style) => {
-                        self.position = lookahead + 1;
+                        self.skip_n(lookahead + 1);
                         styles.push(style);
                     }
                     None => break,
@@ -2581,8 +2823,7 @@ impl Parser {
             tokens.push(Token::Eof);
         }
 
-        let saved_tokens = std::mem::replace(&mut self.tokens, tokens);
-        let saved_position = std::mem::replace(&mut self.position, 0);
+        let saved_tokens = std::mem::replace(&mut self.tokens, reverse_tokens(tokens));
 
         let mut inlines = Vec::new();
         let mut result = Ok(());
@@ -2604,7 +2845,6 @@ impl Parser {
         }
 
         self.tokens = saved_tokens;
-        self.position = saved_position;
         result?;
 
         Ok((inlines, label))
@@ -2652,13 +2892,19 @@ impl Parser {
         let tokens = lexer.tokenize()?;
         let mut child = Parser::new(tokens);
 
-        child.metadata = self.metadata.clone();
-        child.state = self.state.clone();
-        child.citation_manager = self.citation_manager.clone();
-        child.macro_processor = self.macro_processor.clone();
-        child.include_system = self.include_system.clone();
-        child.command_registry = self.command_registry.clone();
+        child.metadata = std::mem::take(&mut self.metadata);
+        child.state = std::mem::take(&mut self.state);
+        child.citation_manager = std::mem::replace(
+            &mut self.citation_manager,
+            CitationManager::new(crate::state::CitationStyle::Numeric),
+        );
+        child.macro_processor = std::mem::take(&mut self.macro_processor);
+        child.include_system = std::mem::take(&mut self.include_system);
+        child.command_registry = std::mem::take(&mut self.command_registry);
         child.footnote_inlines = std::mem::take(&mut self.footnote_inlines);
+        child.depth = self.depth;
+        child.macro_expansions = self.macro_expansions;
+        child.macro_budget = self.macro_budget.saturating_add(child.macro_budget);
 
         let include_base = self
             .include_system
@@ -2669,8 +2915,10 @@ impl Parser {
             child = child.with_base_path(base_path);
         }
 
-        let blocks = child.parse_blocks()?;
+        let parsed = child.parse_blocks();
 
+        self.macro_expansions = child.macro_expansions;
+        self.macro_budget = child.macro_budget;
         self.metadata = child.metadata;
         self.state = child.state;
         self.citation_manager = child.citation_manager;
@@ -2678,6 +2926,7 @@ impl Parser {
         self.include_system = child.include_system;
         self.command_registry = child.command_registry;
         self.footnote_inlines = child.footnote_inlines;
+        let blocks = parsed?;
 
         if blocks.is_empty() {
             Ok(None)
@@ -2735,7 +2984,7 @@ impl Parser {
             Token::DisplayMath(m) => format!("$${}$$", m),
             Token::BeginEnvironment(env) => format!("\\begin{{{}}}", env),
             Token::EndEnvironment(env) => format!("\\end{{{}}}", env),
-            Token::VerbatimEnv { name, content } => {
+            Token::VerbatimEnv { name, content } | Token::MathEnv { name, content } => {
                 format!("\\begin{{{}}}{}\\end{{{}}}", name, content, name)
             }
             Token::Verb(v) => format!("\\verb|{}|", v),
@@ -2743,8 +2992,9 @@ impl Parser {
             Token::Label(l) => format!("\\label{{{}}}", l),
             Token::Ref { kind, label } => format!("\\{}{{{}}}", kind, label),
             Token::Cite { kind, keys } => format!("\\{}{{{}}}", kind, keys),
-            Token::Section(level, title) => {
+            Token::Section(level, title, flags) => {
                 let name = match level {
+                    0 if flags.part => "part",
                     0 => "chapter",
                     1 => "section",
                     2 => "subsection",
@@ -2761,20 +3011,30 @@ impl Parser {
     fn parse_command_block(&mut self, cmd: String) -> Result<Option<Block>> {
         match cmd.as_str() {
             // Document structure (skip these)
-            "documentclass" => {
+            "documentclass" | "documentstyle" => {
                 self.advance();
-                // Skip optional argument
-                if matches!(self.current_token(), Token::LeftBracket) {
-                    self.advance();
-                    while !self.is_at_end() && !matches!(self.current_token(), Token::RightBracket) {
-                        self.advance();
-                    }
-                    if matches!(self.current_token(), Token::RightBracket) {
-                        self.advance();
+                self.skip_whitespace_and_comments();
+                // Class options [11pt,a4paper]
+                let options = self.parse_bracketed_text()?;
+                self.skip_whitespace_and_comments();
+                let class = self.parse_braced_text()?;
+                let class = class.trim();
+                if matches!(
+                    class,
+                    "book" | "report" | "memoir" | "scrbook" | "scrreprt" | "amsbook" | "thesis"
+                        | "ucthesis" | "mitthesis" | "jsbook" | "jreport" | "tufte-book"
+                        | "octavo" | "suthesis-2e" | "kaobook"
+                ) || class.ends_with("thesis")
+                {
+                    self.state.has_chapters = true;
+                }
+                // LaTeX 2.09: \documentstyle[amssymb,epsf]{article} lists
+                // packages as options
+                if cmd == "documentstyle" {
+                    for package in options.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                        let _ = self.include_system.load_package(&mut self.state, package, &[]);
                     }
                 }
-                // Skip required argument
-                let _ = self.parse_braced_text()?;
                 Ok(None)
             }
             
@@ -3035,6 +3295,23 @@ impl Parser {
         }
     }
 
+    /// Current value of a named LaTeX counter.
+    fn counter_value(&self, name: &str) -> usize {
+        match name {
+            "chapter" => self.state.section_counters[0],
+            "section" => self.state.section_counters[1],
+            "subsection" => self.state.section_counters[2],
+            "subsubsection" => self.state.section_counters[3],
+            "paragraph" => self.state.section_counters[4],
+            "subparagraph" => self.state.section_counters[5],
+            "equation" => self.state.equation_counter,
+            "figure" => self.state.figure_counter,
+            "table" => self.state.table_counter,
+            "footnote" => self.state.footnote_counter,
+            _ => 0,
+        }
+    }
+
     fn skip_whitespace_and_comments(&mut self) {
         while !self.is_at_end() {
             match self.current_token() {
@@ -3047,18 +3324,51 @@ impl Parser {
     }
 
     fn current_token(&self) -> &Token {
-        &self.tokens[self.position]
+        self.tokens.last().unwrap_or(&EOF_TOKEN)
     }
 
-    fn advance(&mut self) {
-        if !self.is_at_end() {
-            self.position += 1;
+    /// The token `k` positions ahead of the cursor (0 = current).
+    fn peek_at(&self, k: usize) -> Option<&Token> {
+        let len = self.tokens.len();
+        if k < len {
+            self.tokens.get(len - 1 - k)
+        } else {
+            None
         }
     }
 
-    fn is_at_end(&self) -> bool {
-        self.position >= self.tokens.len() || matches!(self.current_token(), Token::Eof)
+    /// Discard the next `n` tokens.
+    fn skip_n(&mut self, n: usize) {
+        let len = self.tokens.len();
+        self.tokens.truncate(len.saturating_sub(n));
     }
+
+    /// Insert tokens so that `tokens[0]` becomes the current token.
+    fn push_front(&mut self, tokens: Vec<Token>) {
+        self.tokens
+            .extend(tokens.into_iter().rev().filter(|t| !matches!(t, Token::Eof)));
+    }
+
+    fn advance(&mut self) {
+        self.tokens.pop();
+    }
+
+    fn is_at_end(&self) -> bool {
+        matches!(self.current_token(), Token::Eof)
+    }
+}
+
+static EOF_TOKEN: Token = Token::Eof;
+
+/// Reverse a lexed token sequence into the parser's stack order, dropping
+/// end-of-input markers (end of input is simply an empty stack).
+fn reverse_tokens(tokens: Vec<Token>) -> Vec<Token> {
+    let mut tokens: Vec<Token> = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Eof))
+        .collect();
+    tokens.reverse();
+    tokens
 }
 
 /// Map a BibTeX style name to a citation rendering style. Returns None for
@@ -3344,6 +3654,204 @@ fn split_leading_brace_group(body: &str) -> (Option<String>, String) {
         }
     }
     (None, body.to_string())
+}
+
+/// Split display-math content into rows at top-level `\\\\` separators
+/// (ignoring those nested in braces or inner environments like `cases`).
+/// Returns (row text, separator text) pairs; the separator keeps optional
+/// spacing like `\\\\[2pt]`.
+fn split_math_rows(body: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+    let mut env_depth: i32 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if next == '\\' && depth == 0 && env_depth == 0 {
+                let mut sep = String::from("\\\\");
+                i += 2;
+                if i < chars.len() && chars[i] == '*' {
+                    i += 1;
+                }
+                // optional [len]
+                let mut j = i;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '[' {
+                    if let Some(close) = chars[j..].iter().position(|&c| c == ']') {
+                        let spacing: String = chars[j..j + close + 1].iter().collect();
+                        sep.push_str(&spacing);
+                        i = j + close + 1;
+                    }
+                }
+                rows.push((std::mem::take(&mut current), sep));
+                continue;
+            }
+            let rest: String = chars[i + 1..chars.len().min(i + 7)].iter().collect();
+            if rest.starts_with("begin") {
+                env_depth += 1;
+            } else if rest.starts_with("end") {
+                env_depth -= 1;
+            }
+            current.push(ch);
+            current.push(next);
+            i += 2;
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        current.push(ch);
+        i += 1;
+    }
+    rows.push((current, String::new()));
+    rows
+}
+
+struct MathRow {
+    text: String,
+    labels: Vec<String>,
+    nonumber: bool,
+    tag: Option<String>,
+}
+
+/// Remove \\label, \\nonumber/\\notag and \\tag from a math row (recording
+/// them), plus layout commands that Markdown math renderers reject.
+fn strip_math_row_markup(row: &str) -> MathRow {
+    let mut info = MathRow {
+        text: String::new(),
+        labels: Vec::new(),
+        nonumber: false,
+        tag: None,
+    };
+    let chars: Vec<char> = row.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1].is_ascii_alphabetic() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            let name: String = chars[i + 1..j].iter().collect();
+            let mut k = j;
+            if k < chars.len() && chars[k] == '*' && name == "tag" {
+                k += 1;
+            }
+            let read_group = |start: usize| -> Option<(String, usize)> {
+                let mut p = start;
+                while p < chars.len() && chars[p].is_whitespace() {
+                    p += 1;
+                }
+                if p < chars.len() && chars[p] == '{' {
+                    let mut depth = 0;
+                    let mut q = p;
+                    while q < chars.len() {
+                        match chars[q] {
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return Some((chars[p + 1..q].iter().collect(), q + 1));
+                                }
+                            }
+                            _ => {}
+                        }
+                        q += 1;
+                    }
+                }
+                None
+            };
+            match name.as_str() {
+                "label" => {
+                    if let Some((label, next)) = read_group(k) {
+                        info.labels.push(label.trim().to_string());
+                        i = next;
+                        continue;
+                    }
+                }
+                "nonumber" | "notag" => {
+                    info.nonumber = true;
+                    i = j;
+                    continue;
+                }
+                "tag" => {
+                    if let Some((tag, next)) = read_group(k) {
+                        info.tag = Some(tag.trim().to_string());
+                        i = next;
+                        continue;
+                    }
+                }
+                "displaybreak" | "allowdisplaybreaks" => {
+                    i = j;
+                    if i < chars.len() && chars[i] == '[' {
+                        if let Some(close) = chars[i..].iter().position(|&c| c == ']') {
+                            i += close + 1;
+                        }
+                    }
+                    continue;
+                }
+                "intertext" | "shortintertext" => {
+                    if let Some((text, next)) = read_group(k) {
+                        info.text.push_str(&format!("\\text{{{}}}", text));
+                        i = next;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            info.text.extend(&chars[i..j]);
+            i = j;
+            continue;
+        }
+        info.text.push(chars[i]);
+        i += 1;
+    }
+    info
+}
+
+/// eqnarray rows use three columns (`a &=& b`); aligned wants `a &= b`.
+fn eqnarray_row_to_aligned(row: &str) -> String {
+    let mut out = String::with_capacity(row.len());
+    let mut depth = 0;
+    let mut amps = 0;
+    let mut prev_backslash = false;
+    for ch in row.chars() {
+        if ch == '&' && depth == 0 && !prev_backslash {
+            amps += 1;
+            if amps == 2 {
+                prev_backslash = false;
+                continue;
+            }
+        }
+        match ch {
+            '{' if !prev_backslash => depth += 1,
+            '}' if !prev_backslash => depth -= 1,
+            _ => {}
+        }
+        prev_backslash = ch == '\\' && !prev_backslash;
+        out.push(ch);
+    }
+    out
+}
+
+/// Put a custom `\item[label]` marker in front of the item's first paragraph.
+fn prepend_item_label(blocks: &mut Vec<Block>, label: Vec<Inline>) {
+    match blocks.first_mut() {
+        Some(Block::Paragraph(inlines)) => {
+            let mut new_inlines = label;
+            new_inlines.push(Inline::Space);
+            new_inlines.append(inlines);
+            *inlines = new_inlines;
+        }
+        _ => blocks.insert(0, Block::Paragraph(label)),
+    }
 }
 
 /// Extract `language=...` from lstlisting options.

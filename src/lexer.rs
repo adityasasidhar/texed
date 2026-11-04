@@ -1,4 +1,4 @@
-use crate::error::{Result, TexedError};
+use crate::error::Result;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +27,9 @@ pub enum Token {
     // Verbatim
     Verb(String),                 // \verb|...| / \lstinline|...|
     VerbatimEnv { name: String, content: String }, // verbatim/lstlisting/minted captured raw
+    /// A display-math environment (equation, align, ...) with its body
+    /// captured raw so text-mode ligatures/quotes never touch the math.
+    MathEnv { name: String, content: String },
     
     // Special characters
     Ampersand,                    // & (table separator)
@@ -36,7 +39,9 @@ pub enum Token {
     Comment(String),
     
     // Sectioning
-    Section(u8, String),          // Level and title
+    /// Sectioning command: level (0 = part/chapter ... 5 = subparagraph),
+    /// title, and flags.
+    Section(u8, String, SectionFlags),
     
     // Lists
     Item,                         // \item
@@ -48,6 +53,15 @@ pub enum Token {
     
     // End of input
     Eof,
+}
+
+/// Variant flags of a sectioning command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SectionFlags {
+    /// `\section*`: unnumbered, does not step counters
+    pub starred: bool,
+    /// `\part`: has its own counter, does not step chapters
+    pub part: bool,
 }
 
 impl fmt::Display for Token {
@@ -187,7 +201,7 @@ impl Lexer {
         // \( ... \) inline math
         if ch == '(' {
             self.advance();
-            let content = self.read_until_sequence("\\)");
+            let content = self.read_math_until(&['\\', ')'], true);
             return Ok(Some(Token::InlineMath(content)));
         }
         if ch == ')' {
@@ -247,13 +261,13 @@ impl Lexer {
             | "citeyearpar" | "autocite" | "textcite" | "parencite" | "footcite" => {
                 self.lex_cite(&cmd_name)
             }
-            "section" => self.lex_section(1),
-            "subsection" => self.lex_section(2),
-            "subsubsection" => self.lex_section(3),
-            "chapter" => self.lex_section(0),
-            "part" => self.lex_section(0),
-            "paragraph" => self.lex_section(4),
-            "subparagraph" => self.lex_section(5),
+            "section" => self.lex_section(1, &cmd_name),
+            "subsection" => self.lex_section(2, &cmd_name),
+            "subsubsection" => self.lex_section(3, &cmd_name),
+            "chapter" => self.lex_section(0, &cmd_name),
+            "part" => self.lex_section(0, &cmd_name),
+            "paragraph" => self.lex_section(4, &cmd_name),
+            "subparagraph" => self.lex_section(5, &cmd_name),
             _ => Ok(Some(Token::Command(cmd_name))),
         }
     }
@@ -272,12 +286,13 @@ impl Lexer {
         self.advance();
         let close = if delim == '{' { '}' } else { delim };
 
+        // \verb cannot span lines: an unterminated \verb ends at the line end
         let mut content = String::new();
-        while !self.is_at_end() && self.current_char() != close {
+        while !self.is_at_end() && self.current_char() != close && self.current_char() != '\n' {
             content.push(self.current_char());
             self.advance();
         }
-        if !self.is_at_end() {
+        if !self.is_at_end() && self.current_char() == close {
             self.advance(); // consume closing delimiter
         }
 
@@ -303,18 +318,11 @@ impl Lexer {
     fn lex_begin_environment(&mut self) -> Result<Option<Token>> {
         // Don't skip whitespace - let it be tokenized separately
 
-        if self.is_at_end() || self.current_char() != '{' {
+        self.skip_inline_spaces_before_group();
+        let Some(env_name) = self.read_simple_group() else {
             return Ok(Some(Token::Command(String::from("begin"))));
-        }
-
-        self.advance(); // consume '{'
-        let env_name = self.read_until('}');
-
-        if self.is_at_end() || self.current_char() != '}' {
-            return Err(TexedError::UnbalancedBraces);
-        }
-
-        self.advance(); // consume '}'
+        };
+        let env_name = env_name.trim().to_string();
 
         // Verbatim-like environments capture their body raw so that %, $, \ etc.
         // inside code are not interpreted as LaTeX.
@@ -326,35 +334,57 @@ impl Lexer {
             }));
         }
 
+        if is_math_environment(&env_name) {
+            let end = format!("\\end{{{}}}", env_name);
+            if let Some(content) = self.try_read_until_sequence(&end) {
+                return Ok(Some(Token::MathEnv {
+                    name: env_name,
+                    content,
+                }));
+            }
+        }
+
         Ok(Some(Token::BeginEnvironment(env_name)))
     }
 
     fn lex_end_environment(&mut self) -> Result<Option<Token>> {
         // Don't skip whitespace - let it be tokenized separately
         
-        if self.current_char() != '{' {
-            return Ok(Some(Token::Command(String::from("end"))));
+        self.skip_inline_spaces_before_group();
+        match self.read_simple_group() {
+            Some(env_name) => Ok(Some(Token::EndEnvironment(env_name.trim().to_string()))),
+            None => Ok(Some(Token::Command(String::from("end")))),
         }
-
-        self.advance(); // consume '{'
-        let env_name = self.read_until('}');
-        
-        if self.is_at_end() || self.current_char() != '}' {
-            return Err(TexedError::UnbalancedBraces);
-        }
-        
-        self.advance(); // consume '}'
-        Ok(Some(Token::EndEnvironment(env_name)))
     }
 
-    fn lex_section(&mut self, level: u8) -> Result<Option<Token>> {
+    fn lex_section(&mut self, level: u8, name: &str) -> Result<Option<Token>> {
+        let mut flags = SectionFlags {
+            starred: false,
+            part: name == "part",
+        };
         // Starred variant (\section*) — unnumbered, same heading
         if !self.is_at_end() && self.current_char() == '*' {
             self.advance();
+            flags.starred = true;
+        }
+        let start = self.position;
+        self.skip_inline_spaces_before_group();
+        if !self.is_at_end() && self.current_char() != '{' && self.current_char() != '[' {
+            // allow whitespace/newline before the title
+            let mut look = self.position;
+            while look < self.input.len() && matches!(self.input[look], ' ' | '\t' | '\n') {
+                look += 1;
+            }
+            if look < self.input.len() && matches!(self.input[look], '{' | '[') {
+                while self.position < look {
+                    self.advance();
+                }
+            }
         }
 
         if self.is_at_end() {
-            return Ok(Some(Token::Command(String::from("section"))));
+            self.rewind_to(start);
+            return Ok(Some(Token::Command(name.to_string())));
         }
 
         // Handle optional argument [short title]
@@ -369,13 +399,14 @@ impl Lexer {
 
         // Read section title (brace-aware: titles may contain nested groups)
         if self.is_at_end() || self.current_char() != '{' {
-            return Ok(Some(Token::Command(String::from("section"))));
+            self.rewind_to(start);
+            return Ok(Some(Token::Command(name.to_string())));
         }
 
         self.advance(); // consume '{'
         let title = self.read_balanced_braces_content();
 
-        Ok(Some(Token::Section(level, title)))
+        Ok(Some(Token::Section(level, title, flags)))
     }
 
     /// Read content up to the matching closing brace, assuming the opening
@@ -417,58 +448,42 @@ impl Lexer {
     fn lex_label(&mut self) -> Result<Option<Token>> {
         // Don't skip whitespace - let it be tokenized separately
         
-        if self.current_char() != '{' {
-            return Ok(Some(Token::Command(String::from("label"))));
+        self.skip_inline_spaces_before_group();
+        match self.read_simple_group() {
+            Some(label) => Ok(Some(Token::Label(label.trim().to_string()))),
+            None => Ok(Some(Token::Command(String::from("label")))),
         }
-
-        self.advance();
-        let label = self.read_until('}');
-        
-        if !self.is_at_end() && self.current_char() == '}' {
-            self.advance();
-        }
-
-        Ok(Some(Token::Label(label)))
     }
 
     fn lex_ref(&mut self, kind: &str) -> Result<Option<Token>> {
         // Don't skip whitespace - let it be tokenized separately
         
-        if self.current_char() != '{' {
-            return Ok(Some(Token::Command(kind.to_string())));
-        }
-
-        self.advance();
-        let reference = self.read_until('}');
-        
-        if !self.is_at_end() && self.current_char() == '}' {
+        // Starred variants (\ref*, \cref*) only suppress hyperlinks
+        if !self.is_at_end() && self.current_char() == '*' {
             self.advance();
         }
-
-        Ok(Some(Token::Ref {
-            kind: kind.to_string(),
-            label: reference,
-        }))
+        self.skip_inline_spaces_before_group();
+        match self.read_simple_group() {
+            Some(reference) => Ok(Some(Token::Ref {
+                kind: kind.to_string(),
+                label: reference.trim().to_string(),
+            })),
+            None => Ok(Some(Token::Command(kind.to_string()))),
+        }
     }
 
     fn lex_cite(&mut self, kind: &str) -> Result<Option<Token>> {
         // Don't skip whitespace - let it be tokenized separately
         
-        if self.current_char() != '{' {
-            return Ok(Some(Token::Command(kind.to_string())));
+        if !self.is_at_end() && self.current_char() == '{' {
+            if let Some(citation) = self.read_simple_group() {
+                return Ok(Some(Token::Cite {
+                    kind: kind.to_string(),
+                    keys: citation,
+                }));
+            }
         }
-
-        self.advance();
-        let citation = self.read_until('}');
-        
-        if !self.is_at_end() && self.current_char() == '}' {
-            self.advance();
-        }
-
-        Ok(Some(Token::Cite {
-            kind: kind.to_string(),
-            keys: citation,
-        }))
+        Ok(Some(Token::Command(kind.to_string())))
     }
 
     fn lex_math(&mut self) -> Result<Option<Token>> {
@@ -481,47 +496,174 @@ impl Lexer {
             return Ok(Some(Token::DisplayMath(content)));
         }
 
-        // Inline math $...$
-        let content = self.read_until('$');
-        
-        if !self.is_at_end() && self.current_char() == '$' {
-            self.advance();
+        // Inline math $...$ (cannot span a paragraph break in TeX, so an
+        // unterminated $ ends at the next blank line instead of eating the
+        // rest of the document)
+        let (content, terminated) = self.read_math_until_checked(&['$'], true);
+        if !terminated && content.trim().is_empty() {
+            // A lone `$` with nothing after it is a literal dollar sign
+            return Ok(Some(Token::Text(String::from("$"))));
         }
-
         Ok(Some(Token::InlineMath(content)))
     }
 
     fn lex_display_math_bracket(&mut self) -> Result<Option<Token>> {
-        let content = self.read_until_sequence("\\]");
+        let content = self.read_math_until(&['\\', ']'], false);
         Ok(Some(Token::DisplayMath(content)))
     }
 
     fn read_until_double_dollar(&mut self) -> String {
+        self.read_math_until(&['$', '$'], true)
+    }
+
+    /// Read math content up to (and consuming) the closing delimiter,
+    /// skipping escaped characters (`\$`) and `%` comments. If the delimiter
+    /// never appears, stop at the first blank line when `stop_at_par` is set
+    /// (TeX forbids paragraph breaks in `$...$`/`$$...$$`), otherwise at a
+    /// blank line only if the delimiter is missing from the rest of the input.
+    fn read_math_until(&mut self, close: &[char], stop_at_par: bool) -> String {
+        self.read_math_until_checked(close, stop_at_par).0
+    }
+
+    /// Read math content up to (and consuming) the closing delimiter,
+    /// treating `\x` as an escaped pair (so `\$` never closes `$...$`) and
+    /// dropping `%` comments. Returns the content and whether the delimiter
+    /// was found. Unterminated math ends at the first blank line (TeX forbids
+    /// paragraph breaks in math), so a stray `$` cannot swallow the rest of
+    /// the document; when `stop_at_par` is false the blank line is only used
+    /// as the end if the delimiter never appears.
+    fn read_math_until_checked(&mut self, close: &[char], stop_at_par: bool) -> (String, bool) {
         let mut content = String::new();
-        let mut prev_was_dollar = false;
+        let mut par_break_at: Option<(usize, usize)> = None; // (position, content len)
 
         while !self.is_at_end() {
-            let ch = self.current_char();
-            
-            if ch == '$' && prev_was_dollar {
-                self.advance();
-                break;
-            }
-
-            if ch == '$' {
-                prev_was_dollar = true;
-            } else {
-                if prev_was_dollar {
-                    content.push('$');
+            if self.matches_sequence(close) {
+                for _ in 0..close.len() {
+                    self.advance();
                 }
-                prev_was_dollar = false;
-                content.push(ch);
+                return (content, true);
             }
-
+            let ch = self.current_char();
+            if ch == '\\' {
+                content.push(ch);
+                self.advance();
+                if !self.is_at_end() {
+                    content.push(self.current_char());
+                    self.advance();
+                }
+                continue;
+            }
+            if ch == '%' {
+                while !self.is_at_end() && self.current_char() != '\n' {
+                    self.advance();
+                }
+                continue;
+            }
+            if ch == '\n' && par_break_at.is_none() {
+                let mut look = self.position + 1;
+                while look < self.input.len() && matches!(self.input[look], ' ' | '\t' | '\r') {
+                    look += 1;
+                }
+                if look < self.input.len() && self.input[look] == '\n' {
+                    if stop_at_par {
+                        return (content, false);
+                    }
+                    par_break_at = Some((self.position, content.len()));
+                }
+            }
+            content.push(ch);
             self.advance();
         }
 
-        content
+        if let Some((pos, len)) = par_break_at {
+            self.rewind_to(pos);
+            content.truncate(len);
+        }
+        (content, false)
+    }
+
+    /// Move the cursor back to an earlier position, recomputing line info.
+    fn rewind_to(&mut self, position: usize) {
+        self.position = position;
+        self.line = 1 + self.input[..position].iter().filter(|&&c| c == '\n').count();
+        self.column = 1;
+    }
+
+    /// Skip spaces/tabs (not newlines-with-blank-lines) between a command
+    /// and its argument group: `\begin {itemize}` is valid TeX.
+    fn skip_inline_spaces_before_group(&mut self) {
+        let mut look = self.position;
+        while look < self.input.len() && matches!(self.input[look], ' ' | '\t' | '\r') {
+            look += 1;
+        }
+        if look < self.input.len() && self.input[look] == '{' {
+            while self.position < look {
+                self.advance();
+            }
+        }
+    }
+
+    /// Read a simple `{...}` group (no nested braces, no paragraph break),
+    /// as used for environment names, labels and citation keys. On success
+    /// the group is consumed; otherwise nothing is consumed and None is
+    /// returned so a stray brace can never swallow the rest of the document.
+    fn read_simple_group(&mut self) -> Option<String> {
+        if self.is_at_end() || self.current_char() != '{' {
+            return None;
+        }
+        let mut look = self.position + 1;
+        let mut content = String::new();
+        let mut newlines = 0;
+        while look < self.input.len() {
+            let ch = self.input[look];
+            match ch {
+                '}' => {
+                    while self.position <= look {
+                        self.advance();
+                    }
+                    return Some(content);
+                }
+                '{' => return None,
+                '\n' => {
+                    newlines += 1;
+                    if newlines > 1 {
+                        return None;
+                    }
+                    content.push(' ');
+                }
+                '%' => {
+                    // comment inside the group: skip to end of line
+                    while look < self.input.len() && self.input[look] != '\n' {
+                        look += 1;
+                    }
+                    continue;
+                }
+                _ => {
+                    newlines = 0;
+                    content.push(ch);
+                }
+            }
+            look += 1;
+        }
+        None
+    }
+
+    /// Like read_until_sequence, but only consumes input when the sequence
+    /// is actually found.
+    fn try_read_until_sequence(&mut self, sequence: &str) -> Option<String> {
+        let seq: Vec<char> = sequence.chars().collect();
+        let mut look = self.position;
+        while look + seq.len() <= self.input.len() {
+            if self.input[look..look + seq.len()] == seq[..] {
+                let content: String = self.input[self.position..look].iter().collect();
+                while self.position < look + seq.len() {
+                    self.advance();
+                }
+                return Some(content);
+            }
+            look += 1;
+        }
+        None
     }
 
     fn read_until_sequence(&mut self, sequence: &str) -> String {
@@ -732,6 +874,31 @@ pub fn is_verbatim_environment(name: &str) -> bool {
             | "comment"
             | "filecontents"
             | "filecontents*"
+    )
+}
+
+/// Display-math environments captured raw by the lexer.
+pub fn is_math_environment(name: &str) -> bool {
+    matches!(
+        name,
+        "equation"
+            | "equation*"
+            | "align"
+            | "align*"
+            | "gather"
+            | "gather*"
+            | "multline"
+            | "multline*"
+            | "flalign"
+            | "flalign*"
+            | "alignat"
+            | "alignat*"
+            | "eqnarray"
+            | "eqnarray*"
+            | "displaymath"
+            | "math"
+            | "dmath"
+            | "dmath*"
     )
 }
 

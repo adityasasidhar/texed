@@ -23,6 +23,9 @@ pub enum TexedError {
 
     #[error("Failed to write output: {0}")]
     OutputError(String),
+
+    #[error("internal error (please report this input): {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, TexedError>;
