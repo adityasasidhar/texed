@@ -295,3 +295,50 @@ fn captions_and_link_text() {
         same_text,
     );
 }
+
+#[test]
+fn bibliography_fields() {
+    // Text in .bib fields is LaTeX and comes out through the same escaping
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut rng = Rng(77);
+    let mut failures = Vec::new();
+    for _ in 0..200 {
+        let case = random_case(&mut rng);
+        let bib = format!(
+            "@article{{k, author = {{Ann Author}}, title = {{{}}}, journal = {{{}}}, year = 2000}}\n",
+            to_latex(&case),
+            to_latex(&case)
+        );
+        std::fs::write(dir.path().join("refs.bib"), bib).unwrap();
+        let markdown = texed::convert_with(
+            "See \\cite{k}.\n\\bibliography{refs}",
+            &texed::Options {
+                no_frontmatter: true,
+                base_path: Some(dir.path().to_path_buf()),
+            },
+        )
+        .expect("conversion succeeds")
+        .markdown;
+        let rendered = render(&markdown);
+        let seen = normalize(&rendered.text);
+        // parts are joined with ". " unless one already ends a sentence
+        let sep = if case.ends_with(['.', '?', '!']) { " " } else { ". " };
+        let expected = format!("\"{}\"{} {}{}2000.", case, sep.trim_end(), case, sep);
+        if !rendered.unexpected_html.is_empty() || rendered.links != 0 || !seen.contains(&normalize(&expected)) {
+            failures.push(format!("  text {:?}\n  markdown {:?}\n  seen {:?}", case, markdown, seen));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "[bibliography] {} case(s) did not round-trip:\n{}",
+        failures.len(),
+        failures.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn macro_bodies() {
+    // Expanded macro bodies are re-lexed: text in them must survive as is
+    check_context("macro body", 91, |c| format!("\\newcommand{{\\body}}{{{}}}\n\\body", c), same_text);
+    check_context("xparse body", 92, |c| format!("\\NewDocumentCommand{{\\body}}{{m}}{{#1}}\n\\body{{{}}}", c), same_text);
+}

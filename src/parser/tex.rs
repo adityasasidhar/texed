@@ -1150,7 +1150,15 @@ pub(super) fn uses_expl_names(text: &str) -> bool {
                 underscore |= bytes[j] == b'_';
                 j += 1;
             }
-            if underscore && j < bytes.len() && bytes[j] == b':' && j > start + 1 {
+            // `\__private:n` or `\module_name:n`, not an escaped `\_` before
+            // a word and a colon (`\_foo: bar` in text)
+            let name = &bytes[start..j];
+            let shape_ok = match name.first() {
+                Some(b'_') => name.starts_with(b"__") && name.len() > 2 && name[2].is_ascii_alphabetic(),
+                Some(c) => c.is_ascii_alphabetic(),
+                None => false,
+            };
+            if underscore && shape_ok && j < bytes.len() && bytes[j] == b':' && j > start + 1 {
                 return true;
             }
             i = j.max(i + 1);

@@ -359,15 +359,17 @@ impl CitationManager {
         if parts.is_empty() {
             return escape_latex(&entry.key);
         }
+        // a part already ending a sentence (also inside `\emph{...}`) takes
+        // no extra period
+        let ends_sentence = |text: &str| text.trim_end_matches('}').ends_with(['.', '?', '!']);
         let mut out = String::new();
         for part in parts {
             if !out.is_empty() {
-                let ends_with_stop = out.ends_with('.') || out.ends_with('?') || out.ends_with('!');
-                out.push_str(if ends_with_stop { " " } else { ". " });
+                out.push_str(if ends_sentence(&out) { " " } else { ". " });
             }
             out.push_str(&part);
         }
-        if !out.ends_with('.') && !out.ends_with('}') {
+        if !ends_sentence(&out) && !out.ends_with('}') {
             out.push('.');
         }
         out

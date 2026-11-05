@@ -589,7 +589,11 @@ impl Parser {
     /// Parse a LaTeX fragment (a bibliography field, a formatted citation)
     /// into inline content.
     fn latex_to_inlines(&mut self, source: &str) -> Vec<Inline> {
-        let tokens = tex::lex_fragment(source);
+        // document text, never package code: no expl3/@ syntax guessing
+        let mut tokens = Lexer::new(source).tokenize().unwrap_or_default();
+        if matches!(tokens.last(), Some(Token::Eof)) {
+            tokens.pop();
+        }
         match self.parse_inline_fragment_tokens(tokens) {
             Ok((inlines, _)) => trim_inline_whitespace(inlines),
             Err(_) => vec![Inline::Text(source.to_string())],
