@@ -1442,9 +1442,7 @@ fn find_verbatim_begin(text: &str) -> Option<(usize, usize, String)> {
     while let Some(pos) = text[search..].find("\\begin{") {
         let begin = search + pos;
         let name_start = begin + 7;
-        let Some(close) = text[name_start..].find('}') else {
-            return None;
-        };
+        let close = text[name_start..].find('}')?;
         let name = &text[name_start..name_start + close];
         if is_verbatim_environment(name) || matches!(name, "example" | "examples" | "code" | "codeblock") {
             return Some((begin, name_start + close + 1, name.to_string()));

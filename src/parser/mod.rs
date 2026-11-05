@@ -2799,10 +2799,8 @@ impl Parser {
                                 kept = group;
                             }
                         }
-                        'N' => {
-                            if !self.is_at_end() && !matches!(self.current_token(), Token::RightBrace) {
-                                self.advance();
-                            }
+                        'N' if !self.is_at_end() && !matches!(self.current_token(), Token::RightBrace) => {
+                            self.advance();
                         }
                         _ => {}
                     }

@@ -329,38 +329,6 @@ pub fn resolve_graphics_file(
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_graphics_path() {
-        let paths = parse_graphics_path("{./images/}{./figures/}");
-        assert_eq!(paths.len(), 2);
-        assert_eq!(paths[0], PathBuf::from("./images/"));
-        assert_eq!(paths[1], PathBuf::from("./figures/"));
-    }
-
-    #[test]
-    fn test_include_system_creation() {
-        let system = IncludeSystem::new();
-        assert!(!system.search_paths.is_empty());
-        assert_eq!(system.max_depth, 10);
-    }
-
-    #[test]
-    fn test_add_search_path() {
-        let mut system = IncludeSystem::new();
-        let initial_count = system.search_paths.len();
-        
-        system.add_search_path(PathBuf::from("/tmp/test"));
-        assert_eq!(system.search_paths.len(), initial_count + 1);
-        
-        // Adding same path again should not increase count
-        system.add_search_path(PathBuf::from("/tmp/test"));
-        assert_eq!(system.search_paths.len(), initial_count + 1);
-    }
-}
 
 
 /// Verbatim environments and inline-verbatim commands defined by a
@@ -452,4 +420,37 @@ fn referenced_files(text: &str) -> Vec<(String, Vec<&'static str>)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_graphics_path() {
+        let paths = parse_graphics_path("{./images/}{./figures/}");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], PathBuf::from("./images/"));
+        assert_eq!(paths[1], PathBuf::from("./figures/"));
+    }
+
+    #[test]
+    fn test_include_system_creation() {
+        let system = IncludeSystem::new();
+        assert!(!system.search_paths.is_empty());
+        assert_eq!(system.max_depth, 10);
+    }
+
+    #[test]
+    fn test_add_search_path() {
+        let mut system = IncludeSystem::new();
+        let initial_count = system.search_paths.len();
+        
+        system.add_search_path(PathBuf::from("/tmp/test"));
+        assert_eq!(system.search_paths.len(), initial_count + 1);
+        
+        // Adding same path again should not increase count
+        system.add_search_path(PathBuf::from("/tmp/test"));
+        assert_eq!(system.search_paths.len(), initial_count + 1);
+    }
 }
