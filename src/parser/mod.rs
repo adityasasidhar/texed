@@ -10,6 +10,7 @@ use crate::state::{LabelType, MacroDef, ParserState};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+mod knowledge;
 mod math;
 mod tex;
 
@@ -163,6 +164,8 @@ pub struct Parser {
     /// element) so that advancing is a pop and splicing a macro expansion in
     /// front of the cursor is O(expansion length) rather than O(document).
     tokens: Vec<Token>,
+    /// Total tokens consumed so far (monotonic; used to guarantee progress).
+    consumed: u64,
     /// Nesting depth of parse_block/parse_inline recursion; bounded by
     /// MAX_NESTING_DEPTH so pathological input cannot overflow the stack.
     depth: usize,
@@ -185,6 +188,8 @@ pub struct Parser {
     in_preamble: bool,
     /// `\end{document}` was reached (possibly inside an included file).
     document_ended: bool,
+    /// Preamble state to restore when each loaded package ends.
+    package_preamble_restore: Vec<bool>,
     /// Open TeX conditionals whose taken branch is being parsed.
     cond_depth: usize,
     /// Macro expansions whose tokens are still pending: (name, stack length
@@ -227,6 +232,7 @@ impl Parser {
         Self {
             tokens: reverse_tokens(tokens),
             depth: 0,
+            consumed: 0,
             metadata: HashMap::new(),
             state: ParserState::new(),
             citation_manager: CitationManager::new(CitationStyle::Numeric),
@@ -241,6 +247,7 @@ impl Parser {
             list_depth: 0,
             in_preamble: false,
             document_ended: false,
+            package_preamble_restore: Vec::new(),
             cond_depth: 0,
             active_expansions: Vec::new(),
             expansion_counts: HashMap::new(),
@@ -497,6 +504,7 @@ impl Parser {
                 | "include"
                 | "input"
                 | "usepackage"
+                | "RequirePackage"
                 | "newcommand"
                 | "renewcommand"
                 | "providecommand"
@@ -536,8 +544,14 @@ impl Parser {
             return Ok(self.flatten_current_token().map(|inline| Block::Paragraph(vec![inline])));
         }
         self.depth += 1;
+        let consumed_before = self.consumed;
         let result = self.parse_block_inner();
         self.depth -= 1;
+        // Progress guarantee: every call consumes at least one token, so no
+        // loop over parse_block can ever spin forever
+        if self.consumed == consumed_before && !self.is_at_end() {
+            self.advance();
+        }
         // Material before \begin{document} is set-up, never typeset: it is
         // parsed for its side effects (definitions, metadata) only.
         if self.in_preamble && self.depth == 0 {
@@ -757,6 +771,18 @@ impl Parser {
                 }
                 if self.state.environments.contains_key(&env_name) {
                     return self.expand_user_environment_begin(&env_name);
+                }
+                // Theorem-like names whose \newtheorem lives in a style file
+                // we could not read: treat them as theorems anyway
+                if let Some(display) = knowledge::implicit_theorem_name(&env_name) {
+                    self.state.define_theorem_env(
+                        env_name.clone(),
+                        display.to_string(),
+                        !env_name.ends_with('*'),
+                        Some(env_name.trim_end_matches('*').to_string()),
+                        None,
+                    );
+                    return self.parse_theorem_like(&env_name);
                 }
                 // Preserve unsupported environments as raw LaTeX.
                 self.state.warn(format!(
@@ -1899,6 +1925,13 @@ impl Parser {
                     self.advance();
                     break;
                 }
+                // Block-producing commands end the paragraph
+                Token::Command(cmd)
+                    if matches!(cmd.as_str(), "maketitle" | "hrule")
+                        && !self.macro_processor.is_defined(&self.state, cmd) =>
+                {
+                    break;
+                }
                 _ => {
                     if let Some(inline) = self.parse_inline()? {
                         inlines.push(inline);
@@ -1927,8 +1960,12 @@ impl Parser {
             return Ok(self.flatten_current_token());
         }
         self.depth += 1;
+        let consumed_before = self.consumed;
         let result = self.parse_inline_inner();
         self.depth -= 1;
+        if self.consumed == consumed_before && !self.is_at_end() {
+            self.advance();
+        }
         result
     }
 
@@ -2175,6 +2212,10 @@ impl Parser {
             return Ok(None);
         }
 
+        if let Some(result) = self.parse_knowledge_command(&cmd)? {
+            return Ok(result);
+        }
+
         if let Some(literal) = text_symbol_command(&cmd) {
             return Ok(Some(Inline::Text(literal.to_string())));
         }
@@ -2409,6 +2450,305 @@ impl Parser {
                 self.parse_unknown_command(&cmd)
             }
         }
+    }
+
+    /// Commands described by the knowledge tables plus assorted content
+    /// commands. Returns `Ok(Some(result))` when handled.
+    fn parse_knowledge_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        if let Some(signature) = knowledge::setup_command(cmd) {
+            self.consume_text_star();
+            self.consume_signature(signature)?;
+            // Commands whose trailing groups vary: consume them all
+            if matches!(cmd, "titleformat" | "newcolumntype" | "AddToHook" | "AddToHookNext"
+                | "newlist" | "renewlist" | "DeclareFieldFormat")
+            {
+                self.consume_trailing_groups(8)?;
+            }
+            return Ok(Some(None));
+        }
+        if let Some((operands, value)) = knowledge::tex_assignment(cmd) {
+            self.consume_tex_assignment(operands, value);
+            return Ok(Some(None));
+        }
+        if let Some(markup) = knowledge::doc_markup(cmd) {
+            self.skip_whitespace_only();
+            if !matches!(self.current_token(), Token::LeftBrace) {
+                // used without an argument: not doc markup after all
+                return Ok(Some(None));
+            }
+            let text = self.parse_braced_text()?;
+            let text = text.trim().to_string();
+            return Ok(Some(Some(match markup {
+                knowledge::DocMarkup::Code => Inline::Code(text),
+                knowledge::DocMarkup::ControlSequence => {
+                    Inline::Code(format!("\\{}", text.trim_start_matches('\\')))
+                }
+                knowledge::DocMarkup::Meta(open, close) => {
+                    Inline::Text(format!("{}{}{}", open, text, close))
+                }
+            })));
+        }
+        match cmd {
+            "texorpdfstring" => {
+                let content = self.parse_braced_inlines()?;
+                self.skip_whitespace_and_comments();
+                let _ = self.parse_braced_text()?;
+                return Ok(Some(Some(span_or_single(content))));
+            }
+            "hypertarget" => {
+                let _ = self.parse_braced_text()?;
+                let content = self.parse_braced_inlines()?;
+                return Ok(Some(Some(span_or_single(content))));
+            }
+            "hyperlink" => {
+                let target = self.parse_braced_text()?;
+                let text = self.parse_braced_inlines()?;
+                return Ok(Some(Some(Inline::Link {
+                    text,
+                    url: format!("#{}", target.trim()),
+                    title: None,
+                })));
+            }
+            "epigraph" => {
+                let quote = self.parse_braced_inlines()?;
+                self.skip_whitespace_and_comments();
+                let source = self.parse_braced_inlines()?;
+                let mut content = vec![Inline::Emph(quote)];
+                if !source.is_empty() {
+                    content.push(Inline::Text(String::from(" \u{2014} ")));
+                    content.extend(source);
+                }
+                return Ok(Some(Some(span_or_single(content))));
+            }
+            "hologo" | "Hologo" => {
+                let name = self.parse_braced_text()?;
+                return Ok(Some(Some(Inline::Text(name))));
+            }
+            "space" | "nobreakspace" | "enspace" | "thinspace" | "enskip" => {
+                return Ok(Some(Some(Inline::Text(String::from(" ")))));
+            }
+            "char" => {
+                // \char65, \char"41
+                let value = self.read_char_code();
+                return Ok(Some(value.map(|c| Inline::Text(c.to_string()))));
+            }
+            "bye" | "endinput" | "stop" => {
+                // End of input: of the current \input file, or of the document
+                self.skip_to_end_of_file();
+                return Ok(Some(None));
+            }
+            "texed@endfile" => return Ok(Some(None)),
+            "comment" => {
+                // \comment ... \endcomment (comment package, plain form)
+                while !self.is_at_end() {
+                    let done = matches!(self.current_token(), Token::Command(c) if c == "endcomment");
+                    self.advance();
+                    if done {
+                        break;
+                    }
+                }
+                return Ok(Some(None));
+            }
+            "endcomment" => return Ok(Some(None)),
+            "declaretheorem" => {
+                self.parse_declaretheorem()?;
+                return Ok(Some(None));
+            }
+            "newmdtheoremenv" | "newtcbtheorem" | "newtheoremrep" => {
+                // \newmdtheoremenv[opts]{name}[counter]{Title}[within]
+                let unnumbered = self.consume_text_star();
+                self.skip_whitespace_and_comments();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                self.parse_newtheorem_command(unnumbered)?;
+                if cmd == "newtcbtheorem" {
+                    self.consume_trailing_groups(2)?;
+                }
+                return Ok(Some(None));
+            }
+            _ => {}
+        }
+        if let Some(symbol) = knowledge::text_math_symbol(cmd) {
+            return Ok(Some(Some(Inline::Text(symbol.to_string()))));
+        }
+        Ok(None)
+    }
+
+    /// Consume the arguments of a set-up command.
+    fn consume_signature(&mut self, signature: knowledge::Signature) -> Result<()> {
+        if signature.leading_optional {
+            self.skip_whitespace_only();
+            while matches!(self.current_token(), Token::LeftBracket) {
+                let _ = self.collect_bracketed_tokens();
+                self.skip_whitespace_only();
+            }
+        }
+        for _ in 0..signature.braced {
+            self.skip_whitespace_only();
+            match self.current_token() {
+                Token::LeftBrace => {
+                    let _ = self.collect_braced_tokens();
+                }
+                // A single-token argument (\setlength\parindent{0pt})
+                Token::Command(_) | Token::Text(_) => self.advance(),
+                _ => break,
+            }
+        }
+        if signature.trailing_optional {
+            while matches!(self.current_token(), Token::LeftBracket) {
+                let _ = self.collect_bracketed_tokens();
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume up to `max` directly following `[...]`/`{...}` groups.
+    fn consume_trailing_groups(&mut self, max: usize) -> Result<()> {
+        for _ in 0..max {
+            let mut look = 0;
+            while matches!(
+                self.peek_at(look),
+                Some(Token::Whitespace(_)) | Some(Token::Newline) | Some(Token::Comment(_))
+            ) {
+                look += 1;
+            }
+            match self.peek_at(look) {
+                Some(Token::LeftBrace) => {
+                    self.skip_n(look);
+                    let _ = self.collect_braced_tokens();
+                }
+                Some(Token::LeftBracket) => {
+                    self.skip_n(look);
+                    let _ = self.collect_bracketed_tokens();
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume a TeX assignment: `operands` control sequences, then (when
+    /// `value`) an optional `=` and a number/dimension/glue specification.
+    fn consume_tex_assignment(&mut self, operands: usize, value: bool) {
+        for _ in 0..operands {
+            self.skip_whitespace_only();
+            if matches!(self.current_token(), Token::Command(_)) {
+                self.advance();
+            }
+        }
+        if !value {
+            return;
+        }
+        let mut consumed = 0;
+        let mut seen_value = false;
+        while consumed < 24 {
+            match self.current_token().clone() {
+                Token::Whitespace(_) | Token::Newline => self.advance(),
+                Token::Text(t) if is_tex_value_text(&t) => {
+                    seen_value |= t.chars().any(|c| c.is_ascii_digit());
+                    self.advance();
+                }
+                // `\catcode`\@=11`: the backquote lexes as a quote character
+                Token::Text(t) if t == "\u{2018}" || t == "`" => self.advance(),
+                Token::Command(name)
+                    if !seen_value
+                        || matches!(
+                            name.as_str(),
+                            "fill" | "fil" | "z@" | "p@" | "@ne" | "m@ne" | "tw@" | "thr@@"
+                                | "sixt@@n" | "@m" | "@M" | "@MM"
+                        ) =>
+                {
+                    self.advance();
+                    // a register as the value: \parskip=\baselineskip
+                    seen_value = true;
+                }
+                _ => break,
+            }
+            consumed += 1;
+        }
+    }
+
+    /// Read the character code after `\char`.
+    fn read_char_code(&mut self) -> Option<char> {
+        self.skip_whitespace_only();
+        match self.current_token().clone() {
+            Token::Text(t) => {
+                self.advance();
+                let (radix, digits) = if let Some(rest) = t.strip_prefix('"') {
+                    (16, rest)
+                } else if let Some(rest) = t.strip_prefix('\'') {
+                    (8, rest)
+                } else {
+                    (10, t.as_str())
+                };
+                let numeric: String = digits.chars().take_while(|c| c.is_digit(radix)).collect();
+                let rest = digits[numeric.len()..].to_string();
+                if !rest.is_empty() {
+                    self.push_front(vec![Token::Text(rest)]);
+                }
+                u32::from_str_radix(&numeric, radix).ok().and_then(char::from_u32)
+            }
+            _ => None,
+        }
+    }
+
+    /// `\endinput`/`\bye`: skip to the end of the current input file
+    /// (marked by `texed@endfile`), or of the whole document.
+    fn skip_to_end_of_file(&mut self) {
+        while !self.is_at_end() {
+            let at_marker = matches!(self.current_token(), Token::Command(c) if c == "texed@endfile");
+            self.advance();
+            if at_marker {
+                return;
+            }
+        }
+    }
+
+    /// thmtools: `\declaretheorem[name=Theorem, numberwithin=section]{thm}`.
+    fn parse_declaretheorem(&mut self) -> Result<()> {
+        self.skip_whitespace_and_comments();
+        let options = if matches!(self.current_token(), Token::LeftBracket) {
+            self.parse_bracketed_text()?
+        } else {
+            String::new()
+        };
+        self.skip_whitespace_and_comments();
+        let names = self.parse_braced_text()?;
+        // Options may also follow the name (newer thmtools syntax)
+        let options = if matches!(self.current_token(), Token::LeftBracket) {
+            format!("{},{}", options, self.parse_bracketed_text()?)
+        } else {
+            options
+        };
+        let option = |key: &str| -> Option<String> {
+            options.split(',').find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                (parts.next()?.trim() == key).then(|| parts.next().unwrap_or("").trim().to_string())
+            })
+        };
+        let numbered = !matches!(option("numbered").as_deref(), Some("no"));
+        let sibling = option("sibling")
+            .or_else(|| option("numberlike"))
+            .or_else(|| option("sharenumber"));
+        let within = option("numberwithin").or_else(|| option("parent"));
+        for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            let display = option("name").or_else(|| option("title")).unwrap_or_else(|| {
+                let mut chars = name.chars();
+                chars
+                    .next()
+                    .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                    .unwrap_or_default()
+            });
+            self.state.define_theorem_env(
+                name.to_string(),
+                display,
+                numbered,
+                sibling.clone(),
+                within.clone(),
+            );
+        }
+        Ok(())
     }
 
     /// Fallback for commands with no known meaning: the command itself is
@@ -3167,6 +3507,7 @@ impl Parser {
                     if matches!(tokens.last(), Some(Token::Eof)) {
                         tokens.pop();
                     }
+                    tokens.push(Token::Command(String::from("texed@endfile")));
                     self.push_front(tokens);
                 }
             }
@@ -3427,8 +3768,14 @@ impl Parser {
                 // packages as options
                 if cmd == "documentstyle" {
                     for package in options.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                        let _ = self.include_system.load_package(&mut self.state, package, &[]);
+                        let package = package.to_string();
+                        self.load_local_package(&package);
                     }
+                }
+                // A local .cls next to the document carries its macros
+                if !class.is_empty() {
+                    let class_file = format!("{}.cls", class);
+                    self.load_local_package(&class_file);
                 }
                 Ok(None)
             }
@@ -3472,16 +3819,22 @@ impl Parser {
             }
             
             // Package loading
-            "usepackage" => {
+            "usepackage" | "RequirePackage" => {
                 self.advance();
+                self.skip_whitespace_and_comments();
                 let options = if matches!(self.current_token(), Token::LeftBracket) {
                     self.parse_bracketed_text()?
                 } else {
                     String::new()
                 };
-
-                let package = self.parse_braced_text()?;
-                if !package.is_empty() {
+                self.skip_whitespace_and_comments();
+                let packages = self.parse_braced_text()?;
+                // Optional [date] after the package list
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                for package in packages.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let package = package.to_string();
                     // biblatex declares its citation style as a package option
                     if package == "biblatex" {
                         let author_year = options.split(',').any(|opt| {
@@ -3495,7 +3848,7 @@ impl Parser {
                                 .set_style(crate::state::CitationStyle::AuthorYear);
                         }
                     }
-                    let _ = self.include_system.load_package(&mut self.state, &package, &[]);
+                    self.load_local_package(&package);
                 }
                 Ok(None)
             }
@@ -3705,6 +4058,34 @@ impl Parser {
         }
     }
 
+    /// Read a package/class file found next to the document (local style
+    /// files hold the document's macro and theorem definitions) and splice
+    /// it in. Packages not found locally are standard ones: nothing to do.
+    fn load_local_package(&mut self, package: &str) {
+        let base = self.base_path.clone();
+        if let Ok(Some(content)) =
+            self.include_system
+                .load_package(&mut self.state, package, &[], base.as_deref())
+        {
+            if !self.consume_expansion_bytes(package, content.len()) {
+                return;
+            }
+            let mut tokens = Lexer::new(&content)
+                .with_at_letter(true)
+                .tokenize()
+                .unwrap_or_default();
+            if matches!(tokens.last(), Some(Token::Eof)) {
+                tokens.pop();
+            }
+            // Package code is set-up only, even if it contains stray text
+            tokens.push(Token::Command(String::from("texed@endpackage")));
+            let was_preamble = self.in_preamble;
+            self.in_preamble = true;
+            self.package_preamble_restore.push(was_preamble);
+            self.push_front(tokens);
+        }
+    }
+
     /// Charge `bytes` of expansion output against the document's budget.
     fn consume_expansion_bytes(&mut self, name: &str, bytes: usize) -> bool {
         let limit = BASE_EXPANSION_BYTES.saturating_add(self.source_token_count.saturating_mul(256));
@@ -3766,7 +4147,9 @@ impl Parser {
     /// Discard the next `n` tokens.
     fn skip_n(&mut self, n: usize) {
         let len = self.tokens.len();
-        self.tokens.truncate(len.saturating_sub(n));
+        let n = n.min(len);
+        self.tokens.truncate(len - n);
+        self.consumed += n as u64;
     }
 
     /// Insert tokens so that `tokens[0]` becomes the current token.
@@ -3776,7 +4159,9 @@ impl Parser {
     }
 
     fn advance(&mut self) {
-        self.tokens.pop();
+        if self.tokens.pop().is_some() {
+            self.consumed += 1;
+        }
     }
 
     fn is_at_end(&self) -> bool {
@@ -3868,8 +4253,7 @@ fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
         // Two braced arguments
         "setlength" | "addtolength" | "setcounter" | "addtocounter" | "numberwithin"
         | "markboth" | "fontsize" | "DeclareMathOperator" | "settowidth"
-        | "addcontentsline" | "PassOptionsToPackage" | "AtBeginDocument"
-        | "RequirePackage" => Some((2, false)),
+        | "addcontentsline" | "PassOptionsToPackage" => Some((2, false)),
 
         // Three braced arguments
         "definecolor" | "addtocontents" => Some((3, false)),
@@ -4267,6 +4651,45 @@ fn eqnarray_row_to_aligned(row: &str) -> String {
     out
 }
 
+/// A list of inlines as one inline.
+fn span_or_single(mut content: Vec<Inline>) -> Inline {
+    if content.len() == 1 {
+        content.pop().unwrap()
+    } else {
+        Inline::Span {
+            attrs: HashMap::new(),
+            content,
+        }
+    }
+}
+
+/// Does a text token look like part of a TeX number/dimension/glue value
+/// (`0pt`, `=11`, `plus`, `1fil`, `-.5em`, `by`)?
+fn is_tex_value_text(text: &str) -> bool {
+    let text = text.trim_start_matches('=');
+    if text.is_empty() {
+        return true;
+    }
+    if matches!(
+        text,
+        "plus" | "minus" | "by" | "at" | "scaled" | "true" | "fil" | "fill" | "filll" | "to" | "spread"
+    ) {
+        return true;
+    }
+    let numeric_end = text
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | ',' | '-' | '+' | '"' | '\'')))
+        .unwrap_or(text.len());
+    if numeric_end == 0 {
+        return false;
+    }
+    let unit = &text[numeric_end..];
+    matches!(
+        unit,
+        "" | "pt" | "em" | "ex" | "in" | "cm" | "mm" | "bp" | "pc" | "sp" | "dd" | "cc" | "mu"
+            | "fil" | "fill" | "filll" | "px" | "truept" | "truein" | "truecm"
+    )
+}
+
 /// Parse TeX parameter text (`#1#2`, `#1.#2\par`, `(#1)`) into
 /// (prefix before #1, delimiter after each parameter, parameter count).
 fn parse_tex_param_text(text: &str) -> (String, Vec<String>, usize) {
@@ -4338,6 +4761,7 @@ fn is_inline_safe_block_command(cmd: &str) -> bool {
             | "date"
             | "graphicspath"
             | "usepackage"
+            | "RequirePackage"
             | "documentclass"
             | "documentstyle"
     )

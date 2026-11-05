@@ -102,6 +102,21 @@ impl Parser {
                 self.parse_let()?;
                 return Ok(Some(None));
             }
+            "texed@endpackage" => {
+                if let Some(was_preamble) = self.package_preamble_restore.pop() {
+                    self.in_preamble = was_preamble;
+                }
+                return Ok(Some(None));
+            }
+            // Deferred hooks run immediately: their bodies are usually
+            // definitions the document relies on
+            "AtBeginDocument" | "AtEndPreamble" | "AtEndOfPackage" | "AtEndOfClass"
+            | "AfterEndPreamble" => {
+                self.skip_whitespace_and_comments();
+                let body = self.collect_braced_tokens();
+                self.push_front(body);
+                return Ok(Some(None));
+            }
             "futurelet" => {
                 for _ in 0..3 {
                     self.skip_whitespace_and_comments();

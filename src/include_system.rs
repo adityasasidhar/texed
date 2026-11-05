@@ -183,11 +183,16 @@ impl IncludeSystem {
         state: &mut ParserState,
         package_name: &str,
         options: &[String],
+        base_path: Option<&Path>,
     ) -> Result<Option<String>> {
-        let filename = format!("{}.sty", package_name);
-        
+        let filename = if package_name.ends_with(".sty") || package_name.ends_with(".cls") {
+            package_name.to_string()
+        } else {
+            format!("{}.sty", package_name)
+        };
+
         // Try to find and read the package file
-        match self.resolve_path(&filename, None, false) {
+        match self.resolve_path(&filename, base_path, false) {
             Ok(path) => {
                 let canonical_path = path
                     .canonicalize()
