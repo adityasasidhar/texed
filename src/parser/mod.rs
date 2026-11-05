@@ -1056,7 +1056,9 @@ impl Parser {
             | "absolutelynopagebreak" | "nopagebreak" | "needspace" | "spacing*" | "addmargin*"
             | "frontmatter" | "mainmatter" | "backmatter" | "refsection" | "refsegment"
             | "hyphenrules" | "selectlanguage" | "CJK" | "CJK*" | "arabtext" | "hebrew" | "russian"
-            | "sloppypar*" | "arrangement" | "FloatBarrier" | "textblock" | "textblock*" => {
+            | "sloppypar*" | "arrangement" | "FloatBarrier" | "textblock" | "textblock*"
+            // l3doc's documentation/implementation parts
+            | "documentation" | "implementation" => {
                 let args = match env_name.as_str() {
                     "adjustwidth" | "addmargin" | "addmargin*" | "changemargin" => 2,
                     "otherlanguage" | "otherlanguage*" | "Spacing" | "needspace" | "CJK" | "CJK*"
@@ -1085,6 +1087,9 @@ impl Parser {
                 self.skip_overlay_spec();
                 self.parse_transparent_environment(&env_name, 0, true)
             }
+            // l3doc: \begin{function}[EXP]{\foo:n, \foo:V} ... (names, then usage)
+            "function" | "variable" if self.l3doc_names_follow() => self.parse_l3doc_function(&env_name),
+            "syntax" => self.parse_transparent_environment(&env_name, 0, false),
             // algorithm floats (algorithm2e's procedure/function too)
             "algorithm" | "algorithm*" | "algorithm2e" | "procedure" | "function" => {
                 self.parse_algorithm_float(&env_name)
@@ -1212,6 +1217,76 @@ impl Parser {
 
     /// Parse an environment whose contents should simply flow into the
     /// document (center, minipage, ...), consuming any leading arguments.
+    /// Whether an l3doc name list follows (`[opts]{\cs, ...}`): a braced
+    /// group starting with a control sequence (algorithm2e's `function` takes
+    /// none).
+    fn l3doc_names_follow(&self) -> bool {
+        let mut look = 0;
+        let skip = |look: &mut usize| {
+            while matches!(self.peek_at(*look), Some(Token::Whitespace(_) | Token::Newline | Token::Comment(_))) {
+                *look += 1;
+            }
+        };
+        skip(&mut look);
+        if matches!(self.peek_at(look), Some(Token::LeftBracket)) {
+            let mut depth = 0usize;
+            while let Some(token) = self.peek_at(look) {
+                look += 1;
+                match token {
+                    Token::LeftBrace => depth += 1,
+                    Token::RightBrace => depth = depth.saturating_sub(1),
+                    Token::RightBracket if depth == 0 => break,
+                    Token::ParBreak => return false,
+                    _ => {}
+                }
+                if look > 200 {
+                    return false;
+                }
+            }
+            skip(&mut look);
+        }
+        if !matches!(self.peek_at(look), Some(Token::LeftBrace)) {
+            return false;
+        }
+        look += 1;
+        skip(&mut look);
+        matches!(self.peek_at(look), Some(Token::Command(_)))
+    }
+
+    /// l3doc's `function`/`variable`: the documented names as a code line,
+    /// then the body (its `syntax` block and description).
+    fn parse_l3doc_function(&mut self, env_name: &str) -> Result<Option<Block>> {
+        self.skip_whitespace_only();
+        if matches!(self.current_token(), Token::LeftBracket) {
+            let _ = self.collect_bracketed_tokens();
+        }
+        self.skip_whitespace_only();
+        let tokens = self.collect_braced_tokens();
+        let names = self.raw_token_text(&tokens);
+        let mut line = Vec::new();
+        for name in names.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+            if !line.is_empty() {
+                line.push(Inline::Text(String::from(",")));
+                line.push(Inline::Space);
+            }
+            line.push(Inline::Code(name.split_whitespace().collect::<Vec<_>>().join(" ")));
+        }
+        let mut blocks = Vec::new();
+        if !line.is_empty() {
+            blocks.push(Block::Paragraph(line));
+        }
+        match self.parse_transparent_environment(env_name, 0, false)? {
+            Some(Block::Composite(body)) => blocks.extend(body),
+            Some(block) => blocks.push(block),
+            None => {}
+        }
+        Ok(match blocks.len() {
+            0 => None,
+            1 => blocks.pop(),
+            _ => Some(Block::Composite(blocks)),
+        })
+    }
+
     fn parse_transparent_environment(
         &mut self,
         env_name: &str,
@@ -4104,6 +4179,16 @@ impl Parser {
                     _ => tokens,
                 };
                 self.push_front(tokens);
+                return Ok(Some(None));
+            }
+            // \use:c{name}: the control sequence \name (\csname...\endcsname)
+            "use:c" => {
+                self.skip_whitespace_only();
+                let tokens = self.collect_braced_tokens();
+                let name = self.x_expand_tokens(&tokens, 0).trim().to_string();
+                if !name.is_empty() && !is_file_end_marker(&name) {
+                    self.push_front(vec![Token::Command(name)]);
+                }
                 return Ok(Some(None));
             }
             // x-/e-type expansion: constants, token-list variables and

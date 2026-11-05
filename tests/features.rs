@@ -676,3 +676,17 @@ fn chapter_fragment_showing_document_markup() {
     // a real fragment preamble still is one
     lacks("\\usepackage{amsmath}\\newcommand\\x{y}\nSetup junk\n\\begin{document}\nBody\\end{document}", "Setup junk");
 }
+
+#[test]
+fn l3doc_function_blocks_and_expl_token_lists() {
+    let doc = "\\begin{documentation}\n\\begin{function}[EXP]{\\foo:n, \\foo:V}\n\\begin{syntax}\n\\cs{foo:n} \\Arg{tl}\n\\end{syntax}\nDoes foo.\n\\end{function}\n\\end{documentation}";
+    has(doc, "`\\foo:n`, `\\foo:V`");
+    has(doc, "Does foo.");
+    lacks(doc, "begin{");
+    // \begin{Verbatim} built as a token list in expl3 code is not verbatim
+    let expl = "\\documentclass{article}\\ExplSyntaxOn\n\\cs_new:Npn \\__demo:n #1 { \\tl_to_str:n { \\begin { Verbatim } } #1 }\n\\ExplSyntaxOff\n\\begin{document}\nBody text.\n\\end{document}";
+    has(expl, "Body text.");
+    // a body using \use:c is re-lexed with expl3 syntax
+    has("\\ExplSyntaxOn\\cs_new:Npn \\__x:n #1 {[#1]}\\NewDocumentCommand\\demo{m}{\\use:c{__x:n}{#1}}\\ExplSyntaxOff\n\\demo{hi}", "[hi]");
+    lacks("\\ExplSyntaxOn\\cs_new:Npn \\__x:n #1 {[#1]}\\NewDocumentCommand\\demo{m}{\\use:c{__x:n}{#1}}\\ExplSyntaxOff\n\\demo{hi}", ":c");
+}

@@ -736,8 +736,9 @@ impl Lexer {
         let env_name = env_name.trim().to_string();
 
         // Verbatim-like environments capture their body raw so that %, $, \ etc.
-        // inside code are not interpreted as LaTeX.
-        if is_verbatim_environment(&env_name) || self.verbatim_envs.contains(&env_name) {
+        // inside code are not interpreted as LaTeX. (expl3 code only builds
+        // such text as token lists: `\tl_to_str:n { \begin { Verbatim } }`)
+        if !self.expl_syntax && (is_verbatim_environment(&env_name) || self.verbatim_envs.contains(&env_name)) {
             let content = self.read_until_sequence(&format!("\\end{{{}}}", env_name));
             return Ok(Some(Token::VerbatimEnv {
                 name: env_name,

@@ -72,7 +72,7 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         | "GenericError" => sig(false, 2, false),
 
         // Counters, lengths, boxes
-        "newlength" | "newsavebox" => sig(false, 1, false),
+        "newlength" | "newsavebox" | "GetFileInfo" => sig(false, 1, false),
         "setlength" | "addtolength" | "settowidth" | "settoheight" | "settodepth" => sig(false, 2, false),
         "newaliascnt" | "letcountercounter" | "counterwithout" => sig(false, 2, false),
         "aliascntresetthe" => sig(false, 1, false),

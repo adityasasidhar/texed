@@ -1588,6 +1588,14 @@ pub(super) fn uses_expl_names(text: &str) -> bool {
             if underscore && shape_ok && j < bytes.len() && bytes[j] == b':' && j > start + 1 {
                 return true;
             }
+            // a kernel function without an underscore (`\use:c`, `\use:n`):
+            // the colon is followed by an argument signature
+            if shape_ok && j < bytes.len() && bytes[j] == b':' && j > start + 1 {
+                let sig: Vec<u8> = bytes[j + 1..].iter().take_while(|b| b.is_ascii_alphabetic()).copied().collect();
+                if !sig.is_empty() && sig.len() <= 6 && sig.iter().all(|b| b"NncVvoxefTFpwD".contains(b)) {
+                    return true;
+                }
+            }
             i = j.max(i + 1);
         } else {
             i += 1;
