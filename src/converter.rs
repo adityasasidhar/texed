@@ -625,8 +625,14 @@ impl MarkdownConverter {
         let inner = std::mem::replace(&mut self.output, saved);
         result?;
 
-        let leading_ws = inner.len() - inner.trim_start().len();
-        let trailing_ws = inner.len() - inner.trim_end().len();
+        // Edge whitespace: in the rendered text, or as a leading Space inline
+        // (which renders to nothing in an empty buffer)
+        let starts_with_space = matches!(content.first(), Some(Inline::Space) | Some(Inline::SoftBreak))
+            || matches!(content.first(), Some(Inline::Text(t)) if t.starts_with(char::is_whitespace));
+        let ends_with_space = matches!(content.last(), Some(Inline::Space) | Some(Inline::SoftBreak))
+            || matches!(content.last(), Some(Inline::Text(t)) if t.ends_with(char::is_whitespace));
+        let leading_ws = (inner.len() - inner.trim_start().len()).max(starts_with_space as usize);
+        let trailing_ws = (inner.len() - inner.trim_end().len()).max(ends_with_space as usize);
         let core = inner.trim();
         if core.is_empty() {
             if !inner.is_empty() && !self.output.ends_with(' ') && !self.output.is_empty() {
@@ -702,16 +708,36 @@ impl MarkdownConverter {
             }
             Inline::Emph(content) => {
                 if self.emph_depth > 0 {
-                    // \emph inside \emph switches back to upright
+                    // (only reached through other wrappers) render upright
                     self.emph_depth -= 1;
                     let result = self.convert_inlines(content);
                     self.emph_depth += 1;
                     result?;
                 } else {
-                    self.emph_depth += 1;
-                    let result = self.convert_delimited(content, "*", "em");
-                    self.emph_depth -= 1;
-                    result?;
+                    // \emph inside \emph is upright: close the emphasis
+                    // around nested runs (`*a* b *c*`) instead of nesting
+                    let mut run: Vec<Inline> = Vec::new();
+                    for inline in content {
+                        match inline {
+                            Inline::Emph(inner) => {
+                                if !run.is_empty() {
+                                    self.emph_depth += 1;
+                                    let result = self.convert_delimited(&run, "*", "em");
+                                    self.emph_depth -= 1;
+                                    result?;
+                                    run.clear();
+                                }
+                                self.convert_inlines(inner)?;
+                            }
+                            other => run.push(other.clone()),
+                        }
+                    }
+                    if !run.is_empty() {
+                        self.emph_depth += 1;
+                        let result = self.convert_delimited(&run, "*", "em");
+                        self.emph_depth -= 1;
+                        result?;
+                    }
                 }
             }
             Inline::Strong(content) => {

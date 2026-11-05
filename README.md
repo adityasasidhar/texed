@@ -8,15 +8,14 @@ A fast and comprehensive command-line tool written in Rust to convert LaTeX docu
 
 ## Features
 
-- **Comprehensive LaTeX Support**: Handles sections, subsections, paragraphs, lists, tables, figures, math equations, and more
-- **Text Formatting**: Converts bold, italic, underline, superscript, subscript, and code formatting
-- **Math Support**: Preserves inline and display math equations
-- **Lists**: Supports itemize, enumerate, and description lists
-- **Tables**: Converts LaTeX tables to Markdown tables with alignment
-- **Figures**: Converts `\includegraphics` to Markdown image syntax
-- **Environments**: Handles quote, verbatim, code blocks, and theorem-like environments
-- **Fast Performance**: Built in Rust for optimal speed
-- **Flexible I/O**: Read from files or stdin, write to files or stdout
+- **Converts real documents**: papers, theses, books (tested on the Stacks Project, the HoTT book, the C++ standard draft, LaTeX's own documentation, journal templates and LaTeX 2.09-era sources), beamer slides, package documentation
+- **Faithful numbering and cross-references**: sections, `\section*`, `\appendix` (A, B, ...), per-chapter numbering in books, equations (per row in `align`), floats numbered by `\caption`, theorems with shared/scoped counters, subfigures (`1a`), cleveref-style `\cref{a,b}` → "sections 1 and 2"
+- **A real TeX macro layer**: `\newcommand`, `\def` with delimited parameters, `\let`, `\newif` and `\if...\else...\fi`, `\@ifnextchar`, `\csname`, xparse, local `.sty` files — and document macros are expanded *inside math* so formulas render in KaTeX/MathJax
+- **Packages**: amsmath, amsthm/thmtools, hyperref, cleveref, graphicx, subcaption/subfig, booktabs, longtable, threeparttable, multirow, listings, minted, algorithmicx/algorithm2e, siunitx, glossaries/acronym/acro, natbib/biblatex, beamer, TikZ (kept as code), etoolbox/ifthen, and many more
+- **Markdown-safe output**: literal text can never turn into Markdown syntax — verified by round-tripping random special-character text through a CommonMark parser
+- **Robust by construction**: never panics, hangs, or blows up on malformed or adversarial input (see [Robustness](#robustness))
+- **Any encoding**: UTF-8, UTF-16, Latin-1/Windows-1252; CRLF and classic-Mac CR line endings
+- **Fast**: a 400-page book converts in well under a second; usable as a CLI or as a Rust library
 
 ## Installation
 
@@ -121,6 +120,29 @@ $ texed paper.tex -o paper.md --stats
 texed --completions bash > /etc/bash_completion.d/texed
 texed --completions zsh  > ~/.zfunc/_texed
 texed --completions fish > ~/.config/fish/completions/texed.fish
+```
+
+## Robustness
+
+Conversion is *total*: every input produces Markdown.
+
+- Unbalanced braces, unclosed environments, a stray `$`, half-finished `\begin{`, `\verb` without a closing delimiter: each is bounded by TeX's own rules (math cannot span a blank line, `\verb` cannot span a line), so one typo never swallows the rest of the document
+- Recursive and self-replicating macros (`\def\a{\a\a}`) are detected and stopped with a warning; expansion budgets scale with document size
+- 100,000 levels of nested braces or environments do not overflow the stack
+- Constructs that cannot be converted faithfully are reported by `--check` instead of failing the conversion
+
+The test suite fuzzes the converter with random fragment soup, random bytes, every prefix of a real document, deeply nested input and pathological macros.
+
+## Library Usage
+
+```rust
+let markdown = texed::convert(r"\section{Hello} $E = mc^2$")?;
+
+let result = texed::convert_with(latex, &texed::Options {
+    base_path: Some("paper/".into()), // where \input, \bibliography, .sty files are found
+    no_frontmatter: true,
+})?;
+for warning in &result.warnings { eprintln!("{warning}"); }
 ```
 
 ## Examples
@@ -228,7 +250,7 @@ Bob & 25 & LA \\
 
 **Output (Markdown):**
 ```markdown
-**Sample Table**
+**Table 1:** Sample Table
 
 | Name  | Age | City |
 |:------|:---:|:----:|
@@ -261,8 +283,12 @@ fn main() {
 ### Document Structure
 - `\part`, `\chapter`, `\section`, `\subsection`, `\subsubsection`, `\paragraph`, `\subparagraph` (starred variants too; H1 is reserved for the document title, so `\section` maps to `##`)
 - `\title`, `\author` (incl. `\and`/`\And`/`\AND`), `\date`, `\maketitle`, `\thanks` — emitted as YAML frontmatter plus a title block
-- `\label`, `\ref`, `\eqref`, `\autoref`, `\nameref`, `\pageref`, `\cref`/`\Cref`/`\vref` — resolved to numbers/names in a second pass, so **forward references work**
-- `\input`/`\include` (parsed recursively with shared state), `\usepackage`, `\graphicspath`
+- `\label`, `\ref`, `\eqref`, `\autoref`, `\nameref`, `\pageref`, `\cref`/`\Cref`/`\vref`, `\crefrange`, `\namecref`, `\labelcref` — resolved in a second pass, so **forward references work**; cleveref lists are grouped and pluralized (`\cref{a,b,f}` → "sections 1 and 2 and fig. 3")
+- `\input`/`\include`/`\import`/`\subfile` (also mid-paragraph or inside a table), `\usepackage`/`\RequirePackage`/`\documentclass` (local `.sty`/`.cls` files next to the document are read, so their macros and theorem definitions apply), `\graphicspath`, `\endinput`
+- Preamble handling: material before `\begin{document}` is set-up only; text after `\end{document}` is ignored, exactly as in LaTeX
+- Numbering: `\appendix`, per-chapter numbering in book/report classes, `\setcounter`, `\addtocounter`, `\numberwithin`, `\thesection`/`\arabic`/`\roman`/`\alph`
+- `\keywords` and `keywords`/`IEEEkeywords` environments
+- LaTeX 2.09: `\documentstyle[options]{style}`, `\bf`/`\it`/`\tt`/`\em` declarations anywhere in a group or paragraph, `\begin{em}`-style declaration environments
 
 ### Text Formatting
 - `\textbf`, `\textit`, `\emph`, `\textsl`, `\texttt`, `\underline`, `\ul`/`\uline`
@@ -284,32 +310,39 @@ fn main() {
 - `description` (pandoc-style definition lists)
 
 ### Math
-- Inline: `$...$` and `\(...\)`; display: `$$...$$` and `\[...\]`
+- Inline: `$...$` and `\(...\)`; display: `$$...$$` and `\[...\]` — math is captured raw (primes, `--`, quotes are never altered)
 - Environments: `equation`, `align`, `gather`, `multline`, `flalign`, `alignat`, `eqnarray`, `split`, `displaymath` (+ starred forms). Multi-line environments are wrapped in `aligned`/`gathered` so KaTeX/MathJax render them
-- `\label` in numbered environments becomes `\tag{n}`; `\eqref` renders `(n)`
-- **User macros are expanded inside math** (`\newcommand{\R}{\mathbb{R}}` → `$\mathbb{R}$`)
+- Every numbered equation (and every numbered `align` row) consumes a number, as in LaTeX; labeled ones get `\tag{n}`; `\nonumber`/`\notag`/`\tag{...}` respected
+- **User macros are expanded inside math** with the full macro engine (`\newcommand{\R}{\mathbb{R}}` → `$\mathbb{R}$`, `\@ifnextchar`-based notation macros, `\DeclareMathOperator` → `\operatorname`)
 
 ### Tables
-- `tabular`, `tabular*`, `tabularx`, `longtable`, `array`, `tabu` inside `table`/`table*`
+- `tabular`, `tabular*`, `tabularx`, `tabulary`, `longtable`, `supertabular`, `tblr`, `NiceTabular`, ... inside `table`/`table*`/`threeparttable` (or standalone); captions numbered (`**Table 1:** ...`)
+- Nested tabulars and lists/math inside `p{}` cells are kept in their cell; longtable `\endfirsthead`/`\endhead`/`\endfoot` handled (heads not duplicated); `tablenotes` and source lines kept
 - Column specs incl. `p{}/m{}/b{}/X`, `@{}`, `>{}`, `|`, `*{n}{spec}` repetition
 - `\hline`, booktabs rules (`\toprule`/`\midrule`/`\bottomrule`/`\cmidrule(lr){2-3}`) filtered correctly
 - `\multicolumn` (pads spanned cells), `\multirow`, `\\[len]` spacing
 - Output is aligned and padded for raw-text readability
 
 ### Figures
-- `figure`/`figure*`/`sidewaysfigure`/`wrapfigure`, `\includegraphics` (also inline), multiple images per figure, `\caption` with embedded `\label`
+- `figure`/`figure*`/`sidewaysfigure`/`wrapfigure`, `\includegraphics` (also inline, `\epsfig`, `\includesvg`), `\caption` with embedded `\label`
+- Sub-figures: `subfigure`/`subtable` environments, `\subfloat`, `\subcaptionbox` — rendered as `(a)`, `(b)` images, labels resolve to `1a`; minipages with their own captions are separate figures; TikZ inside figures kept
 
 ### Other Environments
 - `quote`, `quotation`, `displayquote`, `verse`, `abstract`
 - `verbatim` (captured raw — `%`, `$`, `\` inside code are safe), `lstlisting` (with `language=`), `minted`, `alltt`, `comment` (dropped)
 - `center`, `flushleft`, `flushright`, `minipage`, `multicols`, `titlepage` (transparent)
 - Theorem-like: built-in `theorem`/`lemma`/`proof`/... plus `\newtheorem{...}[shared]{...}[within]` with correct scoped numbering
-- `tikzpicture` preserved as LaTeX code blocks; unknown environments preserved raw
+- `tikzpicture`, `tikzcd`, `circuitikz`, `pspicture`, `forest` preserved verbatim as LaTeX code blocks; asymptote/gnuplot/luacode/pycode as code blocks
+- Undefined theorem-like names (`defn`, `prop`, `rmk*`, ...) render as theorems; unknown environments are preserved as fenced LaTeX
+- Pseudocode: `algorithm` floats with `algorithmic`/`algpseudocode` (`\State`, `\If`...`\EndIf`, `\Procedure`, ...), classic `\STATE`/`\IF`, and `algorithm2e` (`\If{c}{...}`, `\eIf`, `\ForEach`, `\KwIn`, `\;`) → numbered, indented lines with bold keywords and live math
+- beamer: frames become headings (`\frametitle`, subtitles), `block`/`alertblock`, `columns`; overlay specifications (`\item<2->`, `\only`, `\uncover`, `\alt`, `\pause`) are resolved to the final slide
 
 ### Macros
 - `\newcommand`, `\renewcommand`, `\providecommand`, `\def`, `\DeclareRobustCommand` — braced and unbraced names, `[n]` parameter counts, optional-argument defaults, TeX-style `#1#2` parameter text
 - Expansions are re-lexed and re-parsed, so macros producing formatting, math, or whole environments work
 - `\newenvironment`/`\renewenvironment` — begin/end definitions expand at use sites (with arguments), composing correctly with built-in environments
+- TeX programming: `\def`/`\gdef`/`\edef` with delimited parameters (`\def\foo#1.#2\par{...}`), `\let` (captures the built-in meaning), `\newif` + `\iffoo...\else...\fi`, `\iffalse` blocks, `\ifx`, `\ifnum`, `\ifcase`, `\ifdefined`, etoolbox `\iftoggle`/`\ifbool`/`\ifdef`, ifthen `\ifthenelse`, kernel `\@ifnextchar`/`\@ifstar`/`\@ifundefined`, `\csname...\endcsname`, `\makeatletter`, expl3 names
+- xparse `\NewDocumentCommand`, `\DeclareMathOperator`, `\AtBeginDocument` hooks
 
 ### Links, Citations, Bibliography
 - `\href{url}{text}` (with options), `\url`, `\hyperref[..]{...}`
@@ -319,16 +352,21 @@ fn main() {
 - `.bib` files via `\bibliography`/`\addbibresource` (robust character-level BibTeX parser: single-line entries, nested braces, quoted values, `@string`/`@comment`) → rendered References section
 - `thebibliography`/`\bibitem` → numbered References section with resolved `[n]` markers
 
+### Units, Acronyms, Glossaries
+- siunitx: `\SI`/`\qty`, `\si`/`\unit`, `\num`, `\ang`, ranges, lists, products → `9.81 m/s²`, `1.5 × 10⁻³`, `30°15′`
+- glossaries (`\newacronym`, `\newglossaryentry`, `\gls`, `\Gls`, `\glspl`, `\acrshort`, `\acrlong`, `\acrfull`, ...), acronym (`\acro`, `\ac`, `\acf`, ...), acro (`\DeclareAcronym`) — first use expands to "long (short)", later uses give the short form
+
 ### Layout Commands
-Print-only commands (`\vspace`, `\centering`, `\newpage`, `\setlength`, font size switches, ...) are consumed silently — including their arguments — instead of leaking into the output.
+Print-only commands (`\vspace`, `\centering`, `\newpage`, `\setlength`, font size switches, package configuration like `\hypersetup`/`\lstset`/`\crefname`/`\titleformat`, TeX register assignments like `\parskip 0pt plus 1pt`, ...) are consumed silently — including their arguments — instead of leaking into the output. Unknown commands are dropped with a warning while the text of their arguments is kept.
 
 ## Architecture
 
-Texed follows a three-stage pipeline inspired by Pandoc:
+Texed follows a pipeline inspired by Pandoc:
 
-1. **Lexer** (`src/lexer.rs`): Tokenizes LaTeX input into a stream of tokens
-2. **Parser** (`src/parser.rs`): Builds an Abstract Syntax Tree (AST) from tokens
-3. **Converter** (`src/converter.rs`): Transforms the AST into Markdown output
+1. **Decoder** (`src/decode.rs`): bytes in any common encoding → normalized UTF-8
+2. **Lexer** (`src/lexer.rs`): tokenizes LaTeX (math and verbatim content captured raw)
+3. **Parser** (`src/parser/`): builds an AST, running a TeX-level macro engine (`tex.rs`) and package support modules (tables, figures, algorithms, siunitx, glossaries, ...)
+4. **Converter** (`src/converter.rs`): renders Markdown-safe output
 
 This architecture allows for:
 - Clean separation of concerns
@@ -340,8 +378,10 @@ This architecture allows for:
 ### Running Tests
 
 ```bash
-cargo test
+cargo test --release
 ```
+
+Suites: `features` (one case per construct), `markdown_safety` (CommonMark round-trip), `robustness` (fuzzing), `integration_test` (CLI), plus unit tests.
 
 ### Running with Debug Output
 
@@ -378,4 +418,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [ ] Multiple output formats (HTML, reStructuredText)
 - [ ] Configuration file support
 - [ ] Better error messages with line/column information
+- [x] TeX macro engine (conditionals, `\let`, delimited parameters, `\@ifnextchar`)
+- [x] Robustness: total conversion, fuzz-tested
 - [ ] Unicode math symbol conversion

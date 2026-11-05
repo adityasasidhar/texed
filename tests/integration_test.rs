@@ -645,3 +645,86 @@ fn test_unknown_environment_is_preserved_as_raw_block() {
     assert!(output.contains("opaque content"));
     assert!(output.contains("\\end{mystery}"));
 }
+
+#[test]
+fn test_latin1_input_is_decoded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("latin1.tex");
+    // "Café crème" in ISO-8859-1, as old documents with \usepackage[latin1]{inputenc}
+    fs::write(&input_file, b"\\usepackage[latin1]{inputenc}\nCaf\xe9 cr\xe8me").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file).arg("--no-frontmatter");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Café crème"));
+}
+
+#[test]
+fn test_utf16_input_with_bom_is_decoded() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("utf16.tex");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "\\section{Grüße}".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&input_file, bytes).unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("## Grüße"));
+}
+
+#[test]
+fn test_classic_mac_line_endings() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("mac.tex");
+    // Bare CR line endings: a % comment must end at the CR, not eat the file
+    fs::write(&input_file, "First % comment\rSecond line\r\rNew paragraph").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Second line"))
+        .stdout(predicate::str::contains("New paragraph"));
+}
+
+#[test]
+fn test_local_style_file_macros_apply() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(
+        temp_dir.path().join("mymacros.sty"),
+        "\\newcommand{\\project}{Texed}\n\\newtheorem{thm}{Theorem}\n",
+    )
+    .unwrap();
+    let input_file = temp_dir.path().join("doc.tex");
+    fs::write(
+        &input_file,
+        "\\documentclass{article}\\usepackage{amsmath,mymacros}\\begin{document}About \\project.\\begin{thm}True.\\end{thm}\\end{document}",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("About Texed."))
+        .stdout(predicate::str::contains("**Theorem 1**"));
+}
+
+#[test]
+fn test_inline_input_splices_file() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("part.tex"), "inserted text").unwrap();
+    let input_file = temp_dir.path().join("doc.tex");
+    fs::write(&input_file, "Before \\input{part} after.").unwrap();
+
+    let mut cmd = Command::cargo_bin("texed").unwrap();
+    cmd.arg(&input_file);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Before inserted text after."));
+}
