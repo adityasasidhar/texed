@@ -10,6 +10,7 @@ use crate::state::{LabelType, MacroDef, ParserState};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+mod math;
 mod tex;
 
 /// Baseline budget of macro expansions per document, guarding against
@@ -26,8 +27,6 @@ const MAX_PENDING_TOKENS: usize = 4_000_000;
 /// macros whose arguments grow on every recursion (`\a{#1#1}`).
 const BASE_EXPANSION_BYTES: usize = 8 * 1024 * 1024;
 
-/// Maximum length of a single math formula after macro expansion.
-const MAX_MATH_EXPANSION_CHARS: usize = 200_000;
 
 /// Maximum recursion depth of block/inline parsing. Real documents nest a
 /// few dozen levels at most; beyond this the input is pathological and is
@@ -182,6 +181,10 @@ pub struct Parser {
     macro_def_tex_style: bool,
     /// Current itemize/enumerate nesting depth.
     list_depth: usize,
+    /// Before `\begin{document}` (only when the source has one).
+    in_preamble: bool,
+    /// `\end{document}` was reached (possibly inside an included file).
+    document_ended: bool,
     /// Open TeX conditionals whose taken branch is being parsed.
     cond_depth: usize,
     /// Macro expansions whose tokens are still pending: (name, stack length
@@ -236,6 +239,8 @@ impl Parser {
             pending_enum_start: None,
             macro_def_tex_style: false,
             list_depth: 0,
+            in_preamble: false,
+            document_ended: false,
             cond_depth: 0,
             active_expansions: Vec::new(),
             expansion_counts: HashMap::new(),
@@ -253,6 +258,10 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Document> {
+        self.in_preamble = self
+            .tokens
+            .iter()
+            .any(|t| matches!(t, Token::BeginEnvironment(env) if env == "document"));
         let mut blocks = self.parse_blocks()?;
 
         // Bibliography must load before the resolution pass: author-year
@@ -529,6 +538,11 @@ impl Parser {
         self.depth += 1;
         let result = self.parse_block_inner();
         self.depth -= 1;
+        // Material before \begin{document} is set-up, never typeset: it is
+        // parsed for its side effects (definitions, metadata) only.
+        if self.in_preamble && self.depth == 0 {
+            return result.map(|_| None);
+        }
         result
     }
 
@@ -556,6 +570,12 @@ impl Parser {
 
         match token {
             Token::BeginEnvironment(env) => self.parse_environment(env.clone()),
+            Token::EndEnvironment(env) if env == "document" => {
+                // TeX stops reading at \end{document}
+                self.tokens.clear();
+                self.document_ended = true;
+                Ok(None)
+            }
             Token::EndEnvironment(env) if self.state.environments.contains_key(env) => {
                 // Closing a user-defined environment: splice its end-definition
                 let end_def = self.state.environments[env].end_def.clone();
@@ -690,7 +710,8 @@ impl Parser {
 
         match env_name.as_str() {
             "document" => {
-                // Document environment - just skip the begin/end tags, parse contents normally
+                // The body starts: content is typeset from here on
+                self.in_preamble = false;
                 Ok(None)
             }
             "abstract" => self.parse_abstract(),
@@ -2385,11 +2406,50 @@ impl Parser {
                         }
                     }
                 }
-                self.state
-                    .warn(format!("unknown command `\\{}` kept as plain text", cmd));
-                Ok(Some(Inline::Text(format!("\\{}", cmd))))
+                self.parse_unknown_command(&cmd)
             }
         }
+    }
+
+    /// Fallback for commands with no known meaning: the command itself is
+    /// dropped (reported as a warning), its optional arguments are skipped
+    /// and the text of its braced arguments is kept, so content wrapped in
+    /// custom markup (`\acrshort{gpu}`, `\mynote{...}`) is not lost.
+    fn parse_unknown_command(&mut self, cmd: &str) -> Result<Option<Inline>> {
+        if !self.in_preamble {
+            self.state.warn(format!(
+                "unknown command `\\{}` dropped (arguments kept as text)",
+                cmd
+            ));
+        }
+        self.consume_text_star();
+        let mut parts: Vec<Inline> = Vec::new();
+        for _ in 0..9 {
+            match self.current_token() {
+                Token::LeftBracket => {
+                    let _ = self.collect_bracketed_tokens();
+                }
+                Token::LeftBrace => {
+                    let content = self.parse_braced_inlines()?;
+                    let content = trim_inline_whitespace(content);
+                    if !content.is_empty() {
+                        if !parts.is_empty() {
+                            parts.push(Inline::Space);
+                        }
+                        parts.extend(content);
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(match parts.len() {
+            0 => None,
+            1 => parts.pop(),
+            _ => Some(Inline::Span {
+                attrs: HashMap::new(),
+                content: parts,
+            }),
+        })
     }
 
     /// Apply an accent command to its argument (braced group or next character).
@@ -3028,7 +3088,10 @@ impl Parser {
             }
             self.advance();
             let piece = self.token_to_string(&token);
-            let search_from = collected.len().saturating_sub(delimiter.len());
+            let mut search_from = collected.len().saturating_sub(delimiter.len());
+            while !collected.is_char_boundary(search_from) {
+                search_from -= 1;
+            }
             collected.push_str(&piece);
             if depth == 0 && !matches!(token, Token::LeftBrace | Token::RightBrace) {
                 if let Some(pos) = collected[search_from..].find(delimiter) {
@@ -3121,91 +3184,7 @@ impl Parser {
     /// \newcommand{\R}{\mathbb{R}} render in Markdown math (KaTeX/MathJax
     /// don't know document macros).
     fn expand_macros_in_math(&self, content: &str) -> String {
-        let mut chars: Vec<char> = content.chars().collect();
-        let mut i = 0;
-        let mut expansions = 0usize;
-
-        while i < chars.len() {
-            if chars[i] == '\\'
-                && i + 1 < chars.len()
-                && chars[i + 1].is_alphabetic()
-                && expansions < 200
-            {
-                let start = i + 1;
-                let mut end = start;
-                while end < chars.len() && chars[end].is_alphabetic() {
-                    end += 1;
-                }
-                let name: String = chars[start..end].iter().collect();
-
-                if let Some(def) = self.state.macros.get(&name) {
-                    let def = def.clone();
-                    let mut args: Vec<String> = Vec::new();
-                    let mut j = end;
-
-                    let required = if let Some(default) = &def.optional_param {
-                        if j < chars.len() && chars[j] == '[' {
-                            let mut opt = String::new();
-                            let mut k = j + 1;
-                            while k < chars.len() && chars[k] != ']' {
-                                opt.push(chars[k]);
-                                k += 1;
-                            }
-                            args.push(opt);
-                            j = (k + 1).min(chars.len());
-                        } else {
-                            args.push(default.clone());
-                        }
-                        def.num_params.saturating_sub(1)
-                    } else {
-                        def.num_params
-                    };
-
-                    for _ in 0..required {
-                        while j < chars.len() && chars[j].is_whitespace() {
-                            j += 1;
-                        }
-                        if j < chars.len() && chars[j] == '{' {
-                            let mut depth = 1;
-                            let mut k = j + 1;
-                            let mut arg = String::new();
-                            while k < chars.len() {
-                                match chars[k] {
-                                    '{' => depth += 1,
-                                    '}' => {
-                                        depth -= 1;
-                                        if depth == 0 {
-                                            break;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                arg.push(chars[k]);
-                                k += 1;
-                            }
-                            args.push(arg);
-                            j = (k + 1).min(chars.len());
-                        } else if j < chars.len() {
-                            args.push(chars[j].to_string());
-                            j += 1;
-                        }
-                    }
-
-                    if let Some(expansion) = self.state.expand_macro(&name, &args) {
-                        if chars.len() + expansion.len() > MAX_MATH_EXPANSION_CHARS {
-                            break;
-                        }
-                        expansions += 1;
-                        let replacement: Vec<char> = expansion.chars().collect();
-                        chars.splice(i..j, replacement);
-                        continue; // rescan from the same position
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        chars.into_iter().collect()
+        math::expand_math(content, &self.state.macros)
     }
 
     /// Parse a string of LaTeX as a sequence of inlines, sharing all parser
@@ -3265,13 +3244,6 @@ impl Parser {
         Ok((inlines, label))
     }
 
-    /// Parse a LaTeX fragment and render it as a Markdown string
-    /// (used for footnote texts and metadata values).
-    fn render_fragment_markdown(&mut self, content: &str) -> Result<String> {
-        let (inlines, _) = self.parse_inline_fragment(content)?;
-        Ok(crate::converter::MarkdownConverter::render_inlines_fragment(&inlines))
-    }
-
     /// Collect the raw tokens of a braced group (brace-aware), consuming it.
     fn collect_braced_tokens(&mut self) -> Vec<Token> {
         if !matches!(self.current_token(), Token::LeftBrace) {
@@ -3318,6 +3290,7 @@ impl Parser {
         child.command_registry = std::mem::take(&mut self.command_registry);
         child.footnote_inlines = std::mem::take(&mut self.footnote_inlines);
         child.depth = self.depth;
+        child.in_preamble = self.in_preamble;
         child.macro_expansions = self.macro_expansions;
         child.macro_budget = self.macro_budget.saturating_add(child.macro_budget);
         child.expanded_bytes = self.expanded_bytes;
@@ -3336,6 +3309,11 @@ impl Parser {
         self.macro_expansions = child.macro_expansions;
         self.macro_budget = child.macro_budget;
         self.expanded_bytes = child.expanded_bytes;
+        self.in_preamble = child.in_preamble;
+        if child.document_ended {
+            self.tokens.clear();
+            self.document_ended = true;
+        }
         self.metadata = child.metadata;
         self.state = child.state;
         self.citation_manager = child.citation_manager;

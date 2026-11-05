@@ -2,6 +2,9 @@ use crate::error::Result;
 use crate::parser::{Alignment, Block, Document, Inline, QuoteType};
 use std::fmt::Write;
 
+/// Table columns are padded to align, up to this many characters.
+const MAX_PADDED_COLUMN_WIDTH: usize = 40;
+
 pub struct MarkdownConverter {
     output: String,
     in_table: bool,
@@ -133,8 +136,9 @@ impl MarkdownConverter {
                 )?;
             }
             Block::RawBlock(content) => {
-                self.output.push_str(content);
-                self.output.push('\n');
+                // Unconverted LaTeX is fenced so none of it is misread as
+                // Markdown (lines starting with #, -, >, ...)
+                self.convert_code_block(Some("latex"), content.trim_matches('\n'))?;
             }
             Block::HorizontalRule => {
                 self.output.push_str("---\n\n");
@@ -366,6 +370,12 @@ impl MarkdownConverter {
             for (i, cell) in row.iter().enumerate() {
                 widths[i] = widths[i].max(cell.chars().count());
             }
+        }
+
+        // Pad for readability, but never to more than a modest width: one
+        // long cell must not inflate every row of the table.
+        for width in widths.iter_mut() {
+            *width = (*width).min(MAX_PADDED_COLUMN_WIDTH);
         }
 
         let alignment_of = |i: usize| alignments.get(i).unwrap_or(&Alignment::AlignDefault);
