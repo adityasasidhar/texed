@@ -10,6 +10,8 @@ use crate::state::{LabelType, MacroDef, ParserState};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+mod algorithms;
+mod figures;
 mod glossary;
 mod knowledge;
 mod math;
@@ -209,6 +211,8 @@ pub struct Parser {
     expanded_bytes: usize,
     /// Acronyms and glossary entries by key.
     glossary: HashMap<String, glossary::GlossaryEntry>,
+    /// Numbered algorithm floats so far.
+    algorithm_counter: usize,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -262,6 +266,7 @@ impl Parser {
             source_token_count,
             expanded_bytes: 0,
             glossary: HashMap::new(),
+            algorithm_counter: 0,
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -741,6 +746,34 @@ impl Parser {
                     content: code,
                 })
             }
+            // Graphics code: kept whole (with its \begin/\end) so it can be
+            // re-rendered, as a LaTeX code block
+            "tikzpicture" | "tikzcd" | "pgfpicture" | "circuitikz" | "pspicture" | "forest"
+            | "tikzonimage" | "dot2tex" => Some(Block::CodeBlock {
+                language: Some(String::from("latex")),
+                content: format!("\\begin{{{}}}{}\\end{{{}}}", name, content, name),
+            }),
+            "asy" | "asydef" => Some(Block::CodeBlock {
+                language: Some(String::from("asymptote")),
+                content: body,
+            }),
+            "gnuplot" => Some(Block::CodeBlock {
+                language: Some(String::from("gnuplot")),
+                content: body,
+            }),
+            "mpost" => Some(Block::CodeBlock {
+                language: Some(String::from("metapost")),
+                content: body,
+            }),
+            "sagesilent" | "sageblock" | "pycode" => Some(Block::CodeBlock {
+                language: Some(String::from(if name.starts_with("sage") { "sage" } else { "python" })),
+                content: body,
+            }),
+            "luacode" | "luacode*" => Some(Block::CodeBlock {
+                language: Some(String::from("lua")),
+                content: body,
+            }),
+            "comment*" => None,
             "filecontents" | "filecontents*" => {
                 let (_, code) = split_leading_brace_group(&body);
                 Some(Block::CodeBlock {
@@ -792,6 +825,29 @@ impl Parser {
             // Definition containers: their \acro / \newglossaryentry
             // commands are recorded, nothing is typeset here
             "acronym" => self.parse_transparent_environment(&env_name, 0, true),
+            "keywords" | "IEEEkeywords" | "keyword" => {
+                let content = self.read_environment_inlines(&env_name)?;
+                let mut line = vec![Inline::Strong(vec![Inline::Text(String::from("Keywords:"))])];
+                if !content.is_empty() {
+                    line.push(Inline::Space);
+                    line.extend(content);
+                }
+                Ok(Some(Block::Paragraph(line)))
+            }
+            // beamer
+            "frame" => self.parse_beamer_frame(),
+            "columns" => self.parse_transparent_environment(&env_name, 0, true),
+            "column" => self.parse_transparent_environment(&env_name, 1, true),
+            "block" | "alertblock" | "exampleblock" => self.parse_beamer_block(&env_name),
+            "onlyenv" | "visibleenv" | "uncoverenv" | "altenv" | "overprint" | "actionenv" => {
+                self.skip_overlay_spec();
+                self.parse_transparent_environment(&env_name, 0, true)
+            }
+            // algorithm floats (algorithm2e's procedure/function too)
+            "algorithm" | "algorithm*" | "algorithm2e" | "procedure" | "function" => {
+                self.parse_algorithm_float(&env_name)
+            }
+            "algorithmic" | "algorithmic*" | "algorithmicx" => self.parse_algorithmic(&env_name),
             "thebibliography" => self.parse_thebibliography(),
             "tikzpicture" | "tikzcd" | "pgfpicture" => {
                 // TikZ/PGF graphics - preserve as LaTeX code block
@@ -1052,6 +1108,7 @@ impl Parser {
                 }
                 Token::Item => {
                     self.advance();
+                    self.skip_overlay_spec();
                     let label = self.parse_item_label()?;
                     if items.is_empty() {
                         if let Some(n) = self.pending_enum_start.take() {
@@ -1745,116 +1802,7 @@ impl Parser {
     }
 
     fn parse_figure_environment(&mut self, env_name: &str) -> Result<Option<Block>> {
-        let mut caption = None;
-        let mut paths: Vec<String> = Vec::new();
-        let mut label = None;
-
-        // Skip optional placement specifier [htbp] (or {width} for wrapfigure)
-        self.skip_whitespace_and_comments();
-        if matches!(self.current_token(), Token::LeftBracket) {
-            let _ = self.parse_bracketed_text()?;
-        }
-
-        while !self.is_at_end() {
-            self.skip_whitespace_and_comments();
-
-            if let Token::EndEnvironment(env) = self.current_token() {
-                if env == env_name {
-                    self.advance();
-                    break;
-                }
-            }
-
-            if let Token::Command(cmd) = self.current_token() {
-                match cmd.as_str() {
-                    "includegraphics" => {
-                        self.advance();
-                        self.consume_text_star();
-                        // Skip optional arguments
-                        if matches!(self.current_token(), Token::LeftBracket) {
-                            let _ = self.parse_bracketed_text()?;
-                        }
-                        // Get file path
-                        let path = self.parse_braced_text()?;
-                        if !path.is_empty() {
-                            paths.push(path);
-                        }
-                    }
-                    "caption" => {
-                        self.advance();
-                        self.consume_text_star();
-                        if matches!(self.current_token(), Token::LeftBracket) {
-                            let _ = self.parse_bracketed_text()?;
-                        }
-                        let tokens = self.collect_braced_tokens();
-                        let (inlines, caption_label) =
-                            self.parse_inline_fragment_tokens(tokens)?;
-                        caption = Some(inlines);
-                        if caption_label.is_some() {
-                            label = caption_label;
-                        }
-                    }
-                    _ => {
-                        self.advance();
-                    }
-                }
-                continue;
-            }
-
-            if let Token::Label(l) = self.current_token() {
-                label = Some(l.clone());
-                self.advance();
-                continue;
-            }
-
-            self.advance();
-        }
-
-        // \caption steps the figure counter (labels refer to it)
-        let number = caption.as_ref().map(|_| self.state.next_counter("figure"));
-        if let Some(figure_label) = &label {
-            let title = caption
-                .as_ref()
-                .map(|inlines| self.inlines_to_plain_text(inlines))
-                .filter(|text| !text.is_empty());
-            let number = number
-                .clone()
-                .unwrap_or_else(|| self.state.current_section_number.clone());
-            self.state
-                .add_label_with_number(figure_label.clone(), LabelType::Figure, number, title);
-        }
-
-        match paths.len() {
-            0 => {
-                // Figure without graphics (e.g. only a tikzpicture was skipped):
-                // still emit the caption text if we have one.
-                if let Some(cap) = caption {
-                    Ok(Some(Block::Paragraph(cap)))
-                } else {
-                    Ok(None)
-                }
-            }
-            1 => Ok(Some(Block::Figure {
-                caption,
-                path: paths.into_iter().next().unwrap(),
-                label,
-            })),
-            _ => {
-                // Multiple images (subfigures): one Figure per image,
-                // caption and label attached to the first.
-                let mut blocks = Vec::new();
-                let mut caption = caption;
-                let mut label = label;
-                for path in paths {
-                    blocks.push(Block::Figure {
-                        caption: caption.take(),
-                        path,
-                        label: label.take(),
-                    });
-                }
-                Ok(Some(Block::Composite(blocks)))
-            }
-        }
+        self.parse_figure_float(env_name)
     }
 
     fn parse_theorem_like(&mut self, env_type: &str) -> Result<Option<Block>> {
@@ -2540,6 +2488,132 @@ impl Parser {
         }
     }
 
+    /// beamer `\begin{frame}<overlay>[options]{title}{subtitle} ... \end{frame}`:
+    /// an unnumbered heading followed by the frame's content.
+    fn parse_beamer_frame(&mut self) -> Result<Option<Block>> {
+        self.skip_overlay_spec();
+        self.skip_whitespace_and_comments();
+        if matches!(self.current_token(), Token::LeftBracket) {
+            let _ = self.collect_bracketed_tokens();
+        }
+        self.skip_overlay_spec();
+        let mut title: Vec<Inline> = Vec::new();
+        let mut subtitle: Vec<Inline> = Vec::new();
+        self.skip_whitespace_only();
+        if matches!(self.current_token(), Token::LeftBrace) {
+            title = trim_inline_whitespace(self.parse_braced_inlines()?);
+            self.skip_whitespace_only();
+            if matches!(self.current_token(), Token::LeftBrace) {
+                subtitle = trim_inline_whitespace(self.parse_braced_inlines()?);
+            }
+        }
+        let mut blocks = Vec::new();
+        while !self.is_at_end() {
+            self.skip_whitespace_and_comments();
+            match self.current_token() {
+                Token::EndEnvironment(env) if env == "frame" => {
+                    self.advance();
+                    break;
+                }
+                Token::Command(cmd) if cmd == "frametitle" || cmd == "framesubtitle" => {
+                    let is_title = cmd == "frametitle";
+                    self.advance();
+                    self.skip_overlay_spec();
+                    if matches!(self.current_token(), Token::LeftBracket) {
+                        let _ = self.collect_bracketed_tokens();
+                    }
+                    let content = trim_inline_whitespace(self.parse_braced_inlines()?);
+                    if is_title {
+                        title = content;
+                    } else {
+                        subtitle = content;
+                    }
+                }
+                _ => {
+                    if let Some(block) = self.parse_block()? {
+                        blocks.push(block);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if !title.is_empty() {
+            out.push(Block::Section {
+                level: 2,
+                title,
+                label: None,
+            });
+        }
+        if !subtitle.is_empty() {
+            out.push(Block::Paragraph(vec![Inline::Emph(subtitle)]));
+        }
+        out.extend(blocks);
+        Ok(match out.len() {
+            0 => None,
+            1 => out.pop(),
+            _ => Some(Block::Composite(out)),
+        })
+    }
+
+    /// beamer `\begin{block}{Title}`: a titled quotation.
+    fn parse_beamer_block(&mut self, env_name: &str) -> Result<Option<Block>> {
+        self.skip_overlay_spec();
+        self.skip_whitespace_only();
+        let title = if matches!(self.current_token(), Token::LeftBrace) {
+            trim_inline_whitespace(self.parse_braced_inlines()?)
+        } else {
+            Vec::new()
+        };
+        self.skip_overlay_spec();
+        let mut blocks = Vec::new();
+        if !title.is_empty() {
+            blocks.push(Block::Paragraph(vec![Inline::Strong(title)]));
+        }
+        while !self.is_at_end() {
+            self.skip_whitespace_and_comments();
+            if matches!(self.current_token(), Token::EndEnvironment(env) if env == env_name) {
+                self.advance();
+                break;
+            }
+            if let Some(block) = self.parse_block()? {
+                blocks.push(block);
+            }
+        }
+        Ok(Some(Block::Quote(blocks)))
+    }
+
+    /// The content of an environment as one run of inlines.
+    fn read_environment_inlines(&mut self, env_name: &str) -> Result<Vec<Inline>> {
+        let mut inlines = Vec::new();
+        while !self.is_at_end() {
+            match self.current_token() {
+                Token::EndEnvironment(env) if env == env_name => {
+                    self.advance();
+                    break;
+                }
+                Token::ParBreak => {
+                    self.advance();
+                    inlines.push(Inline::Space);
+                }
+                _ => {
+                    if let Some(inline) = self.parse_inline()? {
+                        inlines.push(inline);
+                    }
+                }
+            }
+        }
+        Ok(trim_inline_whitespace(inlines))
+    }
+
+    /// Skip a beamer overlay specification (`<2->`, `<+->`, `<1,3>`).
+    fn skip_overlay_spec(&mut self) {
+        if let Token::Text(text) = self.current_token() {
+            if is_overlay_spec(text) {
+                self.advance();
+            }
+        }
+    }
+
     /// Commands described by the knowledge tables plus assorted content
     /// commands. Returns `Ok(Some(result))` when handled.
     fn parse_knowledge_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
@@ -2551,6 +2625,7 @@ impl Parser {
             self.consume_signature(signature)?;
             // Commands whose trailing groups vary: consume them all
             if matches!(cmd, "titleformat" | "newcolumntype" | "AddToHook" | "AddToHookNext"
+                | "setbeamertemplate" | "setbeamercolor" | "setbeamerfont"
                 | "newlist" | "renewlist" | "DeclareFieldFormat")
             {
                 self.consume_trailing_groups(8)?;
@@ -2583,6 +2658,86 @@ impl Parser {
             return Ok(Some(Some(Inline::Text(text))));
         }
         match cmd {
+            // beamer overlays: content is shown (as on the final slide)
+            "only" | "uncover" | "visible" | "invisible" | "onslide" | "temporal"
+            | "alt" | "action" | "alert" | "structure" | "pause" | "note" | "frame"
+            | "againframe" | "titlepage" | "framezoom" | "hyperlinkslidenext"
+            | "hyperlinkslideprev" | "transdissolve" | "transblindshorizontal"
+            | "transboxin" | "transfade" | "transduration" => {
+                self.skip_overlay_spec();
+                match cmd {
+                    "pause" | "transdissolve" | "transblindshorizontal" | "transboxin"
+                    | "transfade" | "transduration" | "hyperlinkslidenext"
+                    | "hyperlinkslideprev" => {
+                        if matches!(self.current_token(), Token::LeftBracket) {
+                            let _ = self.collect_bracketed_tokens();
+                        }
+                        return Ok(Some(None));
+                    }
+                    "onslide" => {
+                        // \onslide<2-> as a declaration, or \onslide<2>{text}
+                        self.skip_overlay_spec();
+                        if !matches!(self.current_token(), Token::LeftBrace) {
+                            return Ok(Some(None));
+                        }
+                    }
+                    "note" => {
+                        if matches!(self.current_token(), Token::LeftBracket) {
+                            let _ = self.collect_bracketed_tokens();
+                        }
+                        let _ = self.collect_braced_tokens();
+                        return Ok(Some(None));
+                    }
+                    "againframe" | "framezoom" => {
+                        self.consume_trailing_groups(3)?;
+                        return Ok(Some(None));
+                    }
+                    "titlepage" => {
+                        // The title block, as \maketitle renders it
+                        self.push_front(vec![Token::Command(String::from("maketitle"))]);
+                        return Ok(Some(None));
+                    }
+                    _ => {}
+                }
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.collect_bracketed_tokens();
+                }
+                self.skip_overlay_spec();
+                let content = self.parse_braced_inlines()?;
+                if cmd == "alt" || cmd == "temporal" {
+                    // \alt<spec>{shown}{otherwise}: keep the first
+                    self.skip_whitespace_only();
+                    let _ = self.collect_braced_tokens();
+                    if cmd == "temporal" {
+                        let _ = self.collect_braced_tokens();
+                    }
+                }
+                if cmd == "invisible" {
+                    return Ok(Some(None));
+                }
+                let content = trim_inline_whitespace(content);
+                if content.is_empty() {
+                    return Ok(Some(None));
+                }
+                return Ok(Some(Some(if matches!(cmd, "alert" | "structure") {
+                    Inline::Strong(content)
+                } else {
+                    span_or_single(content)
+                })));
+            }
+            "keywords" | "keyword" | "IEEEkeywords" | "kwd" | "terms" => {
+                self.skip_whitespace_only();
+                if !matches!(self.current_token(), Token::LeftBrace) {
+                    return Ok(None);
+                }
+                let content = trim_inline_whitespace(self.parse_braced_inlines()?);
+                let mut line = vec![Inline::Strong(vec![Inline::Text(String::from("Keywords:"))])];
+                if !content.is_empty() {
+                    line.push(Inline::Space);
+                    line.extend(content);
+                }
+                return Ok(Some(Some(span_or_single(line))));
+            }
             "texorpdfstring" => {
                 let content = self.parse_braced_inlines()?;
                 self.skip_whitespace_and_comments();
@@ -4180,17 +4335,20 @@ impl Parser {
                 let (inlines, _) = self.parse_inline_fragment_tokens(tokens)?;
                 let rendered =
                     crate::converter::MarkdownConverter::render_inlines_fragment(&inlines);
-                let value = rendered
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .replace(" ,", ",")
-                    .replace(",,", ",");
-                let value = value
-                    .trim()
-                    .trim_start_matches(',')
-                    .trim()
-                    .to_string();
+                let value = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+                // \and between authors renders as ", ": tidy the joins
+                let value = if cmd == "author" {
+                    value
+                        .replace(" ,", ",")
+                        .replace(",,", ",")
+                        .trim()
+                        .trim_start_matches(',')
+                        .trim_end_matches([',', ' '])
+                        .trim()
+                        .to_string()
+                } else {
+                    value.trim().to_string()
+                };
                 if !value.is_empty() {
                     self.metadata.insert(cmd.clone(), value);
                 }
@@ -4492,7 +4650,7 @@ fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
         | "hyphenation" | "markright" | "enlargethispage" | "setstretch" | "index"
         | "glossary" | "hypersetup" | "geometry" | "usetikzlibrary" | "color"
         | "pagecolor" | "institute" | "titlerunning" | "authorrunning" | "acmConference"
-        | "subjclass" | "keywords" | "PARstart" | "captionsetup" | "floatplacement" => {
+        | "subjclass" | "PARstart" | "captionsetup" | "floatplacement" => {
             Some((1, true))
         }
 
@@ -5052,6 +5210,16 @@ fn join_and(items: &[String]) -> String {
         1 => items[0].clone(),
         _ => format!("{} and {}", items[..items.len() - 1].join(", "), items[items.len() - 1]),
     }
+}
+
+/// Is this text a beamer overlay specification (`<2->`, `<+->`, `<1,3>`)?
+fn is_overlay_spec(text: &str) -> bool {
+    text.len() >= 3
+        && text.starts_with('<')
+        && text.ends_with('>')
+        && text[1..text.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | ',' | '|' | '.' | '@' | ' ' | '(' | ')'))
 }
 
 /// A list of inlines as one inline.

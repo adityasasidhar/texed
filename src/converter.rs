@@ -57,8 +57,11 @@ impl MarkdownConverter {
                 other => (3, other),
             });
             for key in keys {
-                let value = &document.metadata[key];
-                writeln!(self.output, "{}: {}", key, yaml_scalar(value)).unwrap();
+                // Footnote marks (from \thanks) belong in the byline, not
+                // in metadata; placeholders become their plain characters
+                let value = strip_footnote_marks(&document.metadata[key]);
+                let value = finalize_brackets(&value);
+                writeln!(self.output, "{}: {}", key, yaml_scalar(&value)).unwrap();
             }
             self.output.push_str("---\n\n");
         }
@@ -1068,21 +1071,64 @@ fn markdown_url(url: &str) -> String {
     }
 }
 
+/// Remove `[^n]` footnote references from a metadata value.
+fn strip_footnote_marks(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("[^") {
+        let after = &rest[start + 2..];
+        let digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && after[digits..].starts_with(']') {
+            out.push_str(&rest[..start]);
+            rest = &after[digits + 1..];
+        } else {
+            out.push_str(&rest[..start + 2]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Quote a YAML scalar when needed.
 fn yaml_scalar(value: &str) -> String {
-    let needs_quoting = value.is_empty()
-        || value.contains(": ")
-        || value.ends_with(':')
-        || value.contains('#')
-        || value.contains('"')
-        || value.starts_with(['\'', '"', '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`', '[', ']', '{', '}'])
-        || value.starts_with(' ')
-        || value.ends_with(' ');
-    if needs_quoting {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_string()
+    // Hard line breaks in a title/author become spaces in metadata
+    let value: String = value
+        .split('\n')
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = value.to_ascii_lowercase();
+    let plain_safe = !value.is_empty()
+        && value.chars().all(|c| !c.is_control())
+        && !value.starts_with(|c: char| {
+            c.is_whitespace() || "-?:,[]{}#&*!|>'\"%@`".contains(c)
+        })
+        && !value.ends_with(|c: char| c.is_whitespace() || c == ':')
+        && !value.contains(": ")
+        && !value.contains(" #")
+        && !matches!(
+            lower.as_str(),
+            "true" | "false" | "yes" | "no" | "on" | "off" | "null" | "~" | "y" | "n"
+        )
+        // numbers would change type (keep dates like 2020 as text too)
+        && value.parse::<f64>().is_err();
+    if plain_safe {
+        return value;
     }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02X}", c as u32 & 0xFF)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

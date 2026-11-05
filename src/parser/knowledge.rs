@@ -69,7 +69,13 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "titleformat" => sig(false, 2, false), // remaining groups handled loosely below
         "titlespacing" => sig(false, 4, true),
         "titlecontents" => sig(false, 6, true),
-        "fancyhead" | "fancyfoot" | "fancyhf" | "lhead" | "chead" | "rhead" | "lfoot"
+        "usetheme" | "usecolortheme" | "usefonttheme" | "useinnertheme" | "useoutertheme"
+        | "setbeamercovered" | "logo" | "titlegraphic" | "setbeameroption"
+        | "includeonlyframes" | "beamerdefaultoverlayspecification" | "setbeamersize"
+        | "AtBeginSection" | "AtBeginSubsection" | "AtBeginPart" | "AtBeginLecture" => sig(true, 1, false),
+        "setbeamertemplate" | "setbeamercolor" | "setbeamerfont" => sig(false, 1, false),
+        "beamertemplatenavigationsymbolsempty" | "beamertemplatesolidbackgroundcolor" => sig(false, 0, false),
+                "fancyhead" | "fancyfoot" | "fancyhf" | "lhead" | "chead" | "rhead" | "lfoot"
         | "cfoot" | "rfoot" | "markright" => sig(true, 1, false),
         "markboth" => sig(false, 2, false),
         "crefname" | "Crefname" => sig(false, 3, false),
