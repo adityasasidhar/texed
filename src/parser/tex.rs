@@ -1826,6 +1826,22 @@ impl Parser {
                         k += 1;
                     }
                 }
+                // definitions and state changes inside math (a macro used in
+                // a formula that defines a helper first): run, emit nothing
+                Token::Command(name)
+                    if matches!(
+                        name.as_str(),
+                        "def" | "gdef" | "edef" | "xdef" | "let" | "global" | "newcommand" | "renewcommand"
+                            | "providecommand" | "DeclareRobustCommand" | "newtoggle" | "providetoggle"
+                            | "toggletrue" | "togglefalse" | "settoggle" | "docsvlist" | "forcsvlist"
+                            | "listadd" | "dolistloop" | "forlistloop" | "@for" | "setcounter"
+                            | "addtocounter" | "stepcounter" | "refstepcounter" | "newif" | "setboolean"
+                            | "newboolean"
+                    ) && !self.state.macros.contains_key(name) =>
+                {
+                    let name = name.clone();
+                    let _ = self.parse_inline_command(name);
+                }
                 Token::Command(name) if name == "mathchoice" => {
                     self.advance();
                     let mut styles = Vec::new();

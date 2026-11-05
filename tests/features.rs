@@ -571,3 +571,21 @@ fn glue_keywords_without_spaces() {
     has("\\makeatletter A \\abovedisplayskip=2pt plus.66pt minus.66pt B \\belowdisplayshortskip=\\p@\\@plus 2\\p@\\@minus\\p@ C", "A B C");
     has("{\\tt \\char`\\\\title} \\char65", "`\\title` A");
 }
+
+#[test]
+fn case_changes_apply_to_characters_only() {
+    has("\\uppercase{\\gdef\\fc{abc}}[\\fc] \\MakeUppercase{hello \\textbf{world}}", "[ABC] HELLO **WORLD**");
+}
+
+#[test]
+fn bussproofs_without_environment_is_kept_as_latex() {
+    let out = md("Proof:\n\\AxiomC{$A$}\\UnaryInfC{$B$}\\DisplayProof\nand text.");
+    assert!(out.contains("```latex\n\\AxiomC{$A$}\\UnaryInfC{$B$}\\DisplayProof\n```"), "{}", out);
+    assert!(out.contains("and text."), "{}", out);
+}
+
+#[test]
+fn definitions_inside_math_macros_run() {
+    let doc = "\\newcommand{\\iftagtext}{}\\newcommand{\\iftag}[3]{\\def\\iftagtext{#3}\\def\\do##1{\\iftoggle{##1}{\\def\\iftagtext{#2}}{}}\\docsvlist{#1}\\iftagtext}\\newtoggle{FOL}\\toggletrue{FOL}\n$\\iftag{FOL}{A}{B} + \\iftag{X}{C}{D}$";
+    has(doc, "$A + D$");
+}

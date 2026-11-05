@@ -837,6 +837,11 @@ impl Parser {
 
         match name {
             "comment" => None,
+            // LaTeX kept as written (inline proof trees)
+            "texed@latexcode" => Some(Block::CodeBlock {
+                language: Some(String::from("latex")),
+                content: body,
+            }),
             "lstlisting" => {
                 // Optional [key=value,...] options may lead the body
                 let (options, code) = split_leading_bracket_group(&body);
@@ -2106,6 +2111,55 @@ impl Parser {
                 }
                 Ok(Some(None))
             }
+            // bussproofs used without the prooftree environment
+            // (\AxiomC{..}\UnaryInfC{..}\DisplayProof): the proof as LaTeX
+            "AxiomC" | "Axiom" | "AXC" | "AX" | "UnaryInfC" | "BinaryInfC" | "TrinaryInfC" | "UnaryInf"
+            | "BinaryInf" | "TrinaryInf" | "UIC" | "BIC" | "TIC" | "QuaternaryInfC" | "QuinaryInfC"
+            | "RightLabel" | "LeftLabel" | "RL" | "LL" | "noLine" | "singleLine" | "doubleLine"
+            | "dashedLine" | "DisplayProof" | "DP" | "bottomAlignProof" | "centerAlignProof"
+            | "topAlignProof" => {
+                let mut tokens = vec![Token::Command(cmd.to_string())];
+                let mut guard = 0;
+                if !matches!(cmd, "DisplayProof" | "DP") {
+                    while !self.is_at_end() && guard < 4000 {
+                        guard += 1;
+                        let token = self.current_token().clone();
+                        if matches!(token, Token::ParBreak) {
+                            break;
+                        }
+                        if matches!(&token, Token::Command(c) if is_file_end_marker(c)) {
+                            break;
+                        }
+                        self.advance();
+                        let done = matches!(&token, Token::Command(c) if c == "DisplayProof" || c == "DP");
+                        tokens.push(token);
+                        if done {
+                            break;
+                        }
+                    }
+                }
+                let content = self.raw_token_text(&tokens);
+                self.push_front(vec![Token::VerbatimEnv {
+                    name: String::from("texed@latexcode"),
+                    content: format!("\n{}", content),
+                }]);
+                Ok(Some(None))
+            }
+            // box dimensions used as values in text (\hskip\wd0): nothing
+            "wd" | "ht" | "dp" => {
+                self.skip_whitespace_only();
+                match self.current_token() {
+                    Token::Command(_) => self.advance(),
+                    _ => {
+                        let _ = self.read_tex_number();
+                    }
+                }
+                Ok(Some(None))
+            }
+            // environment names used as commands: \center ... \endcenter
+            "center" | "endcenter" | "flushleft" | "endflushleft" | "flushright" | "endflushright"
+            | "quote" | "endquote" | "quotation" | "endquotation" | "trivlist" | "endtrivlist"
+            | "endlist" | "endtableau" => Ok(Some(None)),
             // Czech quotes \uv{...}: „...“
             "uv" => {
                 self.skip_whitespace_only();
@@ -2964,6 +3018,14 @@ impl Parser {
             return Ok(None);
         }
 
+        // proof-tree commands are kept as LaTeX even when a package defines
+        // them (their definitions only draw)
+        if is_bussproofs_command(&cmd) {
+            if let Some(result) = self.parse_misc_package_command(&cmd)? {
+                return Ok(result);
+            }
+        }
+
         // Check if it's a user-defined macro
         if self.macro_processor.is_defined(&self.state, &cmd) {
             return self.parse_macro_expansion(&cmd);
@@ -3413,13 +3475,36 @@ impl Parser {
             }
 
             // Case conversion
-            "MakeUppercase" | "MakeTextUppercase" | "uppercase" => {
-                let text = self.parse_braced_text()?;
-                Ok(Some(Inline::Text(text.to_uppercase())))
-            }
-            "MakeLowercase" | "MakeTextLowercase" | "lowercase" => {
-                let text = self.parse_braced_text()?;
-                Ok(Some(Inline::Text(text.to_lowercase())))
+            // Case changes apply to the characters only, as in TeX: commands
+            // inside keep their names and run (\uppercase{\gdef\x{a}},
+            // \MakeUppercase{\textbf{b}})
+            "MakeUppercase" | "MakeTextUppercase" | "uppercase" | "MakeLowercase" | "MakeTextLowercase"
+            | "lowercase" => {
+                self.skip_whitespace_only();
+                let upper = cmd.contains("pper");
+                let tokens = self.collect_braced_tokens();
+                // macro arguments are expanded first for \MakeUppercase
+                let tokens: Vec<Token> = tokens
+                    .into_iter()
+                    .map(|t| match t {
+                        Token::Text(text) => Token::Text(if upper { text.to_uppercase() } else { text.to_lowercase() }),
+                        Token::InlineMath(m) => Token::InlineMath(m),
+                        other => other,
+                    })
+                    .collect();
+                let mut group = vec![Token::LeftBrace];
+                group.extend(tokens);
+                group.push(Token::RightBrace);
+                if cmd.starts_with("Make") {
+                    // the content as a group (its case-changed text renders)
+                    self.push_front(group);
+                } else {
+                    // TeX's \uppercase: the tokens are read again unbraced
+                    group.remove(0);
+                    group.pop();
+                    self.push_front(group);
+                }
+                Ok(None)
             }
 
             // Strikeout / highlight
@@ -7118,6 +7203,16 @@ impl Parser {
     fn is_at_end(&self) -> bool {
         matches!(self.current_token(), Token::Eof)
     }
+}
+
+/// bussproofs' inference commands.
+fn is_bussproofs_command(name: &str) -> bool {
+    matches!(
+        name,
+        "AxiomC" | "Axiom" | "AXC" | "AX" | "UnaryInfC" | "BinaryInfC" | "TrinaryInfC" | "UnaryInf"
+            | "BinaryInf" | "TrinaryInf" | "UIC" | "BIC" | "TIC" | "QuaternaryInfC" | "QuinaryInfC"
+            | "DisplayProof" | "DP"
+    )
 }
 
 /// Unicode for a ZapfDingbats code (pifont's `\ding`).
