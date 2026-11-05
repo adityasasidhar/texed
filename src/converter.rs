@@ -694,6 +694,9 @@ impl MarkdownConverter {
                 if self.in_table {
                     self.output.push_str("<br>");
                 } else {
+                    // `  \n` is the hard break; drop spaces before it
+                    let trimmed = self.output.trim_end_matches(' ').len();
+                    self.output.truncate(trimmed);
                     self.output.push_str("  \n");
                 }
             }

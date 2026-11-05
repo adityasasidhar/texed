@@ -26,6 +26,45 @@ impl MacroProcessor {
         self.define_builtin("TeX", 0, "TeX");
         self.define_builtin("LaTeXe", 0, "LaTeX2e");
         self.define_builtin("BibTeX", 0, "BibTeX");
+        // Other TeX-family logos
+        for (name, text) in [
+            ("AmS", "AMS"),
+            ("AMS", "AMS"),
+            ("AmSTeX", "AMS-TeX"),
+            ("AMSTeX", "AMS-TeX"),
+            ("AmSLaTeX", "AMS-LaTeX"),
+            ("AMSLaTeX", "AMS-LaTeX"),
+            ("eTeX", "\u{03B5}-TeX"),
+            ("pdfTeX", "pdfTeX"),
+            ("pdfLaTeX", "pdfLaTeX"),
+            ("XeTeX", "XeTeX"),
+            ("XeLaTeX", "XeLaTeX"),
+            ("LuaTeX", "LuaTeX"),
+            ("LuaLaTeX", "LuaLaTeX"),
+            ("ConTeXt", "ConTeXt"),
+            ("METAFONT", "METAFONT"),
+            ("MF", "METAFONT"),
+            ("MP", "MetaPost"),
+            ("MetaPost", "MetaPost"),
+            ("SliTeX", "SliTeX"),
+            ("SLiTeX", "SLiTeX"),
+            ("PiC", "PiC"),
+            ("PiCTeX", "PiCTeX"),
+            ("LyX", "LyX"),
+            ("KOMAScript", "KOMA-Script"),
+            ("BibLaTeX", "BibLaTeX"),
+            ("biber", "Biber"),
+            ("TikZ", "TikZ"),
+            ("PGF", "PGF"),
+            ("ExTeX", "ExTeX"),
+            ("TeXLive", "TeX Live"),
+            ("MiKTeX", "MiKTeX"),
+            ("plainTeX", "plain TeX"),
+            ("LaTeXiii", "LaTeX3"),
+            ("LaTeX3", "LaTeX3"),
+        ] {
+            self.define_builtin(name, 0, text);
+        }
 
         // Common abbreviations
         self.define_builtin("ie", 0, "i.e.");

@@ -864,6 +864,35 @@ impl Parser {
                 if self.state.environments.contains_key(&env_name) {
                     return self.expand_user_environment_begin(&env_name);
                 }
+                // Any declaration works as an environment: \begin{em} = {\em ...}
+                if let Some(style) = declaration_style(&env_name) {
+                    let blocks = self.parse_environment_blocks(&env_name)?;
+                    let blocks = blocks
+                        .into_iter()
+                        .map(|block| style_block(&style, block))
+                        .collect::<Vec<_>>();
+                    return Ok(match blocks.len() {
+                        0 => None,
+                        1 => blocks.into_iter().next(),
+                        _ => Some(Block::Composite(blocks)),
+                    });
+                }
+                // \begin{foo} runs \foo when foo is a macro or a known
+                // command without output (\begin{sloppypar}, \begin{small})
+                if self.state.macros.contains_key(&env_name) {
+                    self.push_front(vec![Token::Command(env_name.clone())]);
+                    let blocks = self.parse_environment_blocks(&env_name)?;
+                    return Ok(match blocks.len() {
+                        0 => None,
+                        1 => blocks.into_iter().next(),
+                        _ => Some(Block::Composite(blocks)),
+                    });
+                }
+                if noop_command_signature(&env_name).is_some_and(|(args, _)| args == 0)
+                    || knowledge::setup_command(&env_name).is_some_and(|s| s.braced == 0)
+                {
+                    return self.parse_transparent_environment(&env_name, 0, false);
+                }
                 // Theorem-like names whose \newtheorem lives in a style file
                 // we could not read: treat them as theorems anyway
                 if let Some(display) = knowledge::implicit_theorem_name(&env_name) {
@@ -2580,6 +2609,22 @@ impl Parser {
             }
         }
         Ok(Some(Block::Quote(blocks)))
+    }
+
+    /// Parse blocks up to `\end{env_name}`.
+    fn parse_environment_blocks(&mut self, env_name: &str) -> Result<Vec<Block>> {
+        let mut blocks = Vec::new();
+        while !self.is_at_end() {
+            self.skip_whitespace_and_comments();
+            if matches!(self.current_token(), Token::EndEnvironment(env) if env == env_name) {
+                self.advance();
+                break;
+            }
+            if let Some(block) = self.parse_block()? {
+                blocks.push(block);
+            }
+        }
+        Ok(blocks)
     }
 
     /// The content of an environment as one run of inlines.
@@ -4815,6 +4860,23 @@ enum DeclStyle {
     SmallCaps,
     Mono,
     Plain,
+}
+
+/// Apply a font declaration to the text of a block (paragraphs, list
+/// items, quotes); structural blocks are left as they are.
+fn style_block(style: &DeclStyle, block: Block) -> Block {
+    match block {
+        Block::Paragraph(inlines) => Block::Paragraph(apply_decl_style(style, inlines)),
+        Block::Quote(blocks) => Block::Quote(blocks.into_iter().map(|b| style_block(style, b)).collect()),
+        Block::Composite(blocks) => Block::Composite(blocks.into_iter().map(|b| style_block(style, b)).collect()),
+        Block::BulletList(items) => Block::BulletList(
+            items
+                .into_iter()
+                .map(|item| item.into_iter().map(|b| style_block(style, b)).collect())
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Wrap inlines in the inline type a font declaration stands for.
