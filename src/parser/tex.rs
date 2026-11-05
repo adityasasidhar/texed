@@ -1366,6 +1366,17 @@ impl Parser {
                 match token {
                     Token::Command(name) => {
                         self.advance();
+                        // Register accessors take an operand (\the\dp88,
+                        // \the\count255): read it so it does not leak
+                        if matches!(name.as_str(), "wd" | "ht" | "dp" | "dimen" | "skip" | "toks" | "count" | "muskip") {
+                            self.skip_whitespace_only();
+                            if matches!(self.current_token(), Token::Command(_)) {
+                                self.advance();
+                            } else {
+                                let _ = self.read_tex_number();
+                            }
+                            return Ok(None);
+                        }
                         let value = self.command_numeric_value(&name);
                         if let Some(counter) = name.strip_prefix("the") {
                             if let Some(text) = self.format_named_counter(counter, "arabic") {

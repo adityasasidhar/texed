@@ -186,6 +186,13 @@ pub struct Parser {
     macro_budget: usize,
     /// Start number for the next enumerate list (from \setcounter{enumi}).
     pending_enum_start: Option<usize>,
+    /// Item label of the next generic `list` (its first argument) and the
+    /// counter its setup code `\usecounter`s.
+    pending_list_label: Option<(Vec<Token>, Option<String>)>,
+    /// Open `list`/`trivlist` environments, innermost last (`\endlist` closes).
+    generic_lists_open: Vec<String>,
+    /// Open `\begin{foo}` environments run as the macro `\foo`.
+    macro_envs_open: Vec<String>,
     /// The definition being parsed uses TeX parameter text (\def family).
     macro_def_tex_style: bool,
     /// The definition being parsed is an \edef/\xdef.
@@ -294,6 +301,9 @@ impl Parser {
             macro_expansions: 0,
             macro_budget,
             pending_enum_start: None,
+            pending_list_label: None,
+            generic_lists_open: Vec::new(),
+            macro_envs_open: Vec::new(),
             macro_def_tex_style: false,
             macro_def_expand: false,
             list_depth: 0,
@@ -936,6 +946,22 @@ impl Parser {
     fn parse_environment_dispatch(&mut self, env_name: String) -> Result<Option<Block>> {
         self.advance(); // consume BeginEnvironment
 
+        // A document definition wrapping an environment the parser renders
+        // (a compact itemize* around itemize) is what LaTeX runs: it wins
+        // over the built-in rendering of a package environment of that name
+        if !is_builtin_structural_env(&env_name) && self.state.get_theorem_env(&env_name).is_none() {
+            if let Some(def) = self.state.environments.get(&env_name) {
+                let begin = def.begin_def.trim_start_matches(|c: char| c.is_whitespace() || c == '%');
+                let wraps = begin
+                    .strip_prefix("\\begin{")
+                    .and_then(|rest| rest.split('}').next())
+                    .is_some_and(|inner| inner != env_name && is_builtin_structural_env(inner));
+                if wraps && !is_low_level_typesetting(&def.begin_def) {
+                    return self.expand_user_environment_begin(&env_name);
+                }
+            }
+        }
+
         match env_name.as_str() {
             "document" => {
                 // The body starts: content is typeset from here on
@@ -950,6 +976,14 @@ impl Parser {
             "linenomath" | "linenomath*" | "NoHyper" | "subtable" | "subtable*" | "landscape*"
             | "ThreePartTable" | "adjustwidth*" => self.parse_transparent_environment(&env_name, 0, false),
             "enumerate" => self.parse_enumerate(),
+            "list" => self.parse_generic_list(),
+            // \item[label] paragraphs without list markers
+            "trivlist" => Ok(self.parse_list("trivlist", false)?.map(|block| match block {
+                Block::BulletList(items) | Block::OrderedList { items, .. } => {
+                    Block::Composite(items.into_iter().flatten().collect())
+                }
+                other => other,
+            })),
             "description" => self.parse_description(),
             "quote" | "quotation" | "displayquote" | "verse" => {
                 self.parse_quote_environment(&env_name)
@@ -970,7 +1004,7 @@ impl Parser {
                 self.parse_figure_environment(&env_name)
             }
             "center" | "flushleft" | "flushright" | "sloppypar" | "samepage" | "titlepage"
-            | "singlespace" | "landscape" | "footnotesize" | "small" | "large" | "trivlist"
+            | "singlespace" | "landscape" | "footnotesize" | "small" | "large"
             | "RaggedRight"
             | "minipage*" => {
                 self.parse_transparent_environment(&env_name, 0, false)
@@ -1088,7 +1122,10 @@ impl Parser {
                 // command without output (\begin{sloppypar}, \begin{small})
                 if self.state.macros.contains_key(&env_name) {
                     self.push_front(vec![Token::Command(env_name.clone())]);
-                    let blocks = self.parse_environment_blocks(&env_name)?;
+                    self.macro_envs_open.push(env_name.clone());
+                    let blocks = self.parse_environment_blocks(&env_name);
+                    self.macro_envs_open.pop();
+                    let blocks = blocks?;
                     return Ok(match blocks.len() {
                         0 => None,
                         1 => blocks.into_iter().next(),
@@ -1296,7 +1333,14 @@ impl Parser {
     /// lists cannot express arbitrary markers.
     fn parse_list(&mut self, env_name: &str, ordered: bool) -> Result<Option<Block>> {
         self.list_depth += 1;
+        let generic = matches!(env_name, "list" | "trivlist");
+        if generic {
+            self.generic_lists_open.push(env_name.to_string());
+        }
         let result = self.parse_list_inner(env_name, ordered);
+        if generic {
+            self.generic_lists_open.pop();
+        }
         self.list_depth -= 1;
         // LaTeX rejects lists nested more than 4 deep; past a generous limit,
         // flatten instead of producing ever-deeper Markdown indentation.
@@ -1308,11 +1352,51 @@ impl Parser {
         result
     }
 
+    /// `\begin{list}{label}{setup}`: items get the label (evaluated per item,
+    /// so `(\roman{c})` counts); `\usecounter` in the setup numbers them.
+    fn parse_generic_list(&mut self) -> Result<Option<Block>> {
+        self.skip_whitespace_only();
+        let label = if matches!(self.current_token(), Token::LeftBrace) {
+            self.collect_braced_tokens()
+        } else {
+            Vec::new()
+        };
+        self.skip_whitespace_only();
+        let setup = if matches!(self.current_token(), Token::LeftBrace) {
+            self.collect_braced_tokens()
+        } else {
+            Vec::new()
+        };
+        let counter = setup.windows(4).find_map(|w| match w {
+            [Token::Command(cmd), Token::LeftBrace, Token::Text(name), Token::RightBrace]
+                if cmd == "usecounter" => Some(name.trim().to_string()),
+            _ => None,
+        });
+        // The setup code runs (\usecounter resets, \setcounter moves the start)
+        let _ = self.parse_inline_fragment_tokens(setup)?;
+        let ordered = counter.is_some();
+        // No label, no counter: a list used for indentation (pgfmanual's
+        // \command boxes), paragraphs like a trivlist
+        let layout_only = counter.is_none()
+            && label.iter().all(|t| matches!(t, Token::Whitespace(_) | Token::Newline | Token::Comment(_)));
+        self.pending_list_label = Some((label, counter));
+        let list = self.parse_list("list", ordered)?;
+        if layout_only {
+            if let Some(Block::BulletList(items)) = list {
+                return Ok(Some(Block::Composite(items.into_iter().flatten().collect())));
+            }
+        }
+        Ok(list)
+    }
+
     fn parse_list_inner(&mut self, env_name: &str, ordered: bool) -> Result<Option<Block>> {
         let mut items: Vec<Vec<Block>> = Vec::new();
         let mut custom_labels = 0usize;
         let mut start = 1usize;
         self.pending_enum_start = None;
+        // Generic list: the label each plain \item gets
+        let auto_label = self.pending_list_label.take();
+        let mut auto_labels: Vec<(usize, Vec<Inline>)> = Vec::new();
 
         // Optional list options: \begin{enumerate}[label=(\alph*), start=3]
         self.skip_whitespace_and_comments();
@@ -1342,6 +1426,12 @@ impl Parser {
                 {
                     break;
                 }
+                // \begin{item}...\end{item}: the environment form of \item
+                Token::BeginEnvironment(env) if env == "item" => {
+                    self.advance();
+                    self.push_front(vec![Token::Item]);
+                }
+                Token::EndEnvironment(env) if env == "item" => self.advance(),
                 Token::Item => {
                     self.advance();
                     self.skip_overlay_spec();
@@ -1351,10 +1441,24 @@ impl Parser {
                             start = n;
                         }
                     }
+                    let auto = match (&label, &auto_label) {
+                        (None, Some((tokens, counter))) => {
+                            if let Some(counter) = counter {
+                                let next = self.counter_value(counter) + 1;
+                                self.state.set_counter(counter, next);
+                            }
+                            let (inlines, _) = self.parse_inline_fragment_tokens(tokens.clone())?;
+                            Some(trim_inline_whitespace(inlines))
+                        }
+                        _ => None,
+                    };
                     let mut item_blocks = self.parse_item_content(env_name)?;
                     if let Some(label) = label.filter(|l| !l.is_empty()) {
                         custom_labels += 1;
                         prepend_item_label(&mut item_blocks, label);
+                    }
+                    if let Some(auto) = auto {
+                        auto_labels.push((items.len(), auto));
                     }
                     items.push(item_blocks);
                 }
@@ -1376,6 +1480,33 @@ impl Parser {
             }
         }
 
+        if auto_label.is_some() && !auto_labels.is_empty() {
+            // Plain "1." labels are a Markdown ordered list, bullets a bullet
+            // list; anything else ("(i)", "Step 1:") is written out
+            let first = auto_labels
+                .first()
+                .and_then(|(_, l)| inlines_to_code_text(l).trim().strip_suffix('.')?.parse::<usize>().ok());
+            let plain_numbers = ordered
+                && custom_labels == 0
+                && first.is_some_and(|first| {
+                    auto_labels
+                        .iter()
+                        .enumerate()
+                        .all(|(i, (_, l))| inlines_to_code_text(l).trim() == format!("{}.", first + i))
+                });
+            if let (true, Some(start)) = (plain_numbers, first) {
+                return Ok(Some(Block::OrderedList { start, items }));
+            }
+            let all_bullets = auto_labels.iter().all(|(_, l)| is_bullet_label(&inlines_to_code_text(l)));
+            if !all_bullets {
+                for (index, label) in auto_labels {
+                    if let Some(item) = items.get_mut(index) {
+                        prepend_item_label(item, label);
+                    }
+                }
+            }
+            return Ok(Some(Block::BulletList(items)));
+        }
         if ordered && (custom_labels == 0 || custom_labels < items.len()) {
             Ok(Some(Block::OrderedList { start, items }))
         } else {
@@ -1498,8 +1629,14 @@ impl Parser {
             self.skip_whitespace_and_comments();
 
             // Stop at next item or end of environment
-            if matches!(self.current_token(), Token::Item) {
-                break;
+            match self.current_token() {
+                Token::Item => break,
+                Token::BeginEnvironment(env) if env == "item" => break,
+                Token::EndEnvironment(env) if env == "item" => {
+                    self.advance();
+                    continue;
+                }
+                _ => {}
             }
 
             if let Token::EndEnvironment(env) = self.current_token() {
@@ -1532,7 +1669,14 @@ impl Parser {
 
             match token {
                 Token::Item => break,
-                Token::EndEnvironment(env) if env == env_name => break,
+                Token::EndEnvironment(env) if env == env_name || env == "item" => break,
+                // an enclosing environment ends (a \def-defined one whose
+                // begin code opened this list): the item is over
+                Token::EndEnvironment(env) if self.macro_envs_open.iter().any(|open| open == env) => break,
+                Token::Command(cmd) if cmd == "par" => {
+                    self.advance();
+                    break;
+                }
                 Token::ParBreak
                 | Token::BeginEnvironment(_)
                 | Token::DisplayMath(_)
@@ -1748,7 +1892,24 @@ impl Parser {
             "gather" => Some("gathered"),
             _ => None,
         };
-        if let Some(wrapper) = wrapper {
+        // A body that is one alignment block already (\begin{align}\begin{split}
+        // ...\end{split}\end{align}) is not wrapped again; a whole-body split
+        // becomes aligned (same rendering, valid in every display context)
+        let trimmed = content.trim();
+        let single_block = ["split", "aligned", "gathered", "alignedat", "array", "cases", "matrix", "pmatrix", "bmatrix"]
+            .iter()
+            .find(|env| {
+                trimmed.starts_with(&format!("\\begin{{{}}}", env))
+                    && trimmed.ends_with(&format!("\\end{{{}}}", env))
+                    && trimmed.matches(&format!("\\begin{{{}}}", env)).count() == 1
+            });
+        if let Some(env) = single_block {
+            if *env == "split" {
+                content = trimmed
+                    .replacen("\\begin{split}", "\\begin{aligned}", 1)
+                    .replacen("\\end{split}", "\\end{aligned}", 1);
+            }
+        } else if let Some(wrapper) = wrapper {
             if multi_row || content.contains('&') {
                 content = format!("\\begin{{{}}}\n{}\n\\end{{{}}}", wrapper, content, wrapper);
             }
@@ -1947,6 +2108,74 @@ impl Parser {
             ("\"~", "-"), ("\"=", "-"), ("\"/", "/"),
         ] {
             self.shorthands.push((seq.to_string(), code.to_string()));
+        }
+    }
+
+    /// `\aistatstitle{T}`, `\aistatsauthor{A \And B}`, `\icmltitle{T}`,
+    /// `\icmlauthor{Name}{affil}`: the title block; addresses, running
+    /// heads and affiliations produce nothing.
+    fn parse_conference_title(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        match cmd {
+            "aistatstitle" | "icmltitle" => {
+                self.skip_whitespace_only();
+                let tokens = self.collect_braced_tokens();
+                let mut out = vec![Token::Command(String::from("title")), Token::LeftBrace];
+                out.extend(tokens);
+                out.extend([Token::RightBrace, Token::Command(String::from("maketitle"))]);
+                self.push_front(out);
+                Ok(Some(None))
+            }
+            "aistatsauthor" | "icmlauthor" => {
+                self.skip_whitespace_only();
+                let tokens = self.collect_braced_tokens();
+                if cmd == "icmlauthor" {
+                    self.skip_whitespace_only();
+                    let _ = self.collect_braced_tokens();
+                }
+                // \And between authors: a comma
+                let mut names: Vec<Token> = Vec::new();
+                for token in tokens {
+                    match &token {
+                        Token::Command(c) if matches!(c.as_str(), "And" | "AND" | "and") => {
+                            while matches!(names.last(), Some(Token::Whitespace(_) | Token::Newline)) {
+                                names.pop();
+                            }
+                            names.push(Token::Text(String::from(",")));
+                            names.push(Token::Whitespace(String::from(" ")));
+                        }
+                        _ => names.push(token),
+                    }
+                }
+                let (inlines, _) = self.parse_inline_fragment_tokens(names)?;
+                let inlines = trim_inline_whitespace(inlines);
+                if inlines.is_empty() {
+                    return Ok(Some(None));
+                }
+                let text = self.inlines_to_plain_text(&inlines);
+                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let entry = self.metadata.entry(String::from("author")).or_default();
+                if !entry.is_empty() {
+                    entry.push_str(", ");
+                }
+                entry.push_str(text.trim());
+                Ok(Some(Some(Inline::Emph(inlines))))
+            }
+            "aistatsaddress" | "icmlaffiliation" | "icmlcorrespondingauthor" | "icmlkeywords"
+            | "icmltitlerunning" | "runningtitle" | "runningauthor" | "icmlsetsymbol" => {
+                for _ in 0..(if matches!(cmd, "icmlaffiliation" | "icmlcorrespondingauthor" | "icmlsetsymbol") { 2 } else { 1 }) {
+                    self.skip_whitespace_only();
+                    let _ = self.collect_braced_tokens();
+                }
+                Ok(Some(None))
+            }
+            "printAffiliationsAndNotice" | "icmlEqualContribution" => {
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBrace) {
+                    let _ = self.collect_braced_tokens();
+                }
+                Ok(Some(None))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -2168,13 +2397,66 @@ impl Parser {
             }
             // environment names used as commands: \center ... \endcenter
             "center" | "endcenter" | "flushleft" | "endflushleft" | "flushright" | "endflushright"
-            | "quote" | "endquote" | "quotation" | "endquotation" | "trivlist" | "endtrivlist"
-            | "endlist" | "endtableau" => Ok(Some(None)),
+            | "quote" | "endquote" | "quotation" | "endquotation"
+            | "endtableau" => Ok(Some(None)),
+            // the kernel list primitives inside a class's environment code
+            // (\def\myenum{\list{(\roman{c})}{\usecounter{c}}}): a list
+            "list" | "trivlist" => {
+                self.push_front(vec![Token::BeginEnvironment(cmd.to_string())]);
+                Ok(Some(None))
+            }
+            "usecounter" => {
+                self.skip_whitespace_only();
+                let counter = self.parse_braced_text()?.trim().to_string();
+                if !counter.is_empty() {
+                    self.state.new_counter(&counter, None);
+                    self.state.set_counter(&counter, 0);
+                }
+                Ok(Some(None))
+            }
+            "endlist" | "endtrivlist" => {
+                let env = &cmd[3..];
+                if self.generic_lists_open.last().is_some_and(|open| open == env) {
+                    self.push_front(vec![Token::EndEnvironment(env.to_string())]);
+                }
+                Ok(Some(None))
+            }
             "nocite" => {
                 self.skip_whitespace_only();
                 let keys = self.parse_braced_text()?;
                 self.nocite_keys
                     .extend(keys.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()));
+                Ok(Some(None))
+            }
+            // \twocolumn[header]: the header is typeset across the page
+            "twocolumn" => {
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    // the header may hold paragraphs: read to the matching `]`
+                    self.advance();
+                    let (mut braces, mut brackets) = (0usize, 0usize);
+                    let mut tokens = Vec::new();
+                    let mut guard = 0;
+                    while !self.is_at_end() && guard < 100_000 {
+                        guard += 1;
+                        match self.current_token() {
+                            Token::RightBracket if braces == 0 && brackets == 0 => {
+                                self.advance();
+                                break;
+                            }
+                            Token::Command(c) if is_file_end_marker(c) => break,
+                            Token::BeginEnvironment(env) if env == "document" => break,
+                            Token::LeftBrace => braces += 1,
+                            Token::RightBrace => braces = braces.saturating_sub(1),
+                            Token::LeftBracket if braces == 0 => brackets += 1,
+                            Token::RightBracket if braces == 0 => brackets -= 1,
+                            _ => {}
+                        }
+                        tokens.push(self.current_token().clone());
+                        self.advance();
+                    }
+                    self.push_front(tokens);
+                }
                 Ok(Some(None))
             }
             // Czech quotes \uv{...}: „...“
@@ -2908,14 +3190,14 @@ impl Parser {
         }
     }
 
-    /// A `\label` met in running text: it belongs to the innermost open
-    /// float/theorem, else to the current section (LaTeX's `\@currentlabel`).
     /// Whether a built-in parser has `env` open (its `\end` is not the
     /// document's end code).
     fn builtin_owns(&self, env: &str) -> bool {
         self.builtin_open.get(env).is_some_and(|n| *n > 0)
     }
 
+    /// A `\label` met in running text: it belongs to the innermost open
+    /// float/theorem, else to the current section (LaTeX's `\@currentlabel`).
     fn attach_running_label(&mut self, key: String) {
         if let Some(target) = self.label_targets.last_mut() {
             if target.label.is_none() {
@@ -3035,6 +3317,11 @@ impl Parser {
             return Ok(None);
         }
 
+        // Conference title blocks (AISTATS, ICML): handled natively, ahead
+        // of the template's low-level definitions
+        if let Some(result) = self.parse_conference_title(&cmd)? {
+            return Ok(result);
+        }
         // proof-tree commands are kept as LaTeX even when a package defines
         // them (their definitions only draw)
         if is_bussproofs_command(&cmd) {
@@ -3188,9 +3475,9 @@ impl Parser {
                 let new_value = new_value.clamp(0, 1_000_000) as usize;
                 if name.starts_with("enum") {
                     self.pending_enum_start = Some(new_value + 1);
-                } else {
-                    self.state.set_counter(&name, new_value);
                 }
+                // (also a generic list's \usecounter{enumi})
+                self.state.set_counter(&name, new_value);
                 return Ok(None);
             }
             "stepcounter" | "refstepcounter" => {
@@ -3208,7 +3495,7 @@ impl Parser {
                 self.state.reset_dependents(&name);
                 return Ok(None);
             }
-            "newcounter" => {
+            "newcounter" | "@definecounter" => {
                 self.skip_whitespace_and_comments();
                 let name = self.parse_braced_text()?.trim().to_string();
                 let parent = if matches!(self.current_token(), Token::LeftBracket) {
@@ -3262,12 +3549,7 @@ impl Parser {
             if optional_arg && matches!(self.current_token(), Token::LeftBracket) {
                 let _ = self.parse_bracketed_text()?;
             }
-            for _ in 0..braced_args {
-                self.skip_whitespace_and_comments();
-                if matches!(self.current_token(), Token::LeftBrace) {
-                    let _ = self.parse_braced_text()?;
-                }
-            }
+            self.consume_noop_args(braced_args)?;
             return Ok(None);
         }
 
@@ -3675,6 +3957,11 @@ impl Parser {
     fn env_is_inline(&self, env: &str) -> bool {
         if env == "lrbox" {
             return true;
+        }
+        // a redefinition of an environment the parser renders itself
+        // (ieeeaccess's boxed keywords) stays the built-in block
+        if is_builtin_structural_env(env) {
+            return false;
         }
         let Some(def) = self.state.environments.get(env) else {
             return false;
@@ -4545,6 +4832,22 @@ impl Parser {
     }
 
     /// Consume the arguments of a set-up command.
+    /// Arguments of a no-output command: braced groups, or a single control
+    /// sequence (`\setlength\parindent{0pt}`), as TeX reads undelimited ones.
+    fn consume_noop_args(&mut self, count: usize) -> Result<()> {
+        for _ in 0..count {
+            self.skip_whitespace_and_comments();
+            match self.current_token() {
+                Token::LeftBrace => {
+                    let _ = self.parse_braced_text()?;
+                }
+                Token::Command(name) if !is_file_end_marker(name) => self.advance(),
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
     fn consume_signature(&mut self, signature: knowledge::Signature) -> Result<()> {
         if signature.leading_optional {
             self.skip_whitespace_only();
@@ -4600,6 +4903,29 @@ impl Parser {
     /// Consume a TeX assignment: `operands` control sequences, then (when
     /// `value`) an optional `=` and a number/dimension/glue specification
     /// (`0pt plus 1fil`, `\baselineskip`, `-\ht\box`, `2\parindent`).
+    /// `height <dim> depth <dim> width <dim>` after \hrule / \vrule.
+    fn consume_rule_spec(&mut self) {
+        for _ in 0..3 {
+            let mut k = 0;
+            while matches!(self.peek_at(k), Some(Token::Whitespace(_))) {
+                k += 1;
+            }
+            match self.peek_at(k).cloned() {
+                Some(Token::Text(t)) if ["height", "depth", "width"].iter().any(|w| t.starts_with(w)) => {
+                    self.skip_n(k);
+                    let keyword = ["height", "depth", "width"].iter().find(|w| t.starts_with(**w)).unwrap();
+                    self.advance();
+                    let rest = t[keyword.len()..].to_string();
+                    if !rest.is_empty() {
+                        self.push_front(vec![Token::Text(rest)]);
+                    }
+                    self.consume_tex_assignment(0, true);
+                }
+                _ => break,
+            }
+        }
+    }
+
     /// Count registers: declaration, assignment (`\x=3`, `\x 3`) and
     /// arithmetic (`\advance\x by 2`). Returns true when handled.
     fn parse_count_register(&mut self, cmd: &str) -> bool {
@@ -6582,6 +6908,10 @@ impl Parser {
             // Horizontal rules
             "hline" | "hrule" => {
                 self.advance();
+                // \hrule height4pt depth0pt width\hsize: the rule's size
+                if cmd == "hrule" {
+                    self.consume_rule_spec();
+                }
                 Ok(Some(Block::HorizontalRule))
             }
             
@@ -6877,12 +7207,7 @@ impl Parser {
                     if optional_arg && matches!(self.current_token(), Token::LeftBracket) {
                         let _ = self.parse_bracketed_text()?;
                     }
-                    for _ in 0..braced_args {
-                        self.skip_whitespace_and_comments();
-                        if matches!(self.current_token(), Token::LeftBrace) {
-                            let _ = self.parse_braced_text()?;
-                        }
-                    }
+                    self.consume_noop_args(braced_args)?;
                 }
                 Ok(None)
             }
@@ -7027,6 +7352,14 @@ impl Parser {
     }
 
     fn load_local_package(&mut self, package: &str) {
+        // A vendored copy of a standard package (conference templates ship
+        // fancyhdr.sty, natbib.sty, algorithmic.sty ...): the converter
+        // handles these itself, and running their internals only leaks
+        // layout code
+        let base = package.trim_end_matches(".sty");
+        if is_natively_handled_package(base) {
+            return;
+        }
         // Relative to the file being read (a package loading a sibling
         // package), then to the main document
         let mut bases: Vec<Option<PathBuf>> = Vec::new();
@@ -7238,6 +7571,26 @@ impl Parser {
     }
 }
 
+/// Standard packages whose commands the converter implements (or which
+/// only affect page layout): a local copy is not read.
+fn is_natively_handled_package(name: &str) -> bool {
+    matches!(
+        name,
+        "fancyhdr" | "geometry" | "hyperref" | "url" | "times" | "helvet" | "courier" | "mathptmx"
+            | "graphicx" | "graphics" | "color" | "xcolor" | "amsmath" | "amssymb" | "amsthm" | "amsfonts"
+            | "natbib" | "cite" | "algorithm" | "algorithmic" | "algorithmicx" | "algpseudocode"
+            | "algorithm2e" | "listings" | "booktabs" | "multirow" | "subfigure" | "subfig" | "subcaption"
+            | "caption" | "float" | "fullpage" | "setspace" | "enumitem" | "microtype" | "cleveref"
+            | "xspace" | "tikz" | "pgf" | "siunitx" | "lineno" | "wrapfig" | "epsfig" | "psfig"
+            | "fixltx2e" | "inputenc" | "fontenc" | "babel" | "verbatim" | "comment" | "fancyvrb"
+            | "titlesec" | "tocloft" | "etoolbox" | "xparse" | "ifthen" | "calc" | "array" | "tabularx"
+            | "longtable" | "multicol" | "bm" | "mathtools" | "nicefrac" | "units" | "textcomp"
+            | "eso-pic" | "everyshi" | "afterpage" | "placeins" | "parskip" | "lastpage" | "pdfpages"
+            | "sidecap" | "rotating" | "lscape" | "pdflscape" | "soul" | "ulem" | "csquotes" | "biblatex"
+            | "glossaries" | "acronym" | "nomencl" | "makeidx" | "index" | "footmisc" | "authblk"
+    )
+}
+
 /// bussproofs' inference commands.
 fn is_bussproofs_command(name: &str) -> bool {
     matches!(
@@ -7289,6 +7642,7 @@ fn is_builtin_structural_env(name: &str) -> bool {
             | "tabularx" | "longtable" | "equation" | "equation*" | "align" | "align*" | "gather"
             | "gather*" | "multline" | "multline*" | "eqnarray" | "eqnarray*" | "thebibliography"
             | "center" | "flushleft" | "flushright" | "minipage" | "frame" | "proof"
+            | "keywords" | "IEEEkeywords" | "keyword"
     )
 }
 
@@ -7310,6 +7664,9 @@ fn is_engine_primitive(name: &str) -> bool {
             | "else" | "fi" | "or" | "newcommand" | "renewcommand" | "providecommand"
             | "newenvironment" | "renewenvironment" | "input" | "include" | "documentclass"
             | "usepackage" | "RequirePackage" | "makeatletter" | "makeatother" | "@"
+            // classes redefine the title block as page layout; the built-in
+            // one renders the metadata
+            | "maketitle"
     ) || name.starts_with("texed@")
 }
 
@@ -7417,7 +7774,7 @@ fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
         }
 
         // One braced argument
-        "vspace" | "hspace" | "vskip" | "hskip" | "phantom" | "hphantom" | "vphantom"
+        "vspace" | "hspace" | "phantom" | "hphantom" | "vphantom"
         | "pagenumbering" | "thispagestyle" | "pagestyle" | "linespread"
         | "hyphenation" | "markright" | "enlargethispage" | "setstretch" | "index"
         | "glossary" | "hypersetup" | "geometry" | "usetikzlibrary" | "color"
@@ -8418,6 +8775,18 @@ fn is_inline_safe_block_command(cmd: &str) -> bool {
 }
 
 /// Put a custom `\item[label]` marker in front of the item's first paragraph.
+/// A list label that is just a bullet mark (`$\bullet$`, `--`, `\textbullet`).
+fn is_bullet_label(label: &str) -> bool {
+    let label = label.trim().trim_matches('$').trim();
+    matches!(
+        label,
+        "" | "•" | "∙" | "·" | "◦" | "○" | "●" | "▪" | "■" | "□" | "‣" | "-" | "–" | "—" | "*" | "∗"
+            | "\\bullet" | "\\cdot" | "\\circ" | "\\ast" | "\\star" | "\\diamond" | "\\blacksquare"
+            | "\\square" | "\\triangleright" | "\\rhd" | "\\to" | "\\rightarrow" | "\\Rightarrow"
+            | "\\cdots" | "\\diamondsuit" | "\\clubsuit"
+    )
+}
+
 fn prepend_item_label(blocks: &mut Vec<Block>, label: Vec<Inline>) {
     match blocks.first_mut() {
         Some(Block::Paragraph(inlines)) => {

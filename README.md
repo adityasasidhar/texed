@@ -311,6 +311,8 @@ fn main() {
 ### Lists
 - `itemize`, `enumerate` (nested, tight rendering, `\item[...]` markers, package options)
 - `description` (pandoc-style definition lists)
+- The kernel's generic `list` (and `\list` inside class/package environments): labels are evaluated per item (`(\roman{c})`, `Step \arabic{c}:`), the setup code runs (`\usecounter`, `\setcounter`); an empty label is a layout list and becomes plain paragraphs, as does `trivlist`
+- `\begin{item}...\end{item}` (the environment form of `\item`)
 
 ### Math
 - Inline: `$...$` and `\(...\)`; display: `$$...$$` and `\[...\]` — math is captured raw (primes, `--`, quotes are never altered)

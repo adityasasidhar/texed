@@ -608,3 +608,60 @@ fn etoolbox_booleans_and_inline_lists() {
     has("\\newbool{d}\\booltrue{d}\\ifbool{d}{yes}{no} \\setbool{d}{false}\\ifbool{d}{yes}{no}", "yes no");
     has("\\begin{enumerate*}\\item a \\item b\\end{enumerate*}", "1. a\n2. b");
 }
+
+#[test]
+fn conference_title_blocks() {
+    let doc = "\\documentclass{article}\\begin{document}\\twocolumn[\n\\aistatstitle{Deep Things}\n\n\\aistatsauthor{Ann One \\And Bob Two}\n\n\\aistatsaddress{Somewhere} ]\nBody.\\end{document}";
+    has(doc, "# Deep Things\n\n*Ann One, Bob Two*");
+    lacks(doc, "Somewhere");
+    lacks(doc, "]");
+}
+
+#[test]
+fn align_wrapping_a_split_is_not_wrapped_again() {
+    let out = md("\\begin{align}\n\\begin{split}\na &= b,\\\\\nc &= d.\n\\end{split}\n\\end{align}");
+    assert!(out.contains("\\begin{aligned}\na &= b"), "{}", out);
+    assert_eq!(out.matches("\\begin{aligned}").count(), 1, "{}", out);
+    assert!(!out.contains("split"), "{}", out);
+}
+
+#[test]
+fn hrule_and_vskip_specifications() {
+    has("A\n\n\\hrule height4pt\n\nB \\vskip 0.2in plus 1fil minus 0.1in C", "B C");
+    lacks("A\n\n\\hrule height4pt\n\nB", "height");
+}
+
+#[test]
+fn generic_list_environments() {
+    let roman = "\\newcounter{c}\\begin{list}{(\\roman{c})}{\\usecounter{c}}\\item One\\item Two\\end{list}";
+    has(roman, "- (i) One\n- (ii) Two");
+    has("\\begin{list}{$\\bullet$}{}\\item A\\item B\\end{list}", "- A\n- B");
+    has("\\newcounter{c}\\begin{list}{\\arabic{c}.}{\\usecounter{c}}\\item P\\item Q\\end{list}", "1. P\n2. Q");
+    // the kernel primitive inside a class-defined environment
+    let class = "\\makeatletter\\@definecounter{s}\\def\\steps{\\list{Step \\arabic{s}:}{\\usecounter{s}}}\\let\\endsteps\\endlist\\makeatother\n\\begin{steps}\\item a\\item b\\end{steps}\nAfter.";
+    has(class, "- Step 1: a\n- Step 2: b\n\nAfter.");
+    // setup code runs: \setcounter moves the start
+    has("\\begin{list}{(\\theenumi)}{\\usecounter{enumi}\\setcounter{enumi}{33}\\itemsep=3cm}\\item a\\item b\\end{list}", "- (34) a\n- (35) b");
+    // an empty label is a layout device (pgfmanual's \command boxes)
+    has("\\begin{list}{}{\\leftmargin=2em}\\item Sig\\par Explained.\\end{list}", "Sig\n\nExplained.");
+    lacks("\\begin{list}{}{\\leftmargin=2em}\\item Sig\\par Explained.\\end{list}", "- ");
+    // \begin{item}: the environment form of \item
+    has("\\begin{itemize}\\begin{item} foo\\end{item}\\begin{item} bar\\end{item}\\end{itemize}", "- foo\n- bar");
+    has("\\begin{trivlist}\\item[] T\\end{trivlist}", "T");
+    lacks("\\begin{trivlist}\\item[] T\\end{trivlist}", "[]");
+}
+
+#[test]
+fn class_keywords_redefinition_and_register_operands() {
+    // ieeeaccess.cls boxes its keywords; the built-in keywords line wins
+    let doc = "\\newlength\\kwdht\\newenvironment{keywords}{}{}\\renewenvironment{keywords}{\\global\\setbox88=\\hbox\\bgroup}{\\egroup\\global\\setlength\\kwdht{\\the\\dp88}}\n\\begin{keywords}k1, k2\\end{keywords}\n\\section{Probe}\nText.";
+    has(doc, "**Keywords:** k1, k2\n\n## Probe");
+    lacks(doc, "88");
+    has("A\\global\\setlength\\parindent{1pt}B x\\the\\dp88 y", "AB x y");
+}
+
+#[test]
+fn document_environment_wrapping_a_list_wins() {
+    let doc = "\\newenvironment{itemize*}{\\begin{itemize}\\setlength{\\itemsep}{0pt}}{\\end{itemize}}\n\\begin{itemize*}\\item a\\item b\\end{itemize*}\n\nAfter.";
+    has(doc, "- a\n- b\n\nAfter.");
+}
