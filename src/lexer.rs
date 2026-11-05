@@ -1516,7 +1516,7 @@ fn strip_comments_and_verbatim(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pos = 0;
     // the next verbatim begin, searched again only once passed (linear)
-    let mut verbatim = find_verbatim_begin(text).map(|(b, s, n)| (b, s, n));
+    let mut verbatim = find_verbatim_begin(text);
     while pos < text.len() {
         if let Some((begin, _, _)) = &verbatim {
             if *begin < pos {
