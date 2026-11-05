@@ -651,6 +651,7 @@ impl Parser {
                 | "title"
                 | "author"
                 | "date"
+                | "subtitle"
                 | "graphicspath"
                 | "pagestyle"
                 | "thispagestyle"
@@ -848,7 +849,7 @@ impl Parser {
             // Graphics code: kept whole (with its \begin/\end) so it can be
             // re-rendered, as a LaTeX code block
             "tikzpicture" | "tikzcd" | "pgfpicture" | "circuitikz" | "pspicture" | "forest"
-            | "tikzonimage" | "dot2tex" | "prooftree" | "prooftree*" | "bprooftree" => Some(Block::CodeBlock {
+            | "tikzonimage" | "dot2tex" | "prooftree" | "prooftree*" | "bprooftree" | "picture" => Some(Block::CodeBlock {
                 language: Some(String::from("latex")),
                 content: format!("\\begin{{{}}}{}\\end{{{}}}", name, content, name),
             }),
@@ -933,6 +934,10 @@ impl Parser {
                 self.parse_transparent_environment(&env_name, 0, false)
             }
             "minipage" => self.parse_transparent_environment(&env_name, 1, true),
+            // preview (the package's crops), letters (letter class)
+            "preview" | "preview*" | "nopreview" => self.parse_transparent_environment(&env_name, 0, false),
+            "letter" => self.parse_transparent_environment(&env_name, 1, false),
+            "tabbing" => self.parse_tabbing(),
             "multicols" | "spacing" => self.parse_transparent_environment(&env_name, 1, false),
             // Definition containers: their \acro / \newglossaryentry
             // commands are recorded, nothing is typeset here
@@ -2074,6 +2079,82 @@ impl Parser {
                 }
                 Ok(Some(None))
             }
+            // letter class
+            "opening" | "closing" | "cc" | "encl" => {
+                self.skip_whitespace_only();
+                let content = self.parse_braced_inlines()?;
+                let mut out = Vec::new();
+                match cmd {
+                    "cc" => out.push(Inline::Text(String::from("cc: "))),
+                    "encl" => out.push(Inline::Text(String::from("encl: "))),
+                    _ => {}
+                }
+                out.extend(trim_inline_whitespace(content));
+                Ok(Some(Some(span_or_single(out))))
+            }
+            "signature" | "address" | "location" | "telephone" | "fromaddress" | "fromname" => {
+                self.skip_whitespace_only();
+                let _ = self.collect_braced_tokens();
+                Ok(Some(None))
+            }
+            // pifont: \ding{51} is ZapfDingbats character 51 (✓)
+            "ding" => {
+                self.skip_whitespace_only();
+                let code = self.parse_braced_text()?;
+                let symbol = code.trim().parse::<u32>().ok().and_then(zapf_dingbat);
+                Ok(Some(symbol.map(|c| Inline::Text(c.to_string()))))
+            }
+            // placeholder text packages
+            "lipsum" | "lipsum*" | "kant" | "kant*" | "blindtext" | "Blindtext" | "blinddocument" => {
+                self.consume_text_star();
+                while matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.collect_bracketed_tokens();
+                }
+                Ok(Some(Some(Inline::Text(String::from(
+                    "Lorem ipsum dolor sit amet, consectetuer adipiscing elit. Ut purus elit, vestibulum ut, placerat ac, adipiscing vitae, felis.",
+                )))))
+            }
+            "email" | "Email" | "mailto" => {
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                let address = self.parse_braced_raw_text();
+                let address = address.trim().to_string();
+                if address.is_empty() {
+                    return Ok(Some(None));
+                }
+                Ok(Some(Some(Inline::Link {
+                    text: vec![Inline::Text(address.clone())],
+                    url: format!("mailto:{}", address),
+                    title: None,
+                })))
+            }
+            // \tikzstyle{name}=[options]: TikZ set-up
+            "tikzstyle" | "tikzset" | "pgfkeys" | "pgfplotsset" | "pgfqkeys" => {
+                self.skip_whitespace_only();
+                if cmd == "pgfqkeys" {
+                    let _ = self.collect_braced_tokens();
+                    self.skip_whitespace_only();
+                }
+                let _ = self.collect_braced_tokens();
+                if cmd == "tikzstyle" {
+                    self.skip_whitespace_only();
+                    if let Token::Text(t) = self.current_token().clone() {
+                        if let Some(rest) = t.trim_start().strip_prefix('=') {
+                            self.advance();
+                            if !rest.trim().is_empty() {
+                                self.push_front(vec![Token::Text(rest.to_string())]);
+                            }
+                        }
+                    }
+                    self.skip_whitespace_only();
+                    if matches!(self.current_token(), Token::LeftBracket) {
+                        let _ = self.collect_xparse_optional();
+                    }
+                }
+                Ok(Some(None))
+            }
             // babel: \defineshorthand[langs]{seq}{code}, \useshorthands{c}
             "defineshorthand" | "declare@shorthand" => {
                 self.skip_whitespace_and_comments();
@@ -2229,6 +2310,83 @@ impl Parser {
         let display = display.filter(|d| !d.is_empty()).unwrap_or_else(|| capitalize_first(name));
         self.float_envs.insert(name.to_string(), display);
         self.state.declare_float(name, within.filter(|w| *w != "none"));
+    }
+
+    /// `tabbing`: lines (`\\`) of tab-separated cells (`\>`); tab stops
+    /// (`\=`, `\+`, `\-`, `\<`) and `\kill` lines produce nothing. Rendered
+    /// as lines with the cells spaced apart.
+    fn parse_tabbing(&mut self) -> Result<Option<Block>> {
+        let mut lines: Vec<Vec<Vec<Token>>> = vec![vec![Vec::new()]];
+        let mut depth = 0usize;
+        while !self.is_at_end() {
+            let token = self.current_token().clone();
+            match &token {
+                Token::EndEnvironment(env) if env == "tabbing" && depth == 0 => {
+                    self.advance();
+                    break;
+                }
+                Token::LeftBrace => depth += 1,
+                Token::RightBrace => depth = depth.saturating_sub(1),
+                Token::Backslash if depth == 0 => {
+                    self.advance();
+                    if matches!(self.current_token(), Token::LeftBracket) {
+                        let _ = self.collect_bracketed_tokens();
+                    }
+                    lines.push(vec![Vec::new()]);
+                    continue;
+                }
+                Token::Command(c) if depth == 0 => match c.as_str() {
+                    ">" => {
+                        self.advance();
+                        if let Some(line) = lines.last_mut() {
+                            line.push(Vec::new());
+                        }
+                        continue;
+                    }
+                    "=" | "+" | "-" | "<" | "pushtabs" | "poptabs" => {
+                        self.advance();
+                        continue;
+                    }
+                    "kill" => {
+                        self.advance();
+                        if let Some(line) = lines.last_mut() {
+                            *line = vec![Vec::new()];
+                        }
+                        continue;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+            if let Some(cell) = lines.last_mut().and_then(|l| l.last_mut()) {
+                cell.push(token);
+            }
+            self.advance();
+        }
+        let mut inlines = Vec::new();
+        for line in lines {
+            let mut cells = Vec::new();
+            for cell in line {
+                let (content, _) = self.parse_inline_fragment_tokens(cell)?;
+                let content = trim_inline_whitespace(content);
+                if !content.is_empty() {
+                    cells.push(content);
+                }
+            }
+            if cells.is_empty() {
+                continue;
+            }
+            if !inlines.is_empty() {
+                inlines.push(Inline::LineBreak);
+            }
+            for (i, cell) in cells.into_iter().enumerate() {
+                if i > 0 {
+                    inlines.push(Inline::Text(String::from("\u{2003}")));
+                }
+                inlines.extend(cell);
+            }
+        }
+        Ok((!inlines.is_empty()).then_some(Block::Paragraph(inlines)))
     }
 
     /// A float of a declared type (`listing`, `\newfloat{program}...`): any
@@ -2762,6 +2920,64 @@ impl Parser {
         // Check if it's a user-defined macro
         if self.macro_processor.is_defined(&self.state, &cmd) {
             return self.parse_macro_expansion(&cmd);
+        }
+
+        // Margin notes, to-do notes and critical-edition notes: footnotes
+        if matches!(
+            cmd.as_str(),
+            "marginpar" | "marginnote" | "sidenote" | "todo" | "endnote" | "mpfootnote" | "tablefootnote"
+                | "Afootnote" | "Bfootnote" | "Cfootnote" | "Dfootnote" | "Efootnote" | "footnoteA"
+                | "footnoteB" | "footnoteC" | "footnoteD" | "footnoteE" | "missingfigure"
+        ) {
+            self.consume_text_star();
+            let mut tokens = Vec::new();
+            for _ in 0..3 {
+                self.skip_whitespace_only();
+                match self.current_token() {
+                    // \marginpar[left]{right}: the right-hand version
+                    Token::LeftBracket => {
+                        let _ = self.collect_bracketed_tokens();
+                    }
+                    Token::LeftBrace => {
+                        tokens = self.collect_braced_tokens();
+                        if cmd != "marginnote" {
+                            break;
+                        }
+                        // \marginnote{text}[offset]
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if tokens.is_empty() && cmd != "missingfigure" {
+                return Ok(None);
+            }
+            if matches!(cmd.as_str(), "todo" | "missingfigure") {
+                let mut prefixed = vec![Token::Text(String::from(if cmd == "todo" { "TODO: " } else { "Missing figure: " }))];
+                prefixed.extend(tokens);
+                tokens = prefixed;
+            }
+            let mut footnote = vec![Token::Command(String::from("footnote")), Token::LeftBrace];
+            footnote.extend(tokens);
+            footnote.push(Token::RightBrace);
+            self.push_front(footnote);
+            return Ok(None);
+        }
+        // reledmac: \edtext{lemma}{\Afootnote{note}} prints the lemma, notes go
+        // to the apparatus (footnotes here)
+        if cmd == "edtext" || cmd == "critext" {
+            self.skip_whitespace_only();
+            let lemma = self.collect_braced_tokens();
+            self.skip_whitespace_only();
+            let notes = self.collect_braced_tokens();
+            let notes: Vec<Token> = notes
+                .into_iter()
+                .filter(|t| !matches!(t, Token::Command(c) if c == "lemma"))
+                .collect();
+            let mut tokens = lemma;
+            tokens.extend(notes);
+            self.push_front(tokens);
+            return Ok(None);
         }
 
         self.parse_builtin_command(cmd)
@@ -3867,6 +4083,20 @@ impl Parser {
                     "titlepage" => {
                         // The title block, as \maketitle renders it
                         self.push_front(vec![Token::Command(String::from("maketitle"))]);
+                        return Ok(Some(None));
+                    }
+                    // \frame{...} is the frame environment
+                    "frame" => {
+                        while matches!(self.current_token(), Token::LeftBracket) {
+                            let _ = self.collect_bracketed_tokens();
+                        }
+                        self.skip_whitespace_only();
+                        if matches!(self.current_token(), Token::LeftBrace) {
+                            let mut tokens = vec![Token::BeginEnvironment(String::from("frame"))];
+                            tokens.extend(self.collect_braced_tokens());
+                            tokens.push(Token::EndEnvironment(String::from("frame")));
+                            self.push_front(tokens);
+                        }
                         return Ok(Some(None));
                     }
                     _ => {}
@@ -5953,7 +6183,7 @@ impl Parser {
             }
             
             // Metadata commands
-            "title" | "author" | "date" => {
+            "title" | "author" | "date" | "subtitle" => {
                 self.advance();
                 if matches!(self.current_token(), Token::LeftBracket) {
                     let _ = self.parse_bracketed_text()?;
@@ -5991,6 +6221,9 @@ impl Parser {
                         title: vec![Inline::RawInline(title.clone())],
                         label: None,
                     });
+                }
+                if let Some(subtitle) = self.metadata.get("subtitle") {
+                    blocks.push(Block::Paragraph(vec![Inline::Strong(vec![Inline::RawInline(subtitle.clone())])]));
                 }
                 let mut byline = String::new();
                 if let Some(author) = self.metadata.get("author") {
@@ -6420,6 +6653,37 @@ impl Parser {
     }
 }
 
+/// Unicode for a ZapfDingbats code (pifont's `\ding`).
+fn zapf_dingbat(code: u32) -> Option<char> {
+    let special = match code {
+        0x20 => Some(' '),
+        0x25 => Some('\u{260E}'),
+        0x2A => Some('\u{261B}'),
+        0x2B => Some('\u{261E}'),
+        0x48 => Some('\u{2605}'),
+        0x6C => Some('\u{25CF}'),
+        0x6E => Some('\u{25A0}'),
+        0x73 => Some('\u{25B2}'),
+        0x74 => Some('\u{25BC}'),
+        0x75 => Some('\u{25C6}'),
+        0x77 => Some('\u{25D7}'),
+        0xA8 => Some('\u{2663}'),
+        0xA9 => Some('\u{2666}'),
+        0xAA => Some('\u{2665}'),
+        0xAB => Some('\u{2660}'),
+        0xAC..=0xB5 => char::from_u32(0x2460 + code - 0xAC),
+        0xD5 => Some('\u{2192}'),
+        0xD6 => Some('\u{2194}'),
+        0xD7 => Some('\u{2195}'),
+        _ => None,
+    };
+    special.or_else(|| match code {
+        0x21..=0x7E => char::from_u32(0x2700 + code - 0x20),
+        0xA1..=0xFE => char::from_u32(0x2760 + code - 0xA0),
+        _ => None,
+    })
+}
+
 /// The parser's markers for the end of an input file or package.
 fn is_file_end_marker(name: &str) -> bool {
     matches!(name, "texed@endfile" | "texed@popdir" | "texed@endpackage")
@@ -6497,6 +6761,8 @@ fn citation_mode_for(cmd: &str) -> CitationMode {
 /// Returns (number of braced args, whether an optional [arg] may precede them).
 fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
     match cmd {
+        // tabbing commands met outside tabbing
+        ">" | "<" | "+" => Some((0, false)),
         // Zero-argument layout/font declarations
         "centering" | "raggedright" | "raggedleft" | "noindent" | "indent" | "newpage"
         | "clearpage" | "cleardoublepage" | "samepage" | "protect" | "relax"
@@ -7504,6 +7770,7 @@ fn is_inline_safe_block_command(cmd: &str) -> bool {
             | "title"
             | "author"
             | "date"
+            | "subtitle"
             | "graphicspath"
             | "usepackage"
             | "RequirePackage"

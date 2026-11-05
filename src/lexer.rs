@@ -368,7 +368,8 @@ impl Lexer {
 
         // Accent and spacing control symbols: emitted as single-char commands,
         // resolved by the parser (\' \` \^ \" \~ \= \. accents; \, \; \: \! spacing)
-        if matches!(ch, '\'' | '`' | '^' | '"' | '~' | '=' | '.' | ',' | ';' | '!')
+        // (\> \< \+ are tabbing commands; \> is also a math space)
+        if matches!(ch, '\'' | '`' | '^' | '"' | '~' | '=' | '.' | ',' | ';' | '!' | '>' | '<' | '+')
             || (ch == ':' && !self.expl_syntax)
         {
             self.advance();
@@ -1642,6 +1643,9 @@ pub fn is_verbatim_environment(name: &str) -> bool {
             | "filecontents*"
             | "tikzpicture"
             | "prooftree"
+            | "picture"
+            | "codehigh"
+            | "demohigh"
             | "prooftree*"
             | "bprooftree"
             | "tikzcd"

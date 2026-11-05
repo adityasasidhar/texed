@@ -474,3 +474,44 @@ fn xparse_nested_optional_arguments() {
 fn prooftree_is_kept_as_latex() {
     has("\\begin{prooftree}\\AxiomC{A}\\UnaryInfC{B}\\end{prooftree}", "```latex\n\\begin{prooftree}");
 }
+
+#[test]
+fn pifont_dingbats() {
+    has("Yes \\ding{51}, no \\ding{55}, one \\ding{172}, arrow \\ding{220}.", "Yes ✓, no ✗, one ①, arrow ➜.");
+}
+
+#[test]
+fn margin_and_todo_notes_become_footnotes() {
+    let out = md("A\\marginpar{side} B\\todo[inline]{fix}.");
+    assert!(out.contains("A[^1] B[^2]."), "{}", out);
+    assert!(out.contains("[^1]: side"), "{}", out);
+    assert!(out.contains("[^2]: TODO: fix"), "{}", out);
+}
+
+#[test]
+fn tabbing_lines_and_cells() {
+    let out = md("\\begin{tabbing}Name \\= Value \\kill\nAlpha \\> 1 \\\\\nBeta \\> 22\n\\end{tabbing}");
+    assert!(out.contains("Alpha\u{2003}1  \nBeta\u{2003}22"), "{:?}", out);
+}
+
+#[test]
+fn beamer_frame_command_and_subtitle() {
+    let doc = "\\documentclass{beamer}\\title{T}\\subtitle{Sub}\\begin{document}\\frame{\\titlepage}\\begin{frame}\\frametitle{First}Hello.\\end{frame}\\end{document}";
+    has(doc, "# T\n\n**Sub**");
+    has(doc, "### First\n\nHello.");
+}
+
+#[test]
+fn email_links_and_placeholders() {
+    has("Write to \\email{a@b.org}.", "[a@b.org](mailto:a@b.org)");
+    has("\\lipsum[1]", "Lorem ipsum dolor sit amet");
+}
+
+#[test]
+fn transparent_preview_and_letter() {
+    has("\\begin{preview}Shown.\\end{preview}", "Shown.");
+    let doc = "\\begin{letter}{Jane Doe\\\\Street}\\opening{Dear Jane,}\n\nBody text.\n\n\\closing{Yours,}\\end{letter}";
+    has(doc, "Dear Jane,");
+    has(doc, "Body text.");
+    has(doc, "Yours,");
+}

@@ -37,6 +37,16 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "setkeys" => sig(false, 2, false),
         "ExplSyntaxOn" | "ExplSyntaxOff" => sig(false, 0, false),
         "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile" => sig(false, 4, false),
+        // pgf layers, tabularray and reledmac set-up
+        "pgfdeclarelayer" | "pgfsetlayers" | "SetTblrInner" | "SetTblrOuter" | "SetTblrDefault"
+        | "SetTblrTemplate" | "SetTblrStyle" | "DefTblrTemplate" | "NewTblrTheme" | "NewTblrLibrary"
+        | "UseTblrLibrary" | "SetCells" | "SetHlines" | "SetVlines" | "SetHline" | "SetVline"
+        | "SetColumns" | "SetRows" | "SetColumn" => sig(true, 1, true),
+        "NewTblrEnviron" | "NewColumnType" | "NewDocumentColumnType" => sig(false, 1, true),
+        "SetCell" | "SetRow" => sig(true, 1, false),
+        "beginnumbering" | "endnumbering" | "pstart" | "pend" | "autopar" | "beginstanza"
+        | "Pages" | "Columns" | "columnbreak" | "nopagebreak" | "linebreakcorrection" => sig(false, 0, false),
+        "lineation" | "linenummargin" | "firstlinenum" | "linenumincrement" | "setline" | "advanceline" => sig(false, 1, false),
 
         // Diagnostics
         "typeout" | "message" | "wlog" | "errmessage" | "GenericInfo" | "showthe" => sig(false, 1, false),
