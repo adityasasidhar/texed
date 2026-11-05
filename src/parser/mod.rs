@@ -204,6 +204,8 @@ pub struct Parser {
     boxes: HashMap<String, Vec<Token>>,
     /// Verbatim environments defined by the document (name -> language).
     verbatim_envs: HashMap<String, Option<String>>,
+    /// Inline-verbatim commands defined by the document (\newmintinline).
+    verb_commands: HashSet<String>,
     /// `\end{document}` was reached (possibly inside an included file).
     document_ended: bool,
     /// Preamble state to restore when each loaded package ends.
@@ -278,6 +280,7 @@ impl Parser {
             tex_registers: HashSet::new(),
             boxes: HashMap::new(),
             verbatim_envs: HashMap::new(),
+            verb_commands: HashSet::new(),
             document_ended: false,
             package_preamble_restore: Vec::new(),
             input_stack: Vec::new(),
@@ -295,6 +298,16 @@ impl Parser {
         }
     }
     
+    /// Verbatim environments/commands found by pre-scanning the document's
+    /// local files, so files read later are lexed consistently.
+    pub fn with_verbatim_definitions(mut self, envs: &[String], commands: &[String]) -> Self {
+        for env in envs {
+            self.verbatim_envs.entry(env.clone()).or_insert(None);
+        }
+        self.verb_commands.extend(commands.iter().cloned());
+        self
+    }
+
     pub fn with_base_path(mut self, path: std::path::PathBuf) -> Self {
         self.base_path = Some(path);
         self
@@ -570,6 +583,10 @@ impl Parser {
                 | "newenvironment"
                 | "renewenvironment"
                 | "provideenvironment"
+                | "NewDocumentEnvironment"
+                | "RenewDocumentEnvironment"
+                | "ProvideDocumentEnvironment"
+                | "DeclareDocumentEnvironment"
                 | "newtheorem"
                 | "newtheorem*"
                 | "bibliography"
@@ -631,8 +648,10 @@ impl Parser {
 
         match token {
             Token::BeginEnvironment(env) => self.parse_environment(env.clone()),
-            Token::EndEnvironment(env) if env == "document" => {
-                // TeX stops reading at \end{document}
+            // TeX stops reading at \end{document} — the real one: at top
+            // level of the main file (an \end{document} nested in another
+            // environment or in an included file is part of an example)
+            Token::EndEnvironment(env) if env == "document" && self.depth <= 1 && self.input_stack.is_empty() => {
                 self.tokens.clear();
                 self.document_ended = true;
                 Ok(None)
@@ -3421,6 +3440,10 @@ impl Parser {
     /// (marked by `texed@endfile`), or of the whole document.
     fn skip_to_end_of_file(&mut self) {
         while !self.is_at_end() {
+            // a package ends at its own marker, which must still run
+            if matches!(self.current_token(), Token::Command(c) if c == "texed@endpackage") {
+                return;
+            }
             let at_marker = matches!(self.current_token(), Token::Command(c) if c == "texed@endfile");
             self.advance();
             if at_marker {
@@ -4347,6 +4370,7 @@ impl Parser {
                     let mut tokens = Lexer::new(&content)
                         .with_at_letter(at_letter)
                         .with_verbatim_envs(self.verbatim_envs.keys())
+                        .with_verb_commands(self.verb_commands.iter())
                         .tokenize()
                         .unwrap_or_default();
                     if matches!(tokens.last(), Some(Token::Eof)) {
@@ -4694,6 +4718,39 @@ impl Parser {
             }
             
             // Environment definitions
+            "NewDocumentEnvironment" | "RenewDocumentEnvironment" | "ProvideDocumentEnvironment"
+            | "DeclareDocumentEnvironment" => {
+                // xparse environment: {name}{arg spec}{begin}{end}
+                self.advance();
+                self.skip_whitespace_only();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_only();
+                let spec = self.parse_braced_text()?;
+                self.skip_whitespace_only();
+                let begin_def = self.parse_braced_text()?;
+                self.skip_whitespace_only();
+                let end_def = self.parse_braced_text()?;
+                let xargs = parse_xparse_spec(&spec);
+                let optional_param = match xargs.first() {
+                    Some(crate::state::XArg::Optional(default)) => {
+                        Some(default.clone().unwrap_or_default())
+                    }
+                    _ => None,
+                };
+                if !name.is_empty() && !(cmd == "ProvideDocumentEnvironment" && self.state.environments.contains_key(&name)) {
+                    self.state.theorem_envs.remove(&name);
+                    self.state.environments.insert(
+                        name,
+                        crate::state::EnvironmentDef {
+                            num_params: xargs.len().min(9),
+                            optional_param,
+                            begin_def,
+                            end_def,
+                        },
+                    );
+                }
+                Ok(None)
+            }
             "newenvironment" | "renewenvironment" | "provideenvironment" => {
                 self.advance();
                 self.consume_text_star();
@@ -4952,6 +5009,8 @@ impl Parser {
         for (name, language) in crate::lexer::scan_verbatim_env_definitions(text) {
             self.verbatim_envs.entry(name).or_insert(language);
         }
+        self.verb_commands
+            .extend(crate::lexer::scan_verb_command_definitions(text));
     }
 
     /// Read a package/class file found next to the document (local style
@@ -4993,6 +5052,7 @@ impl Parser {
             let mut tokens = Lexer::new(&content)
                 .with_at_letter(true)
                 .with_verbatim_envs(self.verbatim_envs.keys())
+                .with_verb_commands(self.verb_commands.iter())
                 .tokenize()
                 .unwrap_or_default();
             if matches!(tokens.last(), Some(Token::Eof)) {
@@ -5835,6 +5895,13 @@ fn is_overlay_spec(text: &str) -> bool {
 /// `\end{document}`, ignoring commented-out occurrences), if it is one.
 fn document_body(content: &str) -> Option<String> {
     let begin = find_uncommented(content, "\\begin{document}", false)?;
+    // A complete document declares its class first (subfiles, standalone);
+    // a \begin{document} in a chapter's verbatim example does not count
+    let class = find_uncommented(content, "\\documentclass", false)
+        .or_else(|| find_uncommented(content, "\\documentstyle", false))?;
+    if class > begin {
+        return None;
+    }
     let start = begin + "\\begin{document}".len();
     let end = find_uncommented(&content[start..], "\\end{document}", true)
         .map(|e| start + e)
@@ -6145,6 +6212,10 @@ fn is_inline_safe_block_command(cmd: &str) -> bool {
             | "newenvironment"
             | "renewenvironment"
             | "provideenvironment"
+            | "NewDocumentEnvironment"
+            | "RenewDocumentEnvironment"
+            | "ProvideDocumentEnvironment"
+            | "DeclareDocumentEnvironment"
             | "newtheorem"
             | "bibliography"
             | "addbibresource"

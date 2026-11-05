@@ -72,8 +72,13 @@ pub fn convert_with(latex: &str, options: &Options) -> error::Result<Conversion>
 /// Run the pipeline on the calling thread (no stack or panic protection).
 pub fn convert_on_current_thread(latex: &str, options: &Options) -> error::Result<Conversion> {
     let input = decode::normalize_text(latex);
-    let tokens = lexer::Lexer::new(&input).tokenize()?;
-    let mut parser = parser::Parser::new(tokens);
+    let (envs, commands) =
+        include_system::prescan_verbatim_definitions(&input, options.base_path.as_deref());
+    let tokens = lexer::Lexer::new(&input)
+        .with_verbatim_envs(envs.iter())
+        .with_verb_commands(commands.iter())
+        .tokenize()?;
+    let mut parser = parser::Parser::new(tokens).with_verbatim_definitions(&envs, &commands);
     if let Some(base) = &options.base_path {
         parser = parser.with_base_path(base.clone());
     }

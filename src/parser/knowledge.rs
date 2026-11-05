@@ -68,6 +68,7 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "titleformat" => sig(false, 2, false), // remaining groups handled loosely below
         "titlespacing" => sig(false, 4, true),
         "titlecontents" => sig(false, 6, true),
+        "newmintinline" | "newmint" | "newmintedfile" | "setmintedinline" => sig(true, 2, false),
         "usetheme" | "usecolortheme" | "usefonttheme" | "useinnertheme" | "useoutertheme"
         | "setbeamercovered" | "logo" | "titlegraphic" | "setbeameroption"
         | "includeonlyframes" | "beamerdefaultoverlayspecification" | "setbeamersize"

@@ -254,7 +254,15 @@ impl Cli {
         }
 
         let lex_start = Instant::now();
-        let mut lexer = Lexer::new(&input_content);
+        let base_dir = match &job.input {
+            InputSource::File(path) => path.parent().map(|p| p.to_path_buf()),
+            InputSource::Stdin => None,
+        };
+        let (verbatim_envs, verb_commands) =
+            crate::include_system::prescan_verbatim_definitions(&input_content, base_dir.as_deref());
+        let mut lexer = Lexer::new(&input_content)
+            .with_verbatim_envs(verbatim_envs.iter())
+            .with_verb_commands(verb_commands.iter());
         let tokens = lexer.tokenize().context("Failed to tokenize LaTeX input")?;
         let lex_time = lex_start.elapsed();
 
@@ -270,7 +278,7 @@ impl Cli {
         }
 
         let parse_start = Instant::now();
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::new(tokens).with_verbatim_definitions(&verbatim_envs, &verb_commands);
         if let InputSource::File(path) = &job.input {
             if let Some(base) = path.parent() {
                 parser = parser.with_base_path(base.to_path_buf());

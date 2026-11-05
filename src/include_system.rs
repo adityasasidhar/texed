@@ -361,3 +361,95 @@ mod tests {
         assert_eq!(system.search_paths.len(), initial_count + 1);
     }
 }
+
+
+/// Verbatim environments and inline-verbatim commands defined by a
+/// document or by the local files it loads (`\\usepackage{local}`,
+/// `\\input{file}`, a local class). The main file is lexed before those files
+/// are read, so their definitions must be known up front.
+pub fn prescan_verbatim_definitions(
+    text: &str,
+    base_path: Option<&Path>,
+) -> (Vec<String>, Vec<String>) {
+    let mut envs = Vec::new();
+    let mut commands = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue: Vec<(String, usize)> = vec![(text.to_string(), 0)];
+    let mut files_read = 0;
+    while let Some((content, depth)) = queue.pop() {
+        envs.extend(crate::lexer::scan_verbatim_env_definitions(&content).into_iter().map(|(n, _)| n));
+        commands.extend(crate::lexer::scan_verb_command_definitions(&content));
+        if depth >= 6 || files_read >= 200 {
+            continue;
+        }
+        for (name, extensions) in referenced_files(&content) {
+            for ext in extensions {
+                let candidate = if name.ends_with(ext) || ext.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}{}", name, ext)
+                };
+                let path = match base_path {
+                    Some(base) => base.join(&candidate),
+                    None => PathBuf::from(&candidate),
+                };
+                if path.is_file() && seen.insert(path.clone()) {
+                    if let Ok(content) = crate::decode::read_file(&path) {
+                        files_read += 1;
+                        queue.push((content, depth + 1));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    (envs, commands)
+}
+
+/// Local file names a text loads, with the extensions to try.
+fn referenced_files(text: &str) -> Vec<(String, Vec<&'static str>)> {
+    let mut out = Vec::new();
+    for (command, extensions) in [
+        ("\\usepackage", vec![".sty"]),
+        ("\\RequirePackage", vec![".sty"]),
+        ("\\documentclass", vec![".cls"]),
+        ("\\LoadClass", vec![".cls"]),
+        ("\\input", vec!["", ".tex"]),
+        ("\\include", vec![".tex"]),
+        ("\\subfile", vec!["", ".tex"]),
+    ] {
+        let mut search = 0;
+        while let Some(pos) = text[search..].find(command) {
+            let start = search + pos + command.len();
+            search = start;
+            let rest = &text[start..];
+            // not a longer command name (\\inputencoding, \\includegraphics)
+            if rest.starts_with(|c: char| c.is_alphabetic()) {
+                continue;
+            }
+            // skip [options]
+            let rest = rest.trim_start();
+            let rest = if rest.starts_with('[') {
+                match rest.find(']') {
+                    Some(end) => rest[end + 1..].trim_start(),
+                    None => continue,
+                }
+            } else {
+                rest
+            };
+            let Some(body) = rest.strip_prefix('{') else {
+                continue;
+            };
+            let Some(end) = body.find('}') else {
+                continue;
+            };
+            for name in body[..end].split(',') {
+                let name = name.trim();
+                if !name.is_empty() && !name.contains('\\') && !name.contains('#') {
+                    out.push((name.to_string(), extensions.clone()));
+                }
+            }
+        }
+    }
+    out
+}

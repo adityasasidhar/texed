@@ -95,6 +95,11 @@ pub struct Lexer {
     /// Environments defined as verbatim by the document (\lstnewenvironment,
     /// \DefineVerbatimEnvironment, \newminted, ...).
     verbatim_envs: std::collections::HashSet<String>,
+    /// Commands defined as inline verbatim (\newmintinline[ltx]{latex}{}).
+    verb_commands: std::collections::HashSet<String>,
+    /// Characters made inline-verbatim delimiters (\MakeShortVerb{\|}),
+    /// active from their definition on.
+    short_verb_chars: std::collections::HashSet<char>,
 }
 
 impl Lexer {
@@ -103,8 +108,11 @@ impl Lexer {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
+        let verb_commands = scan_verb_command_definitions(input).into_iter().collect();
         Self {
             verbatim_envs,
+            verb_commands,
+            short_verb_chars: std::collections::HashSet::new(),
             input: input.chars().collect(),
             position: 0,
             line: 1,
@@ -127,6 +135,12 @@ impl Lexer {
     /// in the document, e.g. in a previously read file).
     pub fn with_verbatim_envs<'a>(mut self, names: impl IntoIterator<Item = &'a String>) -> Self {
         self.verbatim_envs.extend(names.into_iter().cloned());
+        self
+    }
+
+    /// Additional inline-verbatim commands defined elsewhere in the document.
+    pub fn with_verb_commands<'a>(mut self, names: impl IntoIterator<Item = &'a String>) -> Self {
+        self.verb_commands.extend(names.into_iter().cloned());
         self
     }
 
@@ -200,6 +214,20 @@ impl Lexer {
                     return Ok(Some(Token::Text(ch.to_string())));
                 }
             }
+        }
+
+        // A \MakeShortVerb character: |code| is inline verbatim
+        if self.short_verb_chars.contains(&ch) {
+            self.advance();
+            let mut content = String::new();
+            while !self.is_at_end() && self.current_char() != ch && self.current_char() != '\n' {
+                content.push(self.current_char());
+                self.advance();
+            }
+            if !self.is_at_end() && self.current_char() == ch {
+                self.advance();
+            }
+            return Ok(Some(Token::Verb(content)));
         }
 
         // Handle smart quotes
@@ -359,8 +387,44 @@ impl Lexer {
         }
 
         // \verb|...| and friends capture raw content with arbitrary delimiters
+        // \MakeShortVerb{\|} / \DeleteShortVerb{\|} (and listings' variants)
+        if matches!(cmd_name.as_str(), "MakeShortVerb" | "DefineShortVerb" | "lstMakeShortInline"
+            | "DeleteShortVerb" | "UndefineShortVerb" | "lstDeleteShortInline")
+        {
+            let start = self.position;
+            if !self.is_at_end() && self.current_char() == '*' {
+                self.advance();
+            }
+            self.skip_optional_bracket_group();
+            let braced = !self.is_at_end() && self.current_char() == '{';
+            if braced {
+                self.advance();
+            }
+            if !self.is_at_end() && self.current_char() == '\\' {
+                self.advance();
+            }
+            if !self.is_at_end() {
+                let delimiter = self.current_char();
+                self.advance();
+                if braced && !self.is_at_end() && self.current_char() == '}' {
+                    self.advance();
+                }
+                if !delimiter.is_alphanumeric() && !delimiter.is_whitespace() {
+                    if cmd_name.starts_with("Delete") || cmd_name.starts_with("Undefine") || cmd_name.starts_with("lstDelete") {
+                        self.short_verb_chars.remove(&delimiter);
+                    } else {
+                        self.short_verb_chars.insert(delimiter);
+                    }
+                    return Ok(None);
+                }
+            }
+            self.rewind_to(start);
+            return Ok(Some(Token::Command(cmd_name)));
+        }
+
         if matches!(cmd_name.as_str(), "verb" | "lstinline" | "Verb" | "spverb" | "mintinline"
             | "pyth" | "cppinline" | "inlinecode")
+            || self.verb_commands.contains(&cmd_name)
         {
             if cmd_name == "mintinline" {
                 // \mintinline[opts]{lang}{code} or \mintinline{lang}|code|
@@ -1159,12 +1223,18 @@ impl Lexer {
 /// `\newenvironment{name}{\verbatim}{\endverbatim}`.
 pub fn scan_verbatim_env_definitions(text: &str) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
+    // Definitions inside comments or inside verbatim bodies (a tutorial's
+    // example code) do not exist for TeX: scan only live source
+    let stripped = strip_comments_and_verbatim(text);
+    let text = stripped.as_str();
     if !(text.contains("lstnewenvironment")
         || text.contains("VerbatimEnvironment")
         || text.contains("newminted")
         || text.contains("tcblisting")
         || text.contains("TCBListing")
-        || text.contains("\\verbatim"))
+        || text.contains("\\verbatim")
+        || text.contains("verbatim_start")
+        || text.contains("VerbatimEnvironment"))
     {
         return out;
     }
@@ -1196,6 +1266,10 @@ pub fn scan_verbatim_env_definitions(text: &str) -> Vec<(String, Option<String>)
         ("\\DeclareTCBListing", 0),
         ("\\newminted", 1),
         ("\\newenvironment", 2),
+        ("\\renewenvironment", 2),
+        ("\\NewDocumentEnvironment", 3),
+        ("\\RenewDocumentEnvironment", 3),
+        ("\\DeclareDocumentEnvironment", 3),
     ] {
         let mut search = 0;
         while let Some(pos) = text[search..].find(pattern) {
@@ -1239,12 +1313,28 @@ pub fn scan_verbatim_env_definitions(text: &str) -> Vec<(String, Option<String>)
                     }
                 }
                 _ => {
-                    // \newenvironment{name}[..]{\verbatim}{\endverbatim}
+                    // \newenvironment{name}[..]{begin}{end} (kind 2) or
+                    // \NewDocumentEnvironment{name}{spec}{begin}{end} (kind 3)
+                    // whose begin code switches to verbatim reading
                     if let Some((name, used)) = group_after(rest) {
-                        let body = &rest[used..rest.len().min(used + 200)];
-                        let body_start = body.trim_start_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit() || c.is_whitespace());
-                        if body_start.starts_with("{\\verbatim") || body_start.starts_with("{\\Verbatim") || body_start.starts_with("{\\lstlisting") {
-                            out.push((name, None));
+                        let mut after = &rest[used..];
+                        if kind == 3 {
+                            if let Some((_, spec_len)) = group_after(after) {
+                                after = &after[spec_len..];
+                            }
+                        } else {
+                            after = after.trim_start_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit() || c.is_whitespace());
+                        }
+                        if let Some(begin) = balanced_group(after) {
+                            let starts_verbatim = [
+                                "\\verbatim", "\\Verbatim", "\\VerbatimEnvironment",
+                                "verbatim_start:", "\\begin{verbatim}", "\\begin{Verbatim}",
+                                "\\begin{lstlisting}", "\\begin{minted}", "\\lstlisting",
+                                "\\comment", "\\begin{comment}",
+                            ];
+                            if !name.contains('\\') && starts_verbatim.iter().any(|m| begin.contains(m)) {
+                                out.push((name, None));
+                            }
                         }
                     }
                 }
@@ -1252,6 +1342,153 @@ pub fn scan_verbatim_env_definitions(text: &str) -> Vec<(String, Option<String>)
         }
     }
     out
+}
+
+/// Find commands a text defines as inline verbatim:
+/// `\newmintinline[ltx]{latex}{}` -> `ltx`, `\newmintinline{py}{}` ->
+/// `pyinline`, `\newmint[name]{lang}{}` -> `name`, `\newmint{lang}{}` ->
+/// `lang`.
+pub fn scan_verb_command_definitions(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if !text.contains("\\newmint") {
+        return out;
+    }
+    let stripped = strip_comments_and_verbatim(text);
+    let text = stripped.as_str();
+    for (pattern, suffix) in [("\\newmintinline", "inline"), ("\\newmint", "")] {
+        let mut search = 0;
+        while let Some(pos) = text[search..].find(pattern) {
+            let start = search + pos + pattern.len();
+            search = start;
+            let rest = &text[start..];
+            if suffix.is_empty() && (rest.starts_with("inline") || rest.starts_with("ed") || rest.starts_with("file")) {
+                continue;
+            }
+            let trimmed = rest.trim_start();
+            let (explicit, rest) = if let Some(r) = trimmed.strip_prefix('[') {
+                match r.find(']') {
+                    Some(e) => (Some(r[..e].trim().to_string()), &r[e + 1..]),
+                    None => (None, trimmed),
+                }
+            } else {
+                (None, trimmed)
+            };
+            let lang: Option<String> = rest
+                .trim_start()
+                .strip_prefix('{')
+                .and_then(|r| r.find('}').map(|e| r[..e].trim().to_string()));
+            if let Some(name) = explicit.or_else(|| lang.map(|l| format!("{}{}", l, suffix))) {
+                if !name.is_empty() && name.chars().all(|c| c.is_alphabetic()) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Remove `%` comments and the bodies of verbatim-like environments, so a
+/// scan for definitions sees only live LaTeX source.
+fn strip_comments_and_verbatim(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    'outer: while !rest.is_empty() {
+        // next comment or verbatim begin
+        let comment = find_comment_start(rest);
+        let verbatim = find_verbatim_begin(rest);
+        match (comment, verbatim) {
+            (Some(c), ref v) if v.as_ref().is_none_or(|(b, _, _)| c < *b) => {
+                out.push_str(&rest[..c]);
+                match rest[c..].find('\n') {
+                    Some(nl) => rest = &rest[c + nl..],
+                    None => break 'outer,
+                }
+            }
+            (_, Some((begin, body_start, name))) => {
+                out.push_str(&rest[..begin]);
+                let end_marker = format!("\\end{{{}}}", name);
+                match rest[body_start..].find(&end_marker) {
+                    Some(e) => rest = &rest[body_start + e + end_marker.len()..],
+                    None => break 'outer,
+                }
+            }
+            _ => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Byte offset of the first unescaped `%` in the text.
+fn find_comment_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'%' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The first `\begin{X}` of a built-in verbatim-like environment:
+/// (offset of `\begin`, offset after it, X).
+fn find_verbatim_begin(text: &str) -> Option<(usize, usize, String)> {
+    let mut search = 0;
+    while let Some(pos) = text[search..].find("\\begin{") {
+        let begin = search + pos;
+        let name_start = begin + 7;
+        let Some(close) = text[name_start..].find('}') else {
+            return None;
+        };
+        let name = &text[name_start..name_start + close];
+        if is_verbatim_environment(name) || matches!(name, "example" | "examples" | "code" | "codeblock") {
+            return Some((begin, name_start + close + 1, name.to_string()));
+        }
+        search = name_start;
+    }
+    None
+}
+
+/// The content of a leading `{...}` group (balanced), skipping spaces and
+/// `%` comments before it.
+fn balanced_group(text: &str) -> Option<&str> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '%' if start.is_none() => {
+                for (_, c2) in chars.by_ref() {
+                    if c2 == '\n' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                chars.next();
+            }
+            '{' => {
+                if start.is_none() {
+                    start = Some(i + 1);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&text[start?..i]);
+                }
+            }
+            c if start.is_none() && !c.is_whitespace() => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// How a math scan ended.
