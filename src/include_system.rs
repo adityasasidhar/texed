@@ -1,6 +1,5 @@
 use crate::error::{Result, TexedError};
 use crate::state::ParserState;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Include system for LaTeX with cycle detection and path resolution

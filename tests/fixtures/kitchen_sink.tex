@@ -1,0 +1,103 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\title{On the Robustness of \LaTeX{} Converters}
+\author{Jane Doe\thanks{University of Somewhere} \and John Smith}
+\date{\today}
+\begin{document}
+\maketitle
+\begin{abstract}
+We study things. This is \emph{very} important~\cite{knuth84}.
+\end{abstract}
+\tableofcontents
+\section{Introduction}\label{sec:intro}
+Let $x \in \R$ and $\norm{x} \leq 1$. As shown in Section~\ref{sec:intro}, see also Eq.~\eqref{eq:main}.
+``Quoted text'' and `single' quotes---with dashes--and more. 50\% of \$5 costs \& stuff \# here.
+Accents: caf\'e, na\"ive, \c{c}a, \~n, \^{o}, \`a, \"{u}, \ss, \o, \AA.
+Special: \textbackslash, \{ \}, \_, \textasciitilde, \ldots, \dots
+\subsection*{Unnumbered}
+\begin{equation}\label{eq:main}
+  E = mc^2
+\end{equation}
+\begin{align}
+  a &= b + c \\
+  d &= e
+\end{align}
+\[ \int_0^1 f(x)\,dx \]
+$$ \sum_{i=1}^n i $$
+\begin{theorem}[Main]\label{thm:main}
+Every thing is a \textbf{thing}.
+\end{theorem}
+\begin{proof}
+Trivial. \qedhere
+\end{proof}
+\begin{itemize}
+  \item First \textit{item}
+  \item Second with nested:
+  \begin{enumerate}
+    \item Nested one
+    \item[b)] Custom label
+  \end{enumerate}
+  \item Third
+\end{itemize}
+\begin{description}
+  \item[Foo] bar
+  \item[Baz] qux
+\end{description}
+\begin{table}[ht]
+\centering
+\caption{A table}\label{tab:t}
+\begin{tabular}{|l|c|r|}
+\hline
+Name & Value & Unit \\
+\hline
+$\alpha$ & 1.0 & m \\
+\multicolumn{2}{c}{Merged} & x \\
+a | b & c & d \\
+\hline
+\end{tabular}
+\end{table}
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.5\textwidth]{fig/plot.png}
+\caption{A plot of $f$.}\label{fig:plot}
+\end{figure}
+See Figure~\ref{fig:plot} and Table~\ref{tab:t} and Theorem~\ref{thm:main}.
+\begin{verbatim}
+\section{not a section}
+  indented   code
+\end{verbatim}
+Inline \verb|\foo{bar}| and \verb+x_y+. URL: \url{https://example.com/a_b?c=d&e=f}.
+\href{https://rust-lang.org}{Rust \emph{lang}}.
+Footnote here\footnote{A footnote with $math$ and \textbf{bold}.}.
+% a comment that should vanish
+Text with 100\% escaped percent % and a comment
+\begin{quote}
+Quoted block.
+\end{quote}
+\paragraph{Para heading} Some text.
+\section{Second}
+Text with *asterisks* and _underscores_ and [brackets] and <html> & `backticks`.
+# Not a heading
+1. Not a list
+\begin{lstlisting}[language=Python]
+def f(x):
+    return x * 2  # comment
+\end{lstlisting}
+\begin{minted}{rust}
+fn main() { println!("hi"); }
+\end{minted}
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+\bibitem{knuth84} D. Knuth, \emph{The TeXbook}, 1984.
+\end{thebibliography}
+\appendix
+\section{Appendix}
+Done.
+\end{document}

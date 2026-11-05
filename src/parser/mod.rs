@@ -7,9 +7,10 @@ use crate::lexer::Token;
 use crate::lexer_extended::{get_accent_type, get_special_char};
 use crate::macro_processor::MacroProcessor;
 use crate::state::{LabelType, MacroDef, ParserState};
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+mod tex;
 
 /// Baseline budget of macro expansions per document, guarding against
 /// self-referential macro definitions looping forever. The effective budget
@@ -18,12 +19,27 @@ const MAX_MACRO_EXPANSIONS: usize = 100_000;
 
 /// Hard cap on pending tokens; an expansion that would grow the stream past
 /// this is refused (exponentially self-replicating macros).
-const MAX_PENDING_TOKENS: usize = 20_000_000;
+const MAX_PENDING_TOKENS: usize = 4_000_000;
+
+/// Baseline for the total bytes all macro expansions may produce; the
+/// effective budget adds a multiple of the source size. Guards against
+/// macros whose arguments grow on every recursion (`\a{#1#1}`).
+const BASE_EXPANSION_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum length of a single math formula after macro expansion.
+const MAX_MATH_EXPANSION_CHARS: usize = 200_000;
 
 /// Maximum recursion depth of block/inline parsing. Real documents nest a
 /// few dozen levels at most; beyond this the input is pathological and is
 /// flattened instead of recursed into, so the parser never overflows its stack.
 const MAX_NESTING_DEPTH: usize = 200;
+
+/// Upper bound on table columns (a column spec like `*{999999999}{c}` must
+/// not allocate unboundedly).
+const MAX_TABLE_COLUMNS: usize = 1_000;
+
+/// Lists nested deeper than this are flattened into their parent.
+const MAX_LIST_NESTING: usize = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -162,6 +178,25 @@ pub struct Parser {
     macro_budget: usize,
     /// Start number for the next enumerate list (from \setcounter{enumi}).
     pending_enum_start: Option<usize>,
+    /// The definition being parsed uses TeX parameter text (\def family).
+    macro_def_tex_style: bool,
+    /// Current itemize/enumerate nesting depth.
+    list_depth: usize,
+    /// Open TeX conditionals whose taken branch is being parsed.
+    cond_depth: usize,
+    /// Macro expansions whose tokens are still pending: (name, stack length
+    /// below the expansion). Used to detect runaway recursion.
+    active_expansions: Vec<(String, usize)>,
+    /// Expansions performed per macro.
+    expansion_counts: HashMap<String, usize>,
+    /// How often each command name occurs in the source (scales budgets).
+    source_command_counts: HashMap<String, usize>,
+    /// Number of tokens in the original source.
+    source_token_count: usize,
+    /// Total bytes produced by macro expansions so far.
+    expanded_bytes: usize,
+    /// Macros whose expansion was refused (warned once).
+    refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
     /// references inside them can be resolved.
     footnote_inlines: HashMap<usize, Vec<Inline>>,
@@ -178,6 +213,13 @@ impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         use crate::state::CitationStyle;
         let macro_budget = MAX_MACRO_EXPANSIONS.saturating_add(tokens.len().saturating_mul(4));
+        let source_token_count = tokens.len();
+        let mut source_command_counts: HashMap<String, usize> = HashMap::new();
+        for token in &tokens {
+            if let Token::Command(name) = token {
+                *source_command_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
 
         Self {
             tokens: reverse_tokens(tokens),
@@ -192,6 +234,15 @@ impl Parser {
             macro_expansions: 0,
             macro_budget,
             pending_enum_start: None,
+            macro_def_tex_style: false,
+            list_depth: 0,
+            cond_depth: 0,
+            active_expansions: Vec::new(),
+            expansion_counts: HashMap::new(),
+            source_command_counts,
+            source_token_count,
+            expanded_bytes: 0,
+            refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
     }
@@ -441,7 +492,18 @@ impl Parser {
                 | "renewcommand"
                 | "providecommand"
                 | "def"
+                | "gdef"
+                | "edef"
+                | "xdef"
                 | "DeclareRobustCommand"
+                | "newrobustcmd"
+                | "renewrobustcmd"
+                | "providerobustcmd"
+                | "DeclareMathOperator"
+                | "NewDocumentCommand"
+                | "RenewDocumentCommand"
+                | "ProvideDocumentCommand"
+                | "DeclareDocumentCommand"
                 | "newenvironment"
                 | "renewenvironment"
                 | "newtheorem"
@@ -497,8 +559,11 @@ impl Parser {
             Token::EndEnvironment(env) if self.state.environments.contains_key(env) => {
                 // Closing a user-defined environment: splice its end-definition
                 let end_def = self.state.environments[env].end_def.clone();
+                let env = env.clone();
                 self.advance();
-                self.splice_fragment_tokens(&end_def)?;
+                if self.consume_expansion_budget(&format!("end{}", env)) {
+                    self.splice_fragment_tokens(&end_def)?;
+                }
                 Ok(None)
             }
             Token::Command(cmd) => {
@@ -712,11 +777,10 @@ impl Parser {
             args.push(self.parse_braced_text()?);
         }
 
-        let mut body = def.begin_def.clone();
-        for (i, arg) in args.iter().enumerate() {
-            body = body.replace(&format!("#{}", i + 1), arg);
+        let body = crate::state::substitute_params(&def.begin_def, &args);
+        if !self.consume_expansion_bytes(env_name, body.len()) || !self.consume_expansion_budget(env_name) {
+            return Ok(None);
         }
-
         self.splice_fragment_tokens(&body)?;
         Ok(None)
     }
@@ -861,6 +925,20 @@ impl Parser {
     /// (`\item[(iii)]`) are kept as leading text of the item, since Markdown
     /// lists cannot express arbitrary markers.
     fn parse_list(&mut self, env_name: &str, ordered: bool) -> Result<Option<Block>> {
+        self.list_depth += 1;
+        let result = self.parse_list_inner(env_name, ordered);
+        self.list_depth -= 1;
+        // LaTeX rejects lists nested more than 4 deep; past a generous limit,
+        // flatten instead of producing ever-deeper Markdown indentation.
+        if self.list_depth >= MAX_LIST_NESTING {
+            if let Ok(Some(Block::BulletList(items) | Block::OrderedList { items, .. })) = result {
+                return Ok(Some(Block::Composite(items.into_iter().flatten().collect())));
+            }
+        }
+        result
+    }
+
+    fn parse_list_inner(&mut self, env_name: &str, ordered: bool) -> Result<Option<Block>> {
         let mut items: Vec<Vec<Block>> = Vec::new();
         let mut custom_labels = 0usize;
         let mut start = 1usize;
@@ -993,17 +1071,8 @@ impl Parser {
             if matches!(self.current_token(), Token::Item) {
                 self.advance();
                 
-                // Parse optional term in brackets
-                let term = if matches!(self.current_token(), Token::LeftBracket) {
-                    self.advance();
-                    let term_inlines = self.parse_inlines_until(Token::RightBracket)?;
-                    if matches!(self.current_token(), Token::RightBracket) {
-                        self.advance();
-                    }
-                    term_inlines
-                } else {
-                    vec![Inline::Text(String::from("Item"))]
-                };
+                // Optional term in brackets (brace-aware: \item[{a [b] c}])
+                let term = self.parse_item_label()?.unwrap_or_default();
 
                 let item_blocks = self.parse_item_content("description")?;
                 items.push((term, item_blocks));
@@ -1583,6 +1652,9 @@ impl Parser {
                     let count = count.trim().parse::<usize>().unwrap_or(0);
                     let inner_alignments = self.parse_column_spec(&inner);
                     for _ in 0..count {
+                        if alignments.len() + inner_alignments.len() > MAX_TABLE_COLUMNS {
+                            break;
+                        }
                         alignments.extend(inner_alignments.iter().cloned());
                     }
                 }
@@ -1590,6 +1662,7 @@ impl Parser {
             }
         }
 
+        alignments.truncate(MAX_TABLE_COLUMNS);
         alignments
     }
 
@@ -1863,6 +1936,15 @@ impl Parser {
                 self.advance();
                 Ok(Some(Inline::Code(code)))
             }
+            // Brackets outside an optional-argument position are literal text
+            Token::LeftBracket => {
+                self.advance();
+                Ok(Some(Inline::Text(String::from("["))))
+            }
+            Token::RightBracket => {
+                self.advance();
+                Ok(Some(Inline::Text(String::from("]"))))
+            }
             Token::Tilde => {
                 self.advance();
                 // Non-breaking space
@@ -1909,6 +1991,33 @@ impl Parser {
 
     fn parse_inline_command(&mut self, cmd: String) -> Result<Option<Inline>> {
         self.advance();
+
+        // Built-in meaning captured by \let: skip user macros and aliases
+        if let Some(builtin) = cmd.strip_prefix(tex::BUILTIN_MARK) {
+            return self.parse_builtin_command(builtin.to_string());
+        }
+
+        // TeX-level constructs (conditionals, \let aliases, \csname, ...);
+        // user macros take precedence over everything but aliases.
+        if !self.macro_processor.is_defined(&self.state, &cmd) || self.state.aliases.contains_key(&cmd) {
+            if let Some(result) = self.parse_tex_command(&cmd)? {
+                return Ok(result);
+            }
+        }
+
+        // Definitions and preamble commands appearing mid-paragraph
+        if is_inline_safe_block_command(&cmd) {
+            self.push_front(vec![Token::Command(cmd.clone())]);
+            let _ = self.parse_command_block(cmd)?;
+            return Ok(None);
+        }
+
+        // \input inside a paragraph (or a table cell, list item, ...): splice
+        // the file's tokens in place, as TeX does
+        if cmd == "input" || cmd == "include" || cmd == "subfile" || cmd == "import" {
+            self.splice_input_file(&cmd)?;
+            return Ok(None);
+        }
 
         // Check for citation commands
         if self.is_citation_command(&cmd) {
@@ -1960,6 +2069,12 @@ impl Parser {
         if self.macro_processor.is_defined(&self.state, &cmd) {
             return self.parse_macro_expansion(&cmd);
         }
+
+        self.parse_builtin_command(cmd)
+    }
+
+    /// Commands with built-in meaning (everything but user macros).
+    fn parse_builtin_command(&mut self, cmd: String) -> Result<Option<Inline>> {
 
         // Counter manipulation affects numbering of later sections, floats,
         // equations and list items
@@ -2420,21 +2535,12 @@ impl Parser {
     fn parse_macro_expansion(&mut self, cmd: &str) -> Result<Option<Inline>> {
         let args = self.parse_macro_arguments(cmd)?;
 
-        if self.macro_expansions >= self.macro_budget || self.tokens.len() > MAX_PENDING_TOKENS {
-            if self.macro_expansions != usize::MAX {
-                self.state.warn(format!(
-                    "macro expansion limit reached at `\\{}` (recursive definition?) — further expansion stopped",
-                    cmd
-                ));
-                self.macro_expansions = usize::MAX;
-            }
-            return Ok(Some(Inline::Text(format!("\\{}", cmd))));
-        }
-
         if let Some(expanded) = self.macro_processor.expand_macro(&self.state, cmd, &args) {
+            if !self.consume_expansion_bytes(cmd, expanded.len()) || !self.consume_expansion_budget(cmd) {
+                return Ok(None);
+            }
             // Re-lex the expansion and splice it into the token stream so the
             // body is fully parsed (formatting, math, nested macros, ...).
-            self.macro_expansions += 1;
             let mut lexer = Lexer::new(&expanded);
             let mut tokens = lexer.tokenize()?;
             if matches!(tokens.last(), Some(Token::Eof)) {
@@ -2557,11 +2663,18 @@ impl Parser {
     }
 
     fn parse_macro_definition_command(&mut self, mode: MacroDefinitionMode) -> Result<()> {
+        let tex_style = std::mem::take(&mut self.macro_def_tex_style);
+        self.skip_whitespace_and_comments();
         // Both \newcommand{\name} and the unbraced \newcommand\name are valid
         let name_raw = if matches!(self.current_token(), Token::LeftBrace) {
             self.parse_braced_text()?
         } else if let Token::Command(name) = self.current_token() {
             let name = name.clone();
+            self.advance();
+            name
+        } else if let Token::Ref { kind, .. } | Token::Cite { kind, .. } = self.current_token() {
+            // \renewcommand\ref... is lexed specially; recover the name
+            let name = kind.clone();
             self.advance();
             name
         } else {
@@ -2571,27 +2684,52 @@ impl Parser {
             return Ok(());
         }
 
-        let mut num_params = if matches!(self.current_token(), Token::LeftBracket) {
-            self.parse_bracketed_text()?.trim().parse::<usize>().unwrap_or(0)
-        } else {
-            0
-        };
+        let mut num_params = 0;
+        let mut optional_param = None;
+        let mut delimiters = Vec::new();
+        let mut prefix = String::new();
 
-        // TeX-style parameter text: \def\pair#1#2{...}
-        if let Token::Text(text) = self.current_token() {
-            if text.starts_with('#') {
-                num_params = text.matches('#').count();
+        if tex_style {
+            // TeX parameter text: everything up to the body's opening brace,
+            // e.g. \def\pair#1#2{...} or delimited \def\foo#1.#2\par{...}
+            let mut param_text = String::new();
+            let mut guard = 0;
+            while !self.is_at_end()
+                && !matches!(self.current_token(), Token::LeftBrace | Token::ParBreak)
+                && guard < 64
+            {
+                param_text.push_str(&self.token_to_string(self.current_token()));
                 self.advance();
+                guard += 1;
             }
+            let (p, d, n) = parse_tex_param_text(&param_text);
+            prefix = p;
+            delimiters = d;
+            num_params = n;
+        } else {
+            self.skip_whitespace_and_comments();
+            if matches!(self.current_token(), Token::LeftBracket) {
+                num_params = self.parse_bracketed_text()?.trim().parse::<usize>().unwrap_or(0).min(9);
+            }
+            self.skip_whitespace_and_comments();
+            if matches!(self.current_token(), Token::LeftBracket) {
+                optional_param = Some(self.parse_bracketed_text()?);
+            }
+            self.skip_whitespace_and_comments();
         }
 
-        let optional_param = if matches!(self.current_token(), Token::LeftBracket) {
-            Some(self.parse_bracketed_text()?)
+        let body = if matches!(self.current_token(), Token::LeftBrace) {
+            self.parse_braced_text()?
         } else {
-            None
+            // \newcommand\foo\bar: a single-token body
+            match self.current_token().clone() {
+                Token::Command(c) => {
+                    self.advance();
+                    format!("\\{}", c)
+                }
+                _ => String::new(),
+            }
         };
-
-        let body = self.parse_braced_text()?;
         let name = name_raw.trim().trim_start_matches('\\');
 
         if !name.is_empty() {
@@ -2599,9 +2737,12 @@ impl Parser {
                 num_params,
                 body,
                 optional_param,
+                delimiters,
+                prefix,
             };
             match mode {
                 MacroDefinitionMode::New | MacroDefinitionMode::Renew => {
+                    self.state.aliases.remove(name);
                     self.state.macros.insert(name.to_string(), macro_def);
                 }
                 MacroDefinitionMode::Provide => {
@@ -2610,6 +2751,109 @@ impl Parser {
             }
         }
 
+        Ok(())
+    }
+
+    /// `\DeclareMathOperator{\argmax}{arg\,max}` (star: limits form).
+    fn parse_declare_math_operator(&mut self) -> Result<()> {
+        // A leading * was consumed by the caller via consume_text_star; check
+        // the raw token again in case of `\DeclareMathOperator*`
+        self.skip_whitespace_and_comments();
+        let starred = self.consume_text_star();
+        self.skip_whitespace_and_comments();
+        let name = if matches!(self.current_token(), Token::LeftBrace) {
+            self.parse_braced_text()?
+        } else if let Token::Command(name) = self.current_token().clone() {
+            self.advance();
+            name
+        } else {
+            return Ok(());
+        };
+        self.skip_whitespace_and_comments();
+        let text = self.parse_braced_text()?;
+        let name = name.trim().trim_start_matches('\\').to_string();
+        if !name.is_empty() {
+            let op = if starred { "\\operatorname*" } else { "\\operatorname" };
+            self.state.macros.insert(
+                name,
+                MacroDef {
+                    body: format!("{}{{{}}}", op, text),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// xparse: `\NewDocumentCommand{\foo}{m o m}{body}`.
+    fn parse_xparse_definition(&mut self) -> Result<()> {
+        self.skip_whitespace_and_comments();
+        let name = if matches!(self.current_token(), Token::LeftBrace) {
+            self.parse_braced_text()?
+        } else if let Token::Command(name) = self.current_token().clone() {
+            self.advance();
+            name
+        } else {
+            return Ok(());
+        };
+        self.skip_whitespace_and_comments();
+        let spec = self.parse_braced_text()?;
+        self.skip_whitespace_and_comments();
+        let body = self.parse_braced_text()?;
+
+        // Count argument specifiers; O{default}/D..{default} groups skipped
+        let mut num_params = 0;
+        let mut optional_param = None;
+        let mut chars = spec.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                'm' | 'r' | 'R' | 'v' | 'b' => num_params += 1,
+                'o' | 'd' | 's' | 't' => {
+                    if num_params == 0 && optional_param.is_none() && ch == 'o' {
+                        optional_param = Some(String::new());
+                    }
+                    num_params += 1;
+                }
+                'O' | 'D' => {
+                    let mut default = String::new();
+                    if chars.peek() == Some(&'{') {
+                        chars.next();
+                        let mut depth = 1;
+                        for c in chars.by_ref() {
+                            match c {
+                                '{' => depth += 1,
+                                '}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            default.push(c);
+                        }
+                    }
+                    if num_params == 0 && optional_param.is_none() {
+                        optional_param = Some(default);
+                    }
+                    num_params += 1;
+                }
+                _ => {}
+            }
+        }
+        let name = name.trim().trim_start_matches('\\').to_string();
+        if !name.is_empty() {
+            self.state.aliases.remove(&name);
+            self.state.macros.insert(
+                name,
+                MacroDef {
+                    num_params: num_params.min(9),
+                    body,
+                    optional_param,
+                    ..Default::default()
+                },
+            );
+        }
         Ok(())
     }
 
@@ -2686,9 +2930,17 @@ impl Parser {
         };
         let num_params = def.num_params;
         let optional_param = def.optional_param.clone();
+        let delimiters = def.delimiters.clone();
+        let prefix = def.prefix.clone();
+
+        // Literal text required between the name and the first parameter
+        if !prefix.trim().is_empty() {
+            let _ = self.collect_delimited_argument(prefix.trim());
+        }
 
         let mut args = Vec::new();
         let required_params = if optional_param.is_some() {
+            self.skip_whitespace_only();
             if matches!(self.current_token(), Token::LeftBracket) {
                 args.push(self.parse_bracketed_text()?);
             } else if let Some(default) = optional_param {
@@ -2699,12 +2951,170 @@ impl Parser {
             num_params
         };
 
-        for _ in 0..required_params {
-            self.skip_whitespace_and_comments();
-            args.push(self.parse_braced_text()?);
+        for i in 0..required_params {
+            let index = args.len();
+            let delimiter = delimiters.get(index).cloned().unwrap_or_default();
+            if !delimiter.trim().is_empty() {
+                args.push(self.collect_delimited_argument(delimiter.trim()));
+                continue;
+            }
+            let _ = i;
+            args.push(self.parse_undelimited_argument()?);
         }
 
         Ok(args)
+    }
+
+    /// Skip spaces and comments but not paragraph breaks or newlines that
+    /// precede a blank line (TeX skips spaces before undelimited arguments).
+    fn skip_whitespace_only(&mut self) {
+        while matches!(
+            self.current_token(),
+            Token::Whitespace(_) | Token::Newline | Token::Comment(_)
+        ) {
+            self.advance();
+        }
+    }
+
+    /// One undelimited TeX macro argument: a braced group, or else a single
+    /// token (a single character of a text run, as in TeX).
+    fn parse_undelimited_argument(&mut self) -> Result<String> {
+        self.skip_whitespace_only();
+        match self.current_token().clone() {
+            Token::LeftBrace => self.parse_braced_text(),
+            Token::Text(text) => {
+                self.advance();
+                let mut chars = text.chars();
+                let first = chars.next().map(String::from).unwrap_or_default();
+                let rest: String = chars.collect();
+                if !rest.is_empty() {
+                    self.push_front(vec![Token::Text(rest)]);
+                }
+                Ok(first)
+            }
+            Token::RightBrace | Token::EndEnvironment(_) | Token::ParBreak | Token::Eof => {
+                Ok(String::new())
+            }
+            other => {
+                self.advance();
+                Ok(self.token_to_string(&other))
+            }
+        }
+    }
+
+    /// Collect tokens up to `delimiter` (at brace depth 0), consuming the
+    /// delimiter. A single surrounding brace pair is stripped, as in TeX.
+    fn collect_delimited_argument(&mut self, delimiter: &str) -> String {
+        let is_par = delimiter == "\\par";
+        let mut collected = String::new();
+        let mut depth = 0usize;
+        let mut guard = 0;
+        while !self.is_at_end() && guard < 20_000 {
+            guard += 1;
+            let token = self.current_token().clone();
+            if depth == 0 && is_par && matches!(token, Token::ParBreak) {
+                self.advance();
+                break;
+            }
+            match token {
+                Token::LeftBrace => depth += 1,
+                Token::RightBrace => {
+                    if depth == 0 {
+                        break; // end of enclosing group: argument ends here
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+            self.advance();
+            let piece = self.token_to_string(&token);
+            let search_from = collected.len().saturating_sub(delimiter.len());
+            collected.push_str(&piece);
+            if depth == 0 && !matches!(token, Token::LeftBrace | Token::RightBrace) {
+                if let Some(pos) = collected[search_from..].find(delimiter) {
+                    let pos = search_from + pos;
+                    let leftover = collected[pos + delimiter.len()..].to_string();
+                    collected.truncate(pos);
+                    if !leftover.is_empty() {
+                        self.push_front(tex::lex_fragment(&leftover));
+                    }
+                    break;
+                }
+            }
+        }
+        // Spaces after the macro name are skipped by TeX's tokenizer
+        let collected = collected.trim_start().to_string();
+        let trimmed = collected.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') && balanced_outer_group(trimmed) {
+            trimmed[1..trimmed.len() - 1].to_string()
+        } else {
+            collected
+        }
+    }
+
+    /// Lex an `\input`ed file and splice its tokens at the cursor.
+    fn splice_input_file(&mut self, cmd: &str) -> Result<()> {
+        self.skip_whitespace_and_comments();
+        if cmd == "import" {
+            // \import{dir/}{file}
+            let dir = self.parse_braced_text()?;
+            self.skip_whitespace_and_comments();
+            let file = self.parse_braced_text()?;
+            let path = format!("{}{}", dir.trim(), file.trim());
+            return self.splice_named_file(cmd, &path);
+        }
+        let filename = if matches!(self.current_token(), Token::LeftBrace) {
+            self.parse_braced_text()?
+        } else {
+            // TeX-style \input file (terminated by whitespace)
+            match self.current_token().clone() {
+                Token::Text(t) => {
+                    self.advance();
+                    let mut name = t;
+                    while let Token::Text(more) = self.current_token().clone() {
+                        name.push_str(&more);
+                        self.advance();
+                    }
+                    name
+                }
+                _ => return Ok(()),
+            }
+        };
+        self.splice_named_file(cmd, filename.trim())
+    }
+
+    fn splice_named_file(&mut self, cmd: &str, filename: &str) -> Result<()> {
+        if filename.is_empty() {
+            return Ok(());
+        }
+        let base = self.base_path.as_deref();
+        let content = if cmd == "include" {
+            self.include_system.include_file(&mut self.state, filename, base)
+        } else {
+            self.include_system.input_file(&mut self.state, filename, base)
+        };
+        match content {
+            Ok(content) => {
+                if self.consume_expansion_budget(&format!("input:{}", filename)) {
+                    let at_letter = filename.ends_with(".sty") || filename.ends_with(".cls");
+                    let mut tokens = Lexer::new(&content)
+                        .with_at_letter(at_letter)
+                        .tokenize()
+                        .unwrap_or_default();
+                    if matches!(tokens.last(), Some(Token::Eof)) {
+                        tokens.pop();
+                    }
+                    self.push_front(tokens);
+                }
+            }
+            Err(_) => {
+                self.state.warn(format!(
+                    "could not resolve \\{}{{{}}} — content skipped",
+                    cmd, filename
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Expand user-defined macros inside math content, so constructs like
@@ -2782,6 +3192,9 @@ impl Parser {
                     }
 
                     if let Some(expansion) = self.state.expand_macro(&name, &args) {
+                        if chars.len() + expansion.len() > MAX_MATH_EXPANSION_CHARS {
+                            break;
+                        }
                         expansions += 1;
                         let replacement: Vec<char> = expansion.chars().collect();
                         chars.splice(i..j, replacement);
@@ -2824,6 +3237,7 @@ impl Parser {
         }
 
         let saved_tokens = std::mem::replace(&mut self.tokens, reverse_tokens(tokens));
+        let saved_expansions = std::mem::take(&mut self.active_expansions);
 
         let mut inlines = Vec::new();
         let mut result = Ok(());
@@ -2845,6 +3259,7 @@ impl Parser {
         }
 
         self.tokens = saved_tokens;
+        self.active_expansions = saved_expansions;
         result?;
 
         Ok((inlines, label))
@@ -2905,6 +3320,7 @@ impl Parser {
         child.depth = self.depth;
         child.macro_expansions = self.macro_expansions;
         child.macro_budget = self.macro_budget.saturating_add(child.macro_budget);
+        child.expanded_bytes = self.expanded_bytes;
 
         let include_base = self
             .include_system
@@ -2919,6 +3335,7 @@ impl Parser {
 
         self.macro_expansions = child.macro_expansions;
         self.macro_budget = child.macro_budget;
+        self.expanded_bytes = child.expanded_bytes;
         self.metadata = child.metadata;
         self.state = child.state;
         self.citation_manager = child.citation_manager;
@@ -3106,11 +3523,26 @@ impl Parser {
             }
             
             // Macro definitions
-            "newcommand" | "renewcommand" | "providecommand" | "def" | "DeclareRobustCommand" => {
+            "newcommand" | "renewcommand" | "providecommand" | "def" | "gdef" | "edef"
+            | "xdef" | "DeclareRobustCommand" | "newrobustcmd" | "renewrobustcmd"
+            | "providerobustcmd" | "DeclareMathOperator" | "DeclareTextFontCommand"
+            | "NewDocumentCommand" | "RenewDocumentCommand" | "ProvideDocumentCommand"
+            | "DeclareDocumentCommand" => {
                 self.advance();
                 self.consume_text_star();
+                if cmd == "DeclareMathOperator" {
+                    self.parse_declare_math_operator()?;
+                    return Ok(None);
+                }
+                if cmd.ends_with("DocumentCommand") {
+                    self.parse_xparse_definition()?;
+                    return Ok(None);
+                }
+                let tex_style = matches!(cmd.as_str(), "def" | "gdef" | "edef" | "xdef");
+                self.macro_def_tex_style = tex_style;
                 let mode = match cmd.as_str() {
-                    "renewcommand" | "def" => MacroDefinitionMode::Renew,
+                    "renewcommand" | "def" | "gdef" | "edef" | "xdef" | "renewrobustcmd"
+                    | "DeclareRobustCommand" | "DeclareTextFontCommand" => MacroDefinitionMode::Renew,
                     "providecommand" => MacroDefinitionMode::Provide,
                     _ => MacroDefinitionMode::New,
                 };
@@ -3293,6 +3725,22 @@ impl Parser {
                 Ok(None)
             }
         }
+    }
+
+    /// Charge `bytes` of expansion output against the document's budget.
+    fn consume_expansion_bytes(&mut self, name: &str, bytes: usize) -> bool {
+        let limit = BASE_EXPANSION_BYTES.saturating_add(self.source_token_count.saturating_mul(256));
+        self.expanded_bytes = self.expanded_bytes.saturating_add(bytes);
+        if self.expanded_bytes > limit {
+            if self.refused_macros.insert(name.to_string()) {
+                self.state.warn(format!(
+                    "macro `\\{}` expands to unbounded output — expansion stopped",
+                    name
+                ));
+            }
+            return false;
+        }
+        true
     }
 
     /// Current value of a named LaTeX counter.
@@ -3839,6 +4287,82 @@ fn eqnarray_row_to_aligned(row: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Parse TeX parameter text (`#1#2`, `#1.#2\par`, `(#1)`) into
+/// (prefix before #1, delimiter after each parameter, parameter count).
+fn parse_tex_param_text(text: &str) -> (String, Vec<String>, usize) {
+    let mut prefix = String::new();
+    let mut delimiters: Vec<String> = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '#' && chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+            chars.next();
+            delimiters.push(String::new());
+        } else if let Some(last) = delimiters.last_mut() {
+            last.push(ch);
+        } else {
+            prefix.push(ch);
+        }
+    }
+    let count = delimiters.len().min(9);
+    delimiters.truncate(count);
+    (prefix, delimiters, count)
+}
+
+/// Is the whole string a single balanced `{...}` group?
+fn balanced_outer_group(text: &str) -> bool {
+    let mut depth = 0i32;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 && i != text.len() - 1 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+/// Block-level commands with no output of their own, safe to process when
+/// they appear inside a paragraph (definitions, metadata, preamble setup).
+fn is_inline_safe_block_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "newcommand"
+            | "renewcommand"
+            | "providecommand"
+            | "def"
+            | "gdef"
+            | "edef"
+            | "xdef"
+            | "DeclareRobustCommand"
+            | "newrobustcmd"
+            | "renewrobustcmd"
+            | "providerobustcmd"
+            | "DeclareMathOperator"
+            | "NewDocumentCommand"
+            | "RenewDocumentCommand"
+            | "ProvideDocumentCommand"
+            | "DeclareDocumentCommand"
+            | "newenvironment"
+            | "renewenvironment"
+            | "newtheorem"
+            | "bibliography"
+            | "addbibresource"
+            | "bibliographystyle"
+            | "title"
+            | "author"
+            | "date"
+            | "graphicspath"
+            | "usepackage"
+            | "documentclass"
+            | "documentstyle"
+    )
 }
 
 /// Put a custom `\item[label]` marker in front of the item's first paragraph.

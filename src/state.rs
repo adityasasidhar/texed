@@ -84,6 +84,12 @@ pub struct ParserState {
 
     /// `\numberwithin{counter}{parent}` overrides (counter -> parent).
     pub numberwithin: HashMap<String, String>,
+
+    /// `\newif\ifname` booleans (name without the `if` prefix).
+    pub conditionals: HashMap<String, bool>,
+
+    /// `\let\new\old` aliases of built-in commands (new -> old).
+    pub aliases: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,11 +111,17 @@ pub enum LabelType {
     Other(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MacroDef {
     pub num_params: usize,
     pub body: String,
     pub optional_param: Option<String>,
+    /// TeX delimited parameter text (`\def\foo#1.#2\par{...}`): for each
+    /// parameter, the literal text that must follow it (empty = undelimited).
+    pub delimiters: Vec<String>,
+    /// Literal text that must directly follow the macro name before the
+    /// first parameter (`\def\foo(#1){...}` -> "(").
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +178,8 @@ impl ParserState {
             appendix: false,
             has_chapters: false,
             numberwithin: HashMap::new(),
+            conditionals: HashMap::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -253,7 +267,7 @@ impl ParserState {
     }
 
     /// Formatted section number including levels 0..=max_level.
-    fn section_number_up_to(&self, max_level: usize) -> String {
+    pub fn section_number_up_to(&self, max_level: usize) -> String {
         let top = self.top_level();
         let mut parts = Vec::new();
         for (level, &count) in self.section_counters.iter().enumerate().take(max_level + 1) {
@@ -363,19 +377,15 @@ impl ParserState {
                 num_params,
                 body,
                 optional_param: None,
+                ..Default::default()
             },
         );
     }
 
     pub fn expand_macro(&self, name: &str, args: &[String]) -> Option<String> {
-        self.macros.get(name).map(|def| {
-            let mut result = def.body.clone();
-            for (i, arg) in args.iter().enumerate() {
-                let placeholder = format!("#{}", i + 1);
-                result = result.replace(&placeholder, arg);
-            }
-            result
-        })
+        self.macros
+            .get(name)
+            .map(|def| substitute_params(&def.body, args))
     }
 
     pub fn define_theorem_env(
@@ -484,6 +494,35 @@ impl ParserState {
     pub fn mark_file_included(&mut self, path: String) {
         self.included_files.push(path);
     }
+}
+
+/// Substitute `#1`..`#9` in a macro body in a single pass (so argument text
+/// containing `#2` is never substituted again); `##` becomes `#`, as when a
+/// macro body defines another macro.
+pub fn substitute_params(body: &str, args: &[String]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '#' {
+            match chars.peek().copied() {
+                Some('#') => {
+                    chars.next();
+                    out.push('#');
+                }
+                Some(d @ '1'..='9') => {
+                    chars.next();
+                    let index = d as usize - '1' as usize;
+                    if let Some(arg) = args.get(index) {
+                        out.push_str(arg);
+                    }
+                }
+                _ => out.push('#'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Sectioning level of a counter name (`chapter` = 0, `section` = 1, ...).

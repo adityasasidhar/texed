@@ -1,0 +1,852 @@
+//! TeX-level programming constructs: conditionals (`\if...\else...\fi`,
+//! `\newif`, etoolbox/ifthen branches), `\let`, `\csname`, counter
+//! formatting, and the recursion-aware macro expander.
+//!
+//! None of this attempts to be a full TeX interpreter. The goal is that
+//! real-world preambles and macro packages degrade gracefully: the branch a
+//! document author intended is chosen whenever it can be determined, and
+//! nothing ever loops or explodes when it cannot.
+
+use super::{Inline, Parser};
+use crate::error::Result;
+use crate::lexer::{Lexer, Token};
+use crate::state::{alpha_number, roman_number};
+
+/// Prefix marking a command token that must resolve to its built-in meaning
+/// (skipping user macros and aliases); produced by `\let` aliases.
+pub(super) const BUILTIN_MARK: char = '\u{1}';
+
+/// Maximum simultaneous nested expansions of the same macro.
+const MAX_SAME_MACRO_NESTING: usize = 40;
+/// Maximum simultaneous nested macro expansions overall.
+const MAX_EXPANSION_NESTING: usize = 400;
+/// Baseline per-macro expansion allowance; the effective allowance also
+/// scales with document size and with how often the macro occurs in the
+/// source, so legitimate heavy use is never cut off while a tail-recursive
+/// loop (`\def\a{x\a}`) stops after output proportional to the input.
+const PER_MACRO_BASE_BUDGET: usize = 1_000;
+
+/// etoolbox/ifthen-style conditionals taking braced arguments; these are
+/// *not* TeX primitive conditionals terminated by `\fi`.
+const BRACED_CONDITIONALS: &[&str] = &[
+    "ifthenelse", "iftoggle", "nottoggle", "ifbool", "notbool", "ifdef", "ifundef",
+    "ifcsdef", "ifcsundef", "ifdefempty", "ifcsempty", "ifstrequal", "ifstrempty",
+    "ifblank", "ifnumcomp", "ifdimcomp", "ifnumequal", "ifnumgreater", "ifnumless",
+    "ifnumodd", "ifboolexpr", "ifdefmacro", "ifdefstring", "ifcsstring", "ifdefstrequal",
+    "ifcsmacro", "ifdefltxprotect", "ifltxcounter", "ifdefcounter", "ifdeflength",
+    "ifpackageloaded", "ifclassloaded", "iffileexists", "ifcsvoid", "ifdefvoid",
+];
+
+/// Conditionals with a statically known outcome under pdfLaTeX.
+fn static_conditional(name: &str) -> Option<bool> {
+    Some(match name {
+        "iftrue" | "ifpdf" | "ifPDFTeX" | "ifpdftex" | "ifhmode" | "if@twoside" => true,
+        "iffalse" | "ifxetex" | "ifXeTeX" | "ifluatex" | "ifLuaTeX" | "ifvtex" | "ifmmode"
+        | "ifinner" | "ifvmode" | "ifvoid" | "ifeof" | "ifHy@draft" | "if@draft"
+        | "ifdraft" | "ifbeamer" | "ifhtml" | "ifHtml" | "if@restonecol" => false,
+        _ => return None,
+    })
+}
+
+/// pdfTeX/LaTeX primitives and kernel commands that `\ifx\cs\undefined`
+/// tests commonly probe for.
+fn is_known_defined(name: &str) -> bool {
+    matches!(
+        name,
+        "pdfoutput" | "pdftexversion" | "pdfstrcmp" | "pdfshellescape" | "documentclass"
+            | "section" | "usepackage" | "textbf" | "emph" | "LaTeX" | "TeX" | "eTeXversion"
+            | "protected" | "unexpanded" | "detokenize" | "numexpr" | "dimexpr" | "ifdefined"
+            | "ifcsname" | "pdfTeX" | "relax" | "empty" | "@empty"
+    )
+}
+
+/// What stopped a skipped conditional branch.
+enum BranchEnd {
+    Else,
+    Or,
+    Fi,
+    Eof,
+}
+
+impl Parser {
+    /// Handle TeX-level commands. Returns `Ok(Some(result))` when `cmd` was
+    /// handled (the current token has already been consumed), `Ok(None)`
+    /// when it is not a TeX-level command.
+    pub(super) fn parse_tex_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        // Aliases from \let\new\old: re-lex the target so it receives its
+        // full meaning (environment tokens, \item, ...)
+        if let Some(target) = self.state.aliases.get(cmd).cloned() {
+            if self.consume_expansion_budget(cmd) {
+                let tokens = lex_fragment(&format!("\\{}", target));
+                // \let captures the *built-in* meaning: mark plain commands so
+                // a later \renewcommand of the original name is bypassed
+                let tokens = tokens
+                    .into_iter()
+                    .map(|t| match t {
+                        Token::Command(name) if name == target => {
+                            Token::Command(format!("{}{}", BUILTIN_MARK, name))
+                        }
+                        other => other,
+                    })
+                    .collect();
+                self.push_front(tokens);
+            }
+            return Ok(Some(None));
+        }
+
+        match cmd {
+            "global" | "long" | "outer" | "protected" | "immediate" | "expandafter"
+            | "noexpand" | "unexpanded" | "ignorespaces" | "makeatletter" | "makeatother"
+            | "ExplSyntaxOn" | "ExplSyntaxOff" | "endcsname" => return Ok(Some(None)),
+            "let" => {
+                self.parse_let()?;
+                return Ok(Some(None));
+            }
+            "futurelet" => {
+                for _ in 0..3 {
+                    self.skip_whitespace_and_comments();
+                    self.advance();
+                }
+                return Ok(Some(None));
+            }
+            "csname" => {
+                let name = self.collect_csname();
+                if !name.is_empty() {
+                    self.push_front(vec![Token::Command(name)]);
+                }
+                return Ok(Some(None));
+            }
+            "string" | "detokenize" => {
+                self.skip_whitespace_and_comments();
+                let text = if matches!(self.current_token(), Token::LeftBrace) {
+                    self.parse_braced_text()?
+                } else {
+                    let token = self.current_token().clone();
+                    self.advance();
+                    self.token_to_string(&token)
+                };
+                return Ok(Some(Some(Inline::Text(text))));
+            }
+            "newif" => {
+                self.skip_whitespace_and_comments();
+                if let Token::Command(name) = self.current_token().clone() {
+                    self.advance();
+                    if let Some(base) = name.strip_prefix("if") {
+                        self.state.conditionals.insert(base.to_string(), false);
+                    }
+                }
+                return Ok(Some(None));
+            }
+            "newboolean" | "provideboolean" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.state.conditionals.entry(name).or_insert(false);
+                return Ok(Some(None));
+            }
+            "setboolean" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_and_comments();
+                let value = self.parse_braced_text()?.trim().eq_ignore_ascii_case("true");
+                self.state.conditionals.insert(name, value);
+                return Ok(Some(None));
+            }
+            "providetoggle" | "newtoggle" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.state.toggles.entry(name).or_insert(false);
+                return Ok(Some(None));
+            }
+            "settoggle" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_and_comments();
+                let value = self.parse_braced_text()?.trim().eq_ignore_ascii_case("true");
+                self.state.toggles.insert(name, value);
+                return Ok(Some(None));
+            }
+            "toggletrue" | "togglefalse" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.state.toggles.insert(name, cmd == "toggletrue");
+                return Ok(Some(None));
+            }
+            "else" | "or" => {
+                // Reached the end of the branch being taken: skip the rest
+                // of the conditional.
+                if self.cond_depth > 0 {
+                    if let BranchEnd::Fi = self.skip_branch(false, false) {
+                        self.cond_depth -= 1;
+                    }
+                }
+                return Ok(Some(None));
+            }
+            "fi" => {
+                self.cond_depth = self.cond_depth.saturating_sub(1);
+                return Ok(Some(None));
+            }
+            "the" | "number" | "arabic" | "roman" | "Roman" | "alph" | "Alph" | "value"
+            | "romannumeral" | "fnsymbol" => {
+                return Ok(Some(self.parse_counter_format(cmd)?));
+            }
+            _ => {}
+        }
+
+        // \fooTrue/\foofalse for \newif booleans
+        for (suffix, value) in [("true", true), ("false", false)] {
+            if let Some(base) = cmd.strip_suffix(suffix) {
+                if self.state.conditionals.contains_key(base) {
+                    self.state.conditionals.insert(base.to_string(), value);
+                    return Ok(Some(None));
+                }
+            }
+        }
+
+        // \thesection, \thechapter, \theequation, ...
+        if let Some(counter) = cmd.strip_prefix("the") {
+            if let Some(text) = self.format_named_counter(counter, "arabic") {
+                return Ok(Some(Some(Inline::Text(text))));
+            }
+        }
+
+        if BRACED_CONDITIONALS.contains(&cmd) {
+            self.parse_braced_conditional(cmd)?;
+            return Ok(Some(None));
+        }
+
+        if self.is_tex_conditional(cmd) {
+            self.parse_tex_conditional(cmd)?;
+            return Ok(Some(None));
+        }
+
+        Ok(None)
+    }
+
+    /// Is `name` a primitive-style conditional (terminated by `\fi`)?
+    pub(super) fn is_tex_conditional(&self, name: &str) -> bool {
+        if name.len() <= 2 || !name.starts_with("if") || name == "iff" {
+            return false;
+        }
+        if BRACED_CONDITIONALS.contains(&name) || self.state.macros.contains_key(name) {
+            return false;
+        }
+        true
+    }
+
+    /// Evaluate a `\if...` conditional and position the stream at the
+    /// chosen branch.
+    fn parse_tex_conditional(&mut self, cmd: &str) -> Result<()> {
+        if cmd == "ifcase" {
+            let n = self.read_tex_number().unwrap_or(0);
+            let mut case = 0;
+            while case < n {
+                match self.skip_branch(true, true) {
+                    BranchEnd::Or => case += 1,
+                    BranchEnd::Else => break,
+                    BranchEnd::Fi | BranchEnd::Eof => return Ok(()),
+                }
+            }
+            self.cond_depth += 1;
+            return Ok(());
+        }
+
+        let value = self.evaluate_conditional(cmd)?.unwrap_or(true);
+        if value {
+            self.cond_depth += 1;
+        } else {
+            match self.skip_branch(true, false) {
+                BranchEnd::Else => self.cond_depth += 1,
+                BranchEnd::Fi | BranchEnd::Or | BranchEnd::Eof => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Determine a conditional's truth value, consuming its operands.
+    /// `None` means it cannot be decided statically.
+    fn evaluate_conditional(&mut self, cmd: &str) -> Result<Option<bool>> {
+        // \newif booleans first: a document's own \ifdraft wins over defaults
+        if let Some(value) = cmd
+            .strip_prefix("if")
+            .and_then(|base| self.state.conditionals.get(base))
+        {
+            return Ok(Some(*value));
+        }
+        if let Some(value) = static_conditional(cmd) {
+            return Ok(Some(value));
+        }
+        match cmd {
+            "ifdefined" => {
+                self.skip_whitespace_and_comments();
+                let token = self.current_token().clone();
+                self.advance();
+                Ok(match token {
+                    Token::Command(name) => Some(self.is_defined_command(&name)),
+                    _ => None,
+                })
+            }
+            "ifcsname" => {
+                let name = self.collect_csname();
+                Ok(Some(self.is_defined_command(&name)))
+            }
+            "ifx" => {
+                let a = self.next_significant_token();
+                let b = self.next_significant_token();
+                Ok(self.compare_ifx(a, b))
+            }
+            "if" | "ifcat" => {
+                let a = self.next_significant_token();
+                let b = self.next_significant_token();
+                let a = a.map(|t| self.token_to_string(&t));
+                let b = b.map(|t| self.token_to_string(&t));
+                Ok(match (a, b) {
+                    (Some(a), Some(b)) => Some(a.chars().next() == b.chars().next()),
+                    _ => None,
+                })
+            }
+            "ifnum" | "ifdim" => Ok(self.read_comparison()),
+            "ifodd" => Ok(self.read_tex_number().map(|n| n % 2 == 1)),
+            _ => {
+                if !cmd.starts_with("if@") && !self.state.conditionals.is_empty() {
+                    // Unknown conditional: take the first branch
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn is_defined_command(&self, name: &str) -> bool {
+        self.state.macros.contains_key(name)
+            || self.state.aliases.contains_key(name)
+            || self.macro_processor.is_defined(&self.state, name)
+            || self.state.environments.contains_key(name)
+            || is_known_defined(name)
+    }
+
+    fn compare_ifx(&self, a: Option<Token>, b: Option<Token>) -> Option<bool> {
+        let (a, b) = (a?, b?);
+        let undefined = |name: &str| matches!(name, "undefined" | "@undefined" | "UnDeFiNeD");
+        match (&a, &b) {
+            (Token::Command(x), Token::Command(y)) if undefined(y) => {
+                Some(!self.is_defined_command(x))
+            }
+            (Token::Command(x), Token::Command(y)) if undefined(x) => {
+                Some(!self.is_defined_command(y))
+            }
+            (Token::Command(x), Token::Command(y)) => {
+                if x == y {
+                    return Some(true);
+                }
+                match (self.state.macros.get(x), self.state.macros.get(y)) {
+                    (Some(dx), Some(dy)) => {
+                        Some(dx.body == dy.body && dx.num_params == dy.num_params)
+                    }
+                    _ => None,
+                }
+            }
+            _ => Some(a == b),
+        }
+    }
+
+    /// Next token that is not whitespace or a comment, consumed.
+    fn next_significant_token(&mut self) -> Option<Token> {
+        self.skip_whitespace_and_comments();
+        if self.is_at_end() {
+            return None;
+        }
+        let token = self.current_token().clone();
+        self.advance();
+        Some(token)
+    }
+
+    /// Parse `<number> <relation> <number>` after \ifnum/\ifdim.
+    fn read_comparison(&mut self) -> Option<bool> {
+        let mut text = String::new();
+        let mut relation: Option<char> = None;
+        let mut rhs = String::new();
+        for _ in 0..12 {
+            self.skip_whitespace_and_comments();
+            match self.current_token().clone() {
+                Token::Text(t) if relation.is_none() => {
+                    if let Some(pos) = t.find(['<', '=', '>']) {
+                        text.push_str(&t[..pos]);
+                        relation = t[pos..].chars().next();
+                        let rest = &t[pos + 1..];
+                        self.advance();
+                        if !rest.is_empty() {
+                            rhs.push_str(rest);
+                            break;
+                        }
+                    } else {
+                        text.push_str(&t);
+                        self.advance();
+                    }
+                }
+                Token::Text(t) => {
+                    rhs.push_str(&t);
+                    self.advance();
+                    break;
+                }
+                Token::Command(name) => {
+                    self.advance();
+                    let value = self.command_numeric_value(&name);
+                    let target = if relation.is_none() { &mut text } else { &mut rhs };
+                    target.push_str(&value.map(|v| v.to_string()).unwrap_or_else(|| "?".into()));
+                    if relation.is_some() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let relation = relation?;
+        let lhs = parse_tex_dimen(&text)?;
+        let rhs = parse_tex_dimen(&rhs)?;
+        Some(match relation {
+            '<' => lhs < rhs,
+            '>' => lhs > rhs,
+            _ => (lhs - rhs).abs() < f64::EPSILON,
+        })
+    }
+
+    /// Numeric value of `\value{x}`, `\c@x` or a counter-like command.
+    fn command_numeric_value(&mut self, name: &str) -> Option<i64> {
+        if name == "value" {
+            self.skip_whitespace_and_comments();
+            let counter = self.parse_braced_text().ok()?;
+            return Some(self.counter_value(counter.trim()) as i64);
+        }
+        if let Some(counter) = name.strip_prefix("c@") {
+            return Some(self.counter_value(counter) as i64);
+        }
+        self.state
+            .macros
+            .get(name)
+            .and_then(|def| def.body.trim().parse::<i64>().ok())
+    }
+
+    /// Read a TeX number (literal digits, `\value{}`, or a numeric macro).
+    fn read_tex_number(&mut self) -> Option<i64> {
+        self.skip_whitespace_and_comments();
+        match self.current_token().clone() {
+            Token::Text(t) => {
+                let digits: String = t
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '-')
+                    .collect();
+                let rest = t[digits.len()..].to_string();
+                self.advance();
+                if !rest.is_empty() {
+                    self.push_front(vec![Token::Text(rest)]);
+                }
+                digits.parse().ok()
+            }
+            Token::Command(name) => {
+                self.advance();
+                self.command_numeric_value(&name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Skip tokens of a false conditional branch up to the matching
+    /// `\else`/`\or` (when requested) or `\fi`, which is consumed.
+    fn skip_branch(&mut self, stop_at_else: bool, stop_at_or: bool) -> BranchEnd {
+        let mut depth = 0usize;
+        while !self.is_at_end() {
+            let token = self.current_token().clone();
+            self.advance();
+            if let Token::Command(name) = token {
+                match name.as_str() {
+                    "fi" => {
+                        if depth == 0 {
+                            return BranchEnd::Fi;
+                        }
+                        depth -= 1;
+                    }
+                    "else" if depth == 0 && stop_at_else => return BranchEnd::Else,
+                    "or" if depth == 0 && stop_at_or => return BranchEnd::Or,
+                    // The \ifname after \newif is a name, not a conditional
+                    "newif" | "let" | "def" | "gdef" | "edef" | "xdef" => {
+                        if matches!(self.current_token(), Token::Command(_)) {
+                            self.advance();
+                        }
+                    }
+                    _ if self.is_tex_conditional(&name) => depth += 1,
+                    _ => {}
+                }
+            }
+        }
+        BranchEnd::Eof
+    }
+
+    /// etoolbox / ifthen conditionals: `\iftoggle{x}{yes}{no}` and friends.
+    fn parse_braced_conditional(&mut self, cmd: &str) -> Result<()> {
+        let take_braced = |parser: &mut Parser| -> Vec<Token> {
+            parser.skip_whitespace_and_comments();
+            parser.collect_braced_tokens()
+        };
+        let operand_count = match cmd {
+            "ifstrequal" | "ifnumcomp" | "ifdimcomp" | "ifnumequal" | "ifnumgreater"
+            | "ifnumless" | "ifdefstring" | "ifcsstring" | "ifdefstrequal" => 2,
+            _ => 1,
+        };
+        let operands: Vec<String> = (0..operand_count)
+            .map(|_| {
+                let tokens = take_braced(self);
+                tokens.iter().map(|t| self.token_to_string(t)).collect::<String>()
+            })
+            .collect();
+        // \ifnumcomp{a}{<}{b}: the relation is a separate argument
+        let relation = if matches!(cmd, "ifnumcomp" | "ifdimcomp") {
+            let tokens = take_braced(self);
+            Some(tokens.iter().map(|t| self.token_to_string(t)).collect::<String>())
+        } else {
+            None
+        };
+        let yes = take_braced(self);
+        let no = take_braced(self);
+
+        let operand = operands.first().map(|s| s.trim().to_string()).unwrap_or_default();
+        let defined = |p: &Parser, s: &str| p.is_defined_command(s.trim().trim_start_matches('\\'));
+        let value = match cmd {
+            "ifthenelse" => self.evaluate_ifthen(&operand),
+            "iftoggle" => self.state.toggles.get(&operand).copied().unwrap_or(false),
+            "nottoggle" => !self.state.toggles.get(&operand).copied().unwrap_or(false),
+            "ifbool" => self.state.conditionals.get(&operand).copied().unwrap_or(false),
+            "notbool" => !self.state.conditionals.get(&operand).copied().unwrap_or(false),
+            "ifdef" | "ifcsdef" | "ifdefmacro" | "ifcsmacro" => defined(self, &operand),
+            "ifundef" | "ifcsundef" => !defined(self, &operand),
+            "ifdefempty" | "ifcsempty" | "ifdefvoid" | "ifcsvoid" => self
+                .state
+                .macros
+                .get(operand.trim_start_matches('\\'))
+                .is_none_or(|d| d.body.trim().is_empty()),
+            "ifstrequal" | "ifdefstring" | "ifcsstring" | "ifdefstrequal" => {
+                operands[0].trim() == operands[1].trim()
+            }
+            "ifstrempty" | "ifblank" => operand.is_empty(),
+            "ifnumequal" => num(&operands[0]) == num(&operands[1]),
+            "ifnumgreater" => num(&operands[0]) > num(&operands[1]),
+            "ifnumless" => num(&operands[0]) < num(&operands[1]),
+            "ifnumodd" => num(&operand).is_some_and(|n| n % 2 != 0),
+            "ifnumcomp" | "ifdimcomp" => {
+                let (a, b) = (num(&operands[0]), num(&operands[1]));
+                match relation.as_deref().map(str::trim) {
+                    Some("<") => a < b,
+                    Some(">") => a > b,
+                    _ => a == b,
+                }
+            }
+            "ifpackageloaded" | "ifclassloaded" | "iffileexists" => true,
+            _ => true,
+        };
+        self.push_front(if value { yes } else { no });
+        Ok(())
+    }
+
+    /// Evaluate an `\ifthenelse` condition (ifthen package syntax).
+    fn evaluate_ifthen(&self, condition: &str) -> bool {
+        let condition = condition.trim();
+        if let Some(rest) = condition.strip_prefix("\\not") {
+            return !self.evaluate_ifthen(rest);
+        }
+        if let Some(inner) = braced_arg(condition, "\\boolean") {
+            return self.state.conditionals.get(inner.trim()).copied().unwrap_or(false);
+        }
+        if let Some(rest) = condition.strip_prefix("\\equal") {
+            let (a, rest) = split_braced(rest);
+            let (b, _) = split_braced(rest);
+            return a.trim() == b.trim();
+        }
+        if let Some(inner) = braced_arg(condition, "\\isundefined") {
+            return !self.is_defined_command(inner.trim().trim_start_matches('\\'));
+        }
+        if let Some(pos) = condition.find(['<', '=', '>']) {
+            let (a, b) = (num(&condition[..pos]), num(&condition[pos + 1..]));
+            return match &condition[pos..pos + 1] {
+                "<" => a < b,
+                ">" => a > b,
+                _ => a == b,
+            };
+        }
+        true
+    }
+
+    /// `\let\new\old` / `\let\new=\old`.
+    fn parse_let(&mut self) -> Result<()> {
+        self.skip_whitespace_and_comments();
+        let target = match self.current_token().clone() {
+            Token::Command(name) => name,
+            _ => return Ok(()),
+        };
+        self.advance();
+        self.skip_whitespace_and_comments();
+        if let Token::Text(t) = self.current_token().clone() {
+            if let Some(rest) = t.strip_prefix('=') {
+                self.advance();
+                if !rest.is_empty() {
+                    self.push_front(vec![Token::Text(rest.to_string())]);
+                }
+            }
+        }
+        // One optional space after '='
+        if matches!(self.current_token(), Token::Whitespace(_)) {
+            self.advance();
+        }
+        let source = self.current_token().clone();
+        self.advance();
+
+        self.state.aliases.remove(&target);
+        match source {
+            Token::Command(name) if name == target => {}
+            Token::Command(name) => {
+                if let Some(def) = self.state.macros.get(&name).cloned() {
+                    self.state.macros.insert(target, def);
+                } else if matches!(name.as_str(), "relax" | "empty" | "@empty") {
+                    self.state.macros.insert(target, Default::default());
+                } else if let Some(def) = self.macro_processor.get_definition(&self.state, &name) {
+                    let def = def.clone();
+                    self.state.macros.insert(target, def);
+                } else {
+                    self.state.macros.remove(&target);
+                    let resolved = self.state.aliases.get(&name).cloned().unwrap_or(name);
+                    if resolved != target {
+                        self.state.aliases.insert(target, resolved);
+                    }
+                }
+            }
+            Token::Item => {
+                self.state.macros.remove(&target);
+                self.state.aliases.insert(target, "item".to_string());
+            }
+            Token::Section(level, _, _) => {
+                // Only reachable for malformed input; nothing sensible to alias
+                let _ = level;
+            }
+            _ => {
+                // \let\bgroup={ and similar character aliases: ignore
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect a control sequence name up to `\endcsname`.
+    fn collect_csname(&mut self) -> String {
+        let mut name = String::new();
+        for _ in 0..256 {
+            if self.is_at_end() {
+                break;
+            }
+            let token = self.current_token().clone();
+            self.advance();
+            match token {
+                Token::Command(c) if c == "endcsname" => break,
+                Token::Command(c) => {
+                    // \csname\string\foo\endcsname and similar: expand to name
+                    if let Some(def) = self.state.macros.get(&c) {
+                        name.push_str(def.body.trim());
+                    } else {
+                        name.push_str(&c);
+                    }
+                }
+                Token::Whitespace(_) | Token::Newline => {}
+                other => name.push_str(&self.token_to_string(&other)),
+            }
+        }
+        name
+    }
+
+    /// `\the\value{x}`, `\arabic{x}`, `\roman{x}`, `\thesection`, ...
+    fn parse_counter_format(&mut self, cmd: &str) -> Result<Option<Inline>> {
+        self.skip_whitespace_and_comments();
+        match cmd {
+            "the" | "number" | "romannumeral" => {
+                let token = self.current_token().clone();
+                match token {
+                    Token::Command(name) => {
+                        self.advance();
+                        let value = self.command_numeric_value(&name);
+                        if let Some(counter) = name.strip_prefix("the") {
+                            if let Some(text) = self.format_named_counter(counter, "arabic") {
+                                return Ok(Some(Inline::Text(text)));
+                            }
+                        }
+                        Ok(value.map(|v| {
+                            Inline::Text(if cmd == "romannumeral" {
+                                roman_number(v.max(0) as usize, false)
+                            } else {
+                                v.to_string()
+                            })
+                        }))
+                    }
+                    Token::Text(_) if cmd != "the" => {
+                        let n = self.read_tex_number();
+                        Ok(n.map(|v| {
+                            Inline::Text(if cmd == "romannumeral" {
+                                roman_number(v.max(0) as usize, false)
+                            } else {
+                                v.to_string()
+                            })
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            _ => {
+                let counter = self.parse_braced_text()?.trim().to_string();
+                if cmd == "value" {
+                    return Ok(Some(Inline::Text(self.counter_value(&counter).to_string())));
+                }
+                Ok(self
+                    .format_named_counter(&counter, cmd)
+                    .map(Inline::Text))
+            }
+        }
+    }
+
+    /// Format a counter in a numbering style; `None` if the counter is unknown.
+    fn format_named_counter(&self, counter: &str, style: &str) -> Option<String> {
+        let known = matches!(
+            counter,
+            "chapter" | "section" | "subsection" | "subsubsection" | "paragraph"
+                | "subparagraph" | "equation" | "figure" | "table" | "footnote" | "page"
+        );
+        if !known {
+            return None;
+        }
+        if style == "arabic" {
+            if let Some(level) = crate::state::level_of_sectioning(counter) {
+                return Some(self.state.section_number_up_to(level));
+            }
+        }
+        let n = if counter == "page" { 1 } else { self.counter_value(counter) };
+        Some(match style {
+            "roman" => roman_number(n, false),
+            "Roman" => roman_number(n, true),
+            "alph" => alpha_number(n, false),
+            "Alph" => alpha_number(n, true),
+            "fnsymbol" => ["*", "†", "‡", "§", "¶", "‖", "**", "††", "‡‡"]
+                .get(n.saturating_sub(1))
+                .unwrap_or(&"*")
+                .to_string(),
+            _ => n.to_string(),
+        })
+    }
+
+    /// Account one expansion of `name` against the global and per-macro
+    /// budgets and the nesting limits. Returns false (and warns once) when
+    /// the expansion must be refused because it is runaway recursion.
+    pub(super) fn consume_expansion_budget(&mut self, name: &str) -> bool {
+        // Leave expansions whose tokens have been fully consumed
+        let len = self.tokens.len();
+        while let Some((_, base)) = self.active_expansions.last() {
+            if *base >= len {
+                self.active_expansions.pop();
+            } else {
+                break;
+            }
+        }
+
+        let nesting = self
+            .active_expansions
+            .iter()
+            .filter(|(active, _)| active == name)
+            .count();
+        let count = self.expansion_counts.entry(name.to_string()).or_insert(0);
+        *count += 1;
+        let per_macro_limit = PER_MACRO_BASE_BUDGET
+            .saturating_add(self.source_token_count.saturating_mul(2))
+            .saturating_add(
+                self.source_command_counts
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_mul(64),
+            );
+
+        let refused = nesting >= MAX_SAME_MACRO_NESTING
+            || self.active_expansions.len() >= MAX_EXPANSION_NESTING
+            || *count > per_macro_limit
+            || self.macro_expansions >= self.macro_budget
+            || self.tokens.len() > super::MAX_PENDING_TOKENS;
+        if refused {
+            if self.refused_macros.insert(name.to_string()) {
+                self.state.warn(format!(
+                    "recursive or runaway macro `\\{}` — expansion stopped",
+                    name
+                ));
+            }
+            return false;
+        }
+        self.macro_expansions += 1;
+        self.active_expansions.push((name.to_string(), len));
+        true
+    }
+}
+
+/// Lex a fragment into tokens (without the trailing Eof).
+pub(super) fn lex_fragment(fragment: &str) -> Vec<Token> {
+    let mut tokens = Lexer::new(fragment).tokenize().unwrap_or_default();
+    if matches!(tokens.last(), Some(Token::Eof)) {
+        tokens.pop();
+    }
+    tokens
+}
+
+/// Parse a TeX number or dimension (`12`, `-3`, `2.5pt`, `1em`) to a value
+/// in points (units other than pt are converted approximately).
+fn parse_tex_dimen(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let numeric: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | ','))
+        .collect();
+    let value: f64 = numeric.replace(',', ".").parse().ok()?;
+    let unit = text[numeric.len()..].trim();
+    let factor = match unit {
+        "" | "pt" | "sp" => 1.0,
+        "in" => 72.27,
+        "cm" => 28.45,
+        "mm" => 2.845,
+        "bp" => 1.00375,
+        "pc" => 12.0,
+        "em" => 10.0,
+        "ex" => 4.3,
+        _ => 1.0,
+    };
+    Some(value * factor)
+}
+
+fn num(text: &str) -> Option<i64> {
+    text.trim().parse().ok()
+}
+
+/// `\name{arg}` -> Some("arg") if `text` starts with `prefix{`.
+fn braced_arg<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(prefix)?.trim_start();
+    let (arg, _) = split_braced(rest);
+    Some(arg).filter(|_| rest.starts_with('{'))
+}
+
+/// Split a leading `{...}` group: returns (content, remainder).
+fn split_braced(text: &str) -> (&str, &str) {
+    let text = text.trim_start();
+    if !text.starts_with('{') {
+        return ("", text);
+    }
+    let mut depth = 0;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return (&text[1..i], &text[i + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    (&text[1..], "")
+}

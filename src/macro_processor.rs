@@ -43,6 +43,7 @@ impl MacroProcessor {
                 num_params,
                 body: body.to_string(),
                 optional_param: None,
+                ..Default::default()
             },
         );
     }
@@ -147,6 +148,7 @@ impl MacroProcessor {
                 num_params,
                 body,
                 optional_param,
+                ..Default::default()
             },
         ))
     }
@@ -203,15 +205,7 @@ impl MacroProcessor {
 
         // Check built-in macros
         if let Some(def) = self.builtins.get(name) {
-            let mut result = def.body.clone();
-            
-            // Replace parameters
-            for (i, arg) in args.iter().enumerate() {
-                let placeholder = format!("#{}", i + 1);
-                result = result.replace(&placeholder, arg);
-            }
-            
-            return Some(result);
+            return Some(crate::state::substitute_params(&def.body, args));
         }
 
         None

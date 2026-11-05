@@ -81,6 +81,11 @@ pub struct Lexer {
     position: usize,
     line: usize,
     column: usize,
+    /// `@` is a letter in command names (after `\makeatletter`, and in
+    /// package/class files)
+    at_letter: bool,
+    /// expl3 syntax (`\ExplSyntaxOn`): `_` and `:` are letters
+    expl_syntax: bool,
 }
 
 impl Lexer {
@@ -90,7 +95,15 @@ impl Lexer {
             position: 0,
             line: 1,
             column: 1,
+            at_letter: false,
+            expl_syntax: false,
         }
+    }
+
+    /// Treat `@` as a letter from the start (for .sty/.cls files).
+    pub fn with_at_letter(mut self, at_letter: bool) -> Self {
+        self.at_letter = at_letter;
+        self
     }
 
     pub fn tokenize(&mut self) -> Result<Vec<Token>> {
@@ -229,13 +242,20 @@ impl Lexer {
         }
 
         // Discretionary hyphen \-, italic correction \/, spacing factor \@: no output
-        if matches!(ch, '-' | '/' | '@' | '*') {
+        if matches!(ch, '-' | '/' | '*') || (ch == '@' && !self.at_letter) {
             self.advance();
             return Ok(None);
         }
 
         // Lex command name
         let cmd_name = self.lex_command_name();
+        match cmd_name.as_str() {
+            "makeatletter" => self.at_letter = true,
+            "makeatother" => self.at_letter = false,
+            "ExplSyntaxOn" => self.expl_syntax = true,
+            "ExplSyntaxOff" => self.expl_syntax = false,
+            _ => {}
+        }
 
         if cmd_name.is_empty() {
             // Unknown control symbol: keep the symbol itself as text
@@ -304,7 +324,10 @@ impl Lexer {
 
         while !self.is_at_end() {
             let ch = self.current_char();
-            if ch.is_alphabetic() {
+            if ch.is_alphabetic()
+                || (ch == '@' && self.at_letter)
+                || (self.expl_syntax && (ch == '_' || ch == ':'))
+            {
                 name.push(ch);
                 self.advance();
             } else {
