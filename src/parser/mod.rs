@@ -10,8 +10,10 @@ use crate::state::{LabelType, MacroDef, ParserState};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+mod glossary;
 mod knowledge;
 mod math;
+mod siunitx;
 mod tex;
 
 /// Baseline budget of macro expansions per document, guarding against
@@ -205,6 +207,8 @@ pub struct Parser {
     source_token_count: usize,
     /// Total bytes produced by macro expansions so far.
     expanded_bytes: usize,
+    /// Acronyms and glossary entries by key.
+    glossary: HashMap<String, glossary::GlossaryEntry>,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -257,6 +261,7 @@ impl Parser {
             source_command_counts,
             source_token_count,
             expanded_bytes: 0,
+            glossary: HashMap::new(),
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -376,12 +381,17 @@ impl Parser {
         for inline in inlines.iter_mut() {
             match inline {
                 Inline::Ref { kind, label } => {
-                    if self.state.get_label(label).is_some() {
-                        *inline = self.render_reference(&kind.clone(), &label.clone());
+                    let rendered = self.render_reference(&kind.clone(), &label.clone());
+                    if matches!(rendered, Inline::Ref { .. }) {
+                        for key in label.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+                            if self.state.get_label(key).is_none() {
+                                let warning =
+                                    format!("unresolved reference `\\{}{{{}}}`", kind, key);
+                                self.state.warn(warning);
+                            }
+                        }
                     } else {
-                        let warning =
-                            format!("unresolved reference `\\{}{{{}}}`", kind, label);
-                        self.state.warn(warning);
+                        *inline = rendered;
                     }
                 }
                 Inline::Cite {
@@ -641,9 +651,21 @@ impl Parser {
 
                 if let Some(section_label) = &label {
                     let plain_title = self.inlines_to_plain_text(&title_inlines);
-                    self.state.add_label(
+                    let top = if self.state.has_chapters { 0 } else { 1 };
+                    let label_type = if flags.part {
+                        LabelType::Other(String::from("Part"))
+                    } else if self.state.appendix && level as usize == top {
+                        LabelType::Other(String::from("Appendix"))
+                    } else if level == 0 {
+                        LabelType::Other(String::from("Chapter"))
+                    } else {
+                        LabelType::Section
+                    };
+                    let number = self.state.current_section_number.clone();
+                    self.state.add_label_with_number(
                         section_label.clone(),
-                        LabelType::Section,
+                        label_type,
+                        number,
                         Some(plain_title),
                     );
                 }
@@ -767,6 +789,9 @@ impl Parser {
             }
             "minipage" => self.parse_transparent_environment(&env_name, 1, true),
             "multicols" | "spacing" => self.parse_transparent_environment(&env_name, 1, false),
+            // Definition containers: their \acro / \newglossaryentry
+            // commands are recorded, nothing is typeset here
+            "acronym" => self.parse_transparent_environment(&env_name, 0, true),
             "thebibliography" => self.parse_thebibliography(),
             "tikzpicture" | "tikzcd" | "pgfpicture" => {
                 // TikZ/PGF graphics - preserve as LaTeX code block
@@ -1945,6 +1970,13 @@ impl Parser {
                     break;
                 }
                 _ => {
+                    // A font declaration styles the rest of the paragraph
+                    if let Some(style) = self.current_declaration() {
+                        self.advance();
+                        let rest = trim_leading_space(self.parse_inlines_until_block_end()?);
+                        inlines.extend(apply_decl_style(&style, rest));
+                        break;
+                    }
                     if let Some(inline) = self.parse_inline()? {
                         inlines.push(inline);
                     }
@@ -1959,12 +1991,28 @@ impl Parser {
         let mut inlines = Vec::new();
 
         while !self.is_at_end() && self.current_token() != &end_token {
+            // A font declaration mid-group (`a \bf b`) styles the rest of it
+            if let Some(style) = self.current_declaration() {
+                self.advance();
+                let rest = self.parse_inlines_until(end_token)?;
+                let rest = trim_leading_space(rest);
+                inlines.extend(apply_decl_style(&style, rest));
+                break;
+            }
             if let Some(inline) = self.parse_inline()? {
                 inlines.push(inline);
             }
         }
 
         Ok(inlines)
+    }
+
+    /// The font declaration at the cursor, if any (and not redefined).
+    fn current_declaration(&self) -> Option<DeclStyle> {
+        match self.current_token() {
+            Token::Command(cmd) if !self.state.macros.contains_key(cmd) => declaration_style(cmd),
+            _ => None,
+        }
     }
 
     fn parse_inline(&mut self) -> Result<Option<Inline>> {
@@ -2098,6 +2146,33 @@ impl Parser {
         // Check for reference commands
         if self.is_reference_command(&cmd) {
             return self.parse_reference_command(&cmd);
+        }
+        if cmd == "crefrange" || cmd == "Crefrange" {
+            self.consume_text_star();
+            let first = self.parse_braced_text()?;
+            self.skip_whitespace_only();
+            let last = self.parse_braced_text()?;
+            let (a, b) = (first.trim(), last.trim());
+            match (self.state.get_label(a), self.state.get_label(b)) {
+                (Some(start), Some(end)) => {
+                    let (name, parens) =
+                        ref_type_name(start, cmd == "Crefrange", true, RefStyle::Cleveref);
+                    let wrap = |n: &str| if parens { format!("({})", n) } else { n.to_string() };
+                    return Ok(Some(Inline::Text(format!(
+                        "{} {} to {}",
+                        name,
+                        wrap(&start.number),
+                        wrap(&end.number)
+                    ))));
+                }
+                _ => {
+                    // Forward references: resolve as a list in the second pass
+                    return Ok(Some(Inline::Ref {
+                        kind: String::from(if cmd == "Crefrange" { "Cref" } else { "cref" }),
+                        label: format!("{},{}", a, b),
+                    }));
+                }
+            }
         }
 
         // Check for footnote commands
@@ -2468,6 +2543,9 @@ impl Parser {
     /// Commands described by the knowledge tables plus assorted content
     /// commands. Returns `Ok(Some(result))` when handled.
     fn parse_knowledge_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        if let Some(result) = self.parse_glossary_command(cmd)? {
+            return Ok(Some(result));
+        }
         if let Some(signature) = knowledge::setup_command(cmd) {
             self.consume_text_star();
             self.consume_signature(signature)?;
@@ -2500,6 +2578,9 @@ impl Parser {
                     Inline::Text(format!("{}{}{}", open, text, close))
                 }
             })));
+        }
+        if let Some(text) = self.parse_siunitx(cmd)? {
+            return Ok(Some(Some(Inline::Text(text))));
         }
         match cmd {
             "texorpdfstring" => {
@@ -2586,6 +2667,105 @@ impl Parser {
             return Ok(Some(Some(Inline::Text(symbol.to_string()))));
         }
         Ok(None)
+    }
+
+    /// siunitx commands, rendered with Unicode units and superscripts.
+    fn parse_siunitx(&mut self, cmd: &str) -> Result<Option<String>> {
+        let kind = match cmd {
+            "num" | "si" | "unit" | "SI" | "qty" | "ang" | "SIrange" | "qtyrange" | "numrange"
+            | "SIlist" | "qtylist" | "numlist" | "numproduct" | "qtyproduct" | "SIproduct"
+            | "tablenum" | "complexnum" | "complexqty" | "qtyrange*" => cmd,
+            _ => return Ok(None),
+        };
+        // Only treat as siunitx when an argument follows (\num could be a
+        // user's own command name elsewhere)
+        let mut look = 0;
+        while matches!(self.peek_at(look), Some(Token::Whitespace(_))) {
+            look += 1;
+        }
+        if !matches!(self.peek_at(look), Some(Token::LeftBrace) | Some(Token::LeftBracket)) {
+            return Ok(None);
+        }
+        let arg = |parser: &mut Parser| -> Result<String> {
+            parser.skip_whitespace_only();
+            while matches!(parser.current_token(), Token::LeftBracket) {
+                let _ = parser.collect_bracketed_tokens();
+                parser.skip_whitespace_only();
+            }
+            parser.parse_braced_text()
+        };
+        let nbsp = '\u{00A0}';
+        let list = |items: &[String]| -> String {
+            match items.len() {
+                0 => String::new(),
+                1 => items[0].clone(),
+                _ => format!(
+                    "{} and {}",
+                    items[..items.len() - 1].join(", "),
+                    items[items.len() - 1]
+                ),
+            }
+        };
+        Ok(Some(match kind {
+            "num" | "tablenum" | "complexnum" => siunitx::format_number(&arg(self)?),
+            "si" | "unit" => siunitx::format_unit(&arg(self)?),
+            "SI" | "qty" | "complexqty" => {
+                let number = siunitx::format_number(&arg(self)?);
+                let unit = siunitx::format_unit(&arg(self)?);
+                if unit.starts_with('°') || unit == "%" || unit.starts_with('′') || unit.starts_with('″') {
+                    format!("{}{}", number, unit)
+                } else {
+                    format!("{}{}{}", number, nbsp, unit)
+                }
+            }
+            "ang" => {
+                let spec = arg(self)?;
+                let parts: Vec<&str> = spec.split(';').collect();
+                let marks = ["°", "′", "″"];
+                parts
+                    .iter()
+                    .zip(marks.iter())
+                    .filter(|(p, _)| !p.trim().is_empty())
+                    .map(|(p, m)| format!("{}{}", siunitx::format_number(p), m))
+                    .collect::<String>()
+            }
+            "SIrange" | "qtyrange" | "qtyrange*" => {
+                let a = siunitx::format_number(&arg(self)?);
+                let b = siunitx::format_number(&arg(self)?);
+                let unit = siunitx::format_unit(&arg(self)?);
+                format!("{a}{nbsp}{unit} to {b}{nbsp}{unit}")
+            }
+            "numrange" => {
+                let a = siunitx::format_number(&arg(self)?);
+                let b = siunitx::format_number(&arg(self)?);
+                format!("{} to {}", a, b)
+            }
+            "SIlist" | "qtylist" => {
+                let items: Vec<String> = arg(self)?.split(';').map(siunitx::format_number).collect();
+                let unit = siunitx::format_unit(&arg(self)?);
+                let items: Vec<String> = items.into_iter().map(|n| format!("{}{}{}", n, nbsp, unit)).collect();
+                list(&items)
+            }
+            "numlist" => {
+                let items: Vec<String> = arg(self)?.split(';').map(siunitx::format_number).collect();
+                list(&items)
+            }
+            "numproduct" | "qtyproduct" | "SIproduct" => {
+                let spec = arg(self)?;
+                let product = spec
+                    .split('x')
+                    .map(siunitx::format_number)
+                    .collect::<Vec<_>>()
+                    .join(" × ");
+                if kind == "numproduct" {
+                    product
+                } else {
+                    let unit = siunitx::format_unit(&arg(self)?);
+                    format!("{}{}{}", product, nbsp, unit)
+                }
+            }
+            _ => return Ok(None),
+        }))
     }
 
     /// Consume the arguments of a set-up command.
@@ -2848,7 +3028,11 @@ impl Parser {
     fn is_reference_command(&self, cmd: &str) -> bool {
         matches!(
             cmd,
-            "ref" | "eqref" | "autoref" | "nameref" | "pageref" | "cref" | "Cref" | "vref"
+            "ref" | "eqref" | "autoref" | "Autoref" | "nameref" | "Nameref" | "pageref" | "cref"
+                | "Cref" | "vref" | "Vref" | "labelcref" | "cpageref" | "Cpageref"
+                | "namecref" | "nameCref" | "lcnamecref" | "namecrefs" | "nameCrefs"
+                | "lcnamecrefs" | "subref" | "labelcpageref" | "vpageref" | "zref"
+                | "cref*" | "Cref*" | "autoref*" | "ref*" | "fref" | "Fref" | "prettyref"
         )
     }
     
@@ -2893,58 +3077,94 @@ impl Parser {
     }
     
     fn parse_reference_command(&mut self, cmd: &str) -> Result<Option<Inline>> {
+        self.consume_text_star();
+        self.skip_whitespace_only();
+        if matches!(self.current_token(), Token::LeftBracket) {
+            let _ = self.parse_bracketed_text()?;
+        }
         let label = self.parse_braced_text()?;
-        Ok(Some(self.render_reference(cmd, &label)))
+        let kind = match cmd {
+            "fref" | "vref" | "prettyref" | "zref" => "cref",
+            "Fref" | "Vref" => "Cref",
+            "subref" | "vpageref" => "ref",
+            other => other,
+        };
+        Ok(Some(self.render_reference(kind, &label)))
     }
 
-    /// Render a \ref-family command against the label table.
-    /// Unresolved labels stay as `Inline::Ref` so a later pass (after the
-    /// whole document is parsed) can resolve forward references.
-    fn render_reference(&self, kind: &str, label: &str) -> Inline {
-        let Some(label_info) = self.state.get_label(label) else {
+    /// Render a \ref-family command against the label table. `labels` may
+    /// be a comma-separated list (cleveref). Unresolved labels stay as
+    /// `Inline::Ref` so the post-parse pass can resolve forward references.
+    fn render_reference(&self, kind: &str, labels: &str) -> Inline {
+        let keys: Vec<&str> = labels.split(',').map(str::trim).filter(|l| !l.is_empty()).collect();
+        let infos: Vec<&crate::state::LabelInfo> = keys.iter().filter_map(|k| self.state.get_label(k)).collect();
+        if keys.is_empty() || infos.len() != keys.len() {
             return Inline::Ref {
                 kind: kind.to_string(),
-                label: label.to_string(),
+                label: labels.to_string(),
             };
-        };
+        }
 
-        let type_prefix = || -> &str {
-            match &label_info.label_type {
-                LabelType::Section => "Section",
-                LabelType::Figure => "Figure",
-                LabelType::Table => "Table",
-                LabelType::Equation => "Equation",
-                LabelType::Theorem => "Theorem",
-                LabelType::Lemma => "Lemma",
-                LabelType::Definition => "Definition",
-                LabelType::Other(name) => name.as_str(),
-            }
-        };
-
+        let number_of = |info: &crate::state::LabelInfo| info.number.clone();
         let text = match kind {
-            "nameref" => label_info
-                .title
-                .clone()
-                .unwrap_or_else(|| label.to_string()),
-            "eqref" => format!("({})", label_info.number),
-            "autoref" | "Cref" | "cref" | "vref" => {
-                let prefix = type_prefix();
-                let prefix = if kind == "cref" {
-                    prefix.to_lowercase()
-                } else {
-                    prefix.to_string()
-                };
-                if label_info.number.is_empty() {
-                    prefix
-                } else {
-                    format!("{} {}", prefix, label_info.number)
-                }
+            "nameref" | "Nameref" => infos[0].title.clone().unwrap_or_else(|| keys[0].to_string()),
+            "eqref" => infos
+                .iter()
+                .map(|i| format!("({})", number_of(i)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            "namecref" | "nameCref" | "lcnamecref" | "namecrefs" | "nameCrefs" | "lcnamecrefs" => {
+                let capital = kind.starts_with("nameC");
+                let plural = kind.ends_with('s');
+                ref_type_name(infos[0], capital, plural, RefStyle::Cleveref).0
             }
-            _ => label_info.number.clone(),
+            "cref" | "Cref" | "vref" | "Vref" | "cpageref" | "Cpageref" | "autoref" | "Autoref" => {
+                let style = if kind.ends_with("autoref") || kind == "Autoref" {
+                    RefStyle::Hyperref
+                } else {
+                    RefStyle::Cleveref
+                };
+                let capital = kind.starts_with(|c: char| c.is_uppercase()) || style == RefStyle::Hyperref;
+                // Group consecutive references of the same type
+                let mut groups: Vec<(String, bool, Vec<String>)> = Vec::new();
+                for info in &infos {
+                    let (singular, parens) = ref_type_name(info, false, false, style);
+                    match groups.last_mut() {
+                        Some((name, _, numbers)) if *name == singular => numbers.push(number_of(info)),
+                        _ => groups.push((singular, parens, vec![number_of(info)])),
+                    }
+                }
+                let rendered: Vec<String> = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(gi, (_, parens, numbers))| {
+                        let info = infos
+                            .iter()
+                            .find(|i| ref_type_name(i, false, false, style).0 == groups[gi].0)
+                            .unwrap();
+                        let (name, _) = ref_type_name(info, capital && gi == 0, numbers.len() > 1, style);
+                        let numbers: Vec<String> = numbers
+                            .iter()
+                            .map(|n| if *parens { format!("({})", n) } else { n.clone() })
+                            .collect();
+                        let list = join_and(&numbers);
+                        if list.is_empty() {
+                            name
+                        } else if name.is_empty() {
+                            list
+                        } else {
+                            format!("{} {}", name, list)
+                        }
+                    })
+                    .collect();
+                join_and(&rendered)
+            }
+            // \ref, \pageref, \labelcref, ... : the number(s) only
+            _ => join_and(&infos.iter().map(|i| number_of(i)).collect::<Vec<_>>()),
         };
         Inline::Text(text)
     }
-    
+
     fn parse_macro_expansion(&mut self, cmd: &str) -> Result<Option<Inline>> {
         let args = self.parse_macro_arguments(cmd)?;
 
@@ -2999,12 +3219,7 @@ impl Parser {
             if inlines.is_empty() {
                 break;
             }
-            inlines = match style {
-                DeclStyle::Strong => vec![Inline::Strong(inlines)],
-                DeclStyle::Emph => vec![Inline::Emph(inlines)],
-                DeclStyle::SmallCaps => vec![Inline::SmallCaps(inlines)],
-                DeclStyle::Plain => inlines,
-            };
+            inlines = apply_decl_style(style, inlines);
         }
 
         // Return as a span or flatten
@@ -4440,7 +4655,36 @@ enum DeclStyle {
     Strong,
     Emph,
     SmallCaps,
+    Mono,
     Plain,
+}
+
+/// Wrap inlines in the inline type a font declaration stands for.
+fn apply_decl_style(style: &DeclStyle, inlines: Vec<Inline>) -> Vec<Inline> {
+    if inlines.is_empty() {
+        return inlines;
+    }
+    match style {
+        DeclStyle::Strong => vec![Inline::Strong(inlines)],
+        DeclStyle::Emph => vec![Inline::Emph(inlines)],
+        DeclStyle::SmallCaps => vec![Inline::SmallCaps(inlines)],
+        DeclStyle::Mono => {
+            // Monospace text is code when it is plain text
+            if inlines.iter().all(|i| matches!(i, Inline::Text(_) | Inline::Space)) {
+                let text: String = inlines
+                    .iter()
+                    .map(|i| match i {
+                        Inline::Text(t) => t.as_str(),
+                        _ => " ",
+                    })
+                    .collect();
+                vec![Inline::Code(text.trim().to_string())]
+            } else {
+                inlines
+            }
+        }
+        DeclStyle::Plain => inlines,
+    }
 }
 
 fn declaration_style(cmd: &str) -> Option<DeclStyle> {
@@ -4448,7 +4692,8 @@ fn declaration_style(cmd: &str) -> Option<DeclStyle> {
         "bf" | "bfseries" => DeclStyle::Strong,
         "it" | "itshape" | "em" | "sl" | "slshape" => DeclStyle::Emph,
         "sc" | "scshape" => DeclStyle::SmallCaps,
-        "rm" | "sf" | "tt" | "rmfamily" | "sffamily" | "ttfamily" | "normalfont"
+        "tt" | "ttfamily" => DeclStyle::Mono,
+        "rm" | "sf" | "rmfamily" | "sffamily" | "normalfont"
         | "mdseries" | "upshape" | "normalsize" | "small" | "footnotesize" | "scriptsize"
         | "tiny" | "large" | "Large" | "LARGE" | "huge" | "Huge" => DeclStyle::Plain,
         _ => return None,
@@ -4478,6 +4723,15 @@ fn is_table_rule_command(cmd: &str) -> bool {
             | "endfoot"
             | "endlastfoot"
     )
+}
+
+/// Drop leading spaces (the space after a declaration like `\bf ` is
+/// skipped by TeX's tokenizer).
+fn trim_leading_space(mut inlines: Vec<Inline>) -> Vec<Inline> {
+    while matches!(inlines.first(), Some(Inline::Space)) {
+        inlines.remove(0);
+    }
+    inlines
 }
 
 /// Strip leading/trailing whitespace-like inlines from a cell or fragment.
@@ -4714,6 +4968,90 @@ fn eqnarray_row_to_aligned(row: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RefStyle {
+    /// cleveref: lowercase names in \cref, eq. (1)
+    Cleveref,
+    /// hyperref \autoref: capitalized names, plain numbers
+    Hyperref,
+}
+
+/// Name for a referenced label's type, and whether its number is shown in
+/// parentheses (equations under cleveref).
+fn ref_type_name(
+    info: &crate::state::LabelInfo,
+    capital: bool,
+    plural: bool,
+    style: RefStyle,
+) -> (String, bool) {
+    let (singular, parens) = match &info.label_type {
+        LabelType::Section => ("section", false),
+        LabelType::Figure if style == RefStyle::Cleveref && !capital => ("fig.", false),
+        LabelType::Figure => ("figure", false),
+        LabelType::Table => ("table", false),
+        LabelType::Equation if style == RefStyle::Cleveref => {
+            (if capital { "eq." } else { "eq." }, true)
+        }
+        LabelType::Equation => ("equation", false),
+        LabelType::Theorem => ("theorem", false),
+        LabelType::Lemma => ("lemma", false),
+        LabelType::Definition => ("definition", false),
+        LabelType::Other(name) => {
+            let lower = name.to_lowercase();
+            let mut word = lower.clone();
+            if plural {
+                word = pluralize(&word);
+            }
+            return (if capital { capitalize_first(&word) } else { word }, false);
+        }
+    };
+    let mut word = singular.to_string();
+    if plural {
+        word = match word.as_str() {
+            "fig." => "figs.".to_string(),
+            "eq." => "eqs.".to_string(),
+            other => pluralize(other),
+        };
+    }
+    if capital {
+        word = match word.as_str() {
+            "fig." => "Figure".to_string(),
+            "figs." => "Figures".to_string(),
+            other => capitalize_first(other),
+        };
+    }
+    (word, parens)
+}
+
+fn pluralize(word: &str) -> String {
+    if word.ends_with("ix") {
+        format!("{}ices", &word[..word.len() - 2])
+    } else if word.ends_with('s') || word.ends_with('x') {
+        format!("{}es", word)
+    } else if word.ends_with('y') && !word.ends_with("ey") {
+        format!("{}ies", &word[..word.len() - 1])
+    } else {
+        format!("{}s", word)
+    }
+}
+
+fn capitalize_first(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(items: &[String]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].clone(),
+        _ => format!("{} and {}", items[..items.len() - 1].join(", "), items[items.len() - 1]),
+    }
 }
 
 /// A list of inlines as one inline.

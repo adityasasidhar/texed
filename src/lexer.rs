@@ -89,6 +89,9 @@ pub struct Lexer {
     /// Lexing math content: no text ligatures or smart quotes, escaped
     /// characters keep their backslash, no raw environment capture.
     math_mode: bool,
+    /// Tokens produced by a multi-token construct, emitted before lexing
+    /// continues (stored in emission order).
+    pending: Vec<Token>,
 }
 
 impl Lexer {
@@ -101,6 +104,7 @@ impl Lexer {
             at_letter: false,
             expl_syntax: false,
             math_mode: false,
+            pending: Vec::new(),
         }
     }
 
@@ -123,8 +127,9 @@ impl Lexer {
         while !self.is_at_end() {
             match self.next_token()? {
                 Some(token) => tokens.push(token),
-                None => continue,
+                None => {}
             }
+            tokens.append(&mut self.pending);
         }
 
         tokens.push(Token::Eof);
@@ -336,8 +341,39 @@ impl Lexer {
         }
 
         // \verb|...| and friends capture raw content with arbitrary delimiters
-        if cmd_name == "verb" || cmd_name == "lstinline" || cmd_name == "Verb" {
+        if matches!(cmd_name.as_str(), "verb" | "lstinline" | "Verb" | "spverb" | "mintinline"
+            | "pyth" | "cppinline" | "inlinecode")
+        {
+            if cmd_name == "mintinline" {
+                // \mintinline[opts]{lang}{code} or \mintinline{lang}|code|
+                self.skip_optional_bracket_group();
+                let _ = self.read_simple_group();
+            } else if cmd_name != "verb" {
+                // \lstinline[language=C]|code|
+                self.skip_optional_bracket_group();
+            }
             return self.lex_verb();
+        }
+
+        // URL arguments are verbatim in LaTeX: % # ~ _ & are literal there
+        if matches!(cmd_name.as_str(), "url" | "nolinkurl" | "path" | "burl" | "href" | "doi"
+            | "email" | "uri")
+        {
+            let start = self.position;
+            self.skip_inline_spaces_before_group();
+            if !self.is_at_end() && self.current_char() == '[' && cmd_name == "href" {
+                // \href[options]{url}{text}: leave options to the parser
+                self.rewind_to(start);
+                return Ok(Some(Token::Command(cmd_name)));
+            }
+            if let Some(raw) = self.read_verbatim_group() {
+                self.pending.push(Token::LeftBrace);
+                self.pending.push(Token::Text(raw));
+                self.pending.push(Token::RightBrace);
+                return Ok(Some(Token::Command(cmd_name)));
+            }
+            self.rewind_to(start);
+            return Ok(Some(Token::Command(cmd_name)));
         }
 
         // Handle specific commands
@@ -364,6 +400,67 @@ impl Lexer {
         }
     }
 
+    /// Skip a `[...]` group directly at the cursor (verbatim, no nesting).
+    fn skip_optional_bracket_group(&mut self) {
+        if !self.is_at_end() && self.current_char() == '[' {
+            let mut look = self.position + 1;
+            while look < self.input.len() && self.input[look] != ']' && self.input[look] != '\n' {
+                look += 1;
+            }
+            if look < self.input.len() && self.input[look] == ']' {
+                while self.position <= look {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    /// Read a `{...}` group verbatim (balanced braces, no comment or escape
+    /// processing, single paragraph). Consumes it on success.
+    fn read_verbatim_group(&mut self) -> Option<String> {
+        if self.is_at_end() || self.current_char() != '{' {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut look = self.position;
+        let mut content = String::new();
+        while look < self.input.len() {
+            let ch = self.input[look];
+            match ch {
+                '{' => {
+                    depth += 1;
+                    if depth > 1 {
+                        content.push(ch);
+                    }
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        while self.position <= look {
+                            self.advance();
+                        }
+                        return Some(content);
+                    }
+                    content.push(ch);
+                }
+                '\n' => {
+                    if look + 1 < self.input.len() && self.input[look + 1] == '\n' {
+                        return None;
+                    }
+                }
+                // `\%` and `\#` in URLs are escapes for the literal character
+                '\\' if look + 1 < self.input.len() && matches!(self.input[look + 1], '%' | '#' | '&' | '_' | '~' | '$') => {
+                    content.push(self.input[look + 1]);
+                    look += 2;
+                    continue;
+                }
+                _ => content.push(ch),
+            }
+            look += 1;
+        }
+        None
+    }
+
     fn lex_verb(&mut self) -> Result<Option<Token>> {
         // Optional star variant (\verb*)
         if !self.is_at_end() && self.current_char() == '*' {
@@ -378,10 +475,21 @@ impl Lexer {
         self.advance();
         let close = if delim == '{' { '}' } else { delim };
 
-        // \verb cannot span lines: an unterminated \verb ends at the line end
+        // \verb cannot span lines: an unterminated \verb ends at the line end.
+        // A `{`-delimited body (\mintinline, \lstinline{...}) nests braces.
         let mut content = String::new();
-        while !self.is_at_end() && self.current_char() != close && self.current_char() != '\n' {
-            content.push(self.current_char());
+        let mut depth = 0usize;
+        while !self.is_at_end() && self.current_char() != '\n' {
+            let ch = self.current_char();
+            if delim == '{' && ch == '{' {
+                depth += 1;
+            } else if ch == close {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            content.push(ch);
             self.advance();
         }
         if !self.is_at_end() && self.current_char() == close {

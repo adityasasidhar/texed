@@ -122,8 +122,6 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "index" | "glossary"
         | "indexentry" => sig(true, 1, false),
         "nomenclature" => sig(true, 2, false),
-        "newglossaryentry" | "longnewglossaryentry" => sig(false, 2, false),
-        "newacronym" => sig(true, 3, false),
         "vspace" | "hspace" | "addvspace" | "enlargethispage" | "linethickness" => sig(false, 1, false),
         "vspace*" | "hspace*" => sig(false, 1, false),
         "rule" => sig(true, 2, false),
@@ -139,7 +137,6 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "preto" | "appto" | "gappto" | "gpreto" | "eappto" | "xappto" => sig(false, 2, false),
         "csdef" | "csgdef" | "csedef" | "csxdef" => sig(false, 2, false),
         "bibpunct" => sig(true, 6, false),
-        "newacro" | "DeclareAcronym" => sig(true, 2, false),
         "acsetup" | "glsdisablehyper" | "setacronymstyle" | "setglossarystyle" => sig(false, 1, false),
         "ccsdesc" | "acmConference" | "acmBooktitle" | "acmDOI"
         | "acmISBN" | "acmYear" | "acmPrice" | "copyrightyear" | "acmJournal" | "acmVolume"
