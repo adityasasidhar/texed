@@ -216,6 +216,23 @@ impl Lexer {
             }
         }
 
+        // expl3 syntax: spaces and line ends are ignored, `~` is a space
+        if self.expl_syntax {
+            match ch {
+                ' ' | '\t' | '\r' | '\n' => {
+                    while !self.is_at_end() && matches!(self.current_char(), ' ' | '\t' | '\r' | '\n') {
+                        self.advance();
+                    }
+                    return Ok(None);
+                }
+                '~' => {
+                    self.advance();
+                    return Ok(Some(Token::Whitespace(String::from(" "))));
+                }
+                _ => {}
+            }
+        }
+
         // A \MakeShortVerb character: |code| is inline verbatim
         if self.short_verb_chars.contains(&ch) {
             self.advance();
@@ -358,7 +375,14 @@ impl Lexer {
         }
 
         // Lex command name
-        let cmd_name = self.lex_command_name();
+        let mut cmd_name = self.lex_command_name();
+        // expl3 names for TeX primitives: the TeX conditional engine and
+        // kernel helpers handle them under their classic names
+        if self.expl_syntax && cmd_name.contains(':') {
+            if let Some(primitive) = expl_primitive(&cmd_name) {
+                cmd_name = primitive.to_string();
+            }
+        }
         match cmd_name.as_str() {
             "makeatletter" => self.at_letter = true,
             "makeatother" => self.at_letter = false,
@@ -428,9 +452,12 @@ impl Lexer {
             return Ok(Some(Token::Command(cmd_name)));
         }
 
-        if matches!(cmd_name.as_str(), "verb" | "lstinline" | "Verb" | "spverb" | "mintinline"
+        // (expl3 code is programming: an inline-verbatim command there is
+        // part of a definition, read when the definition runs)
+        if (matches!(cmd_name.as_str(), "verb" | "lstinline" | "Verb" | "spverb" | "mintinline"
             | "pyth" | "cppinline" | "inlinecode")
-            || self.verb_commands.contains(&cmd_name)
+            || self.verb_commands.contains(&cmd_name))
+            && !self.expl_syntax
         {
             if cmd_name == "mintinline" {
                 // \mintinline[opts]{lang}{code} or \mintinline{lang}|code|
@@ -593,7 +620,21 @@ impl Lexer {
             self.advance();
         }
 
-        if self.is_at_end() {
+        // TeX skips the spaces (and line end) after a control word, and
+        // expl3 code ignores spaces: the delimiter is the next visible
+        // character, but never across a blank line
+        let mut newlines = 0;
+        while !self.is_at_end() && matches!(self.current_char(), ' ' | '\t' | '\n') {
+            if self.current_char() == '\n' {
+                newlines += 1;
+                if newlines > 1 {
+                    break;
+                }
+            }
+            self.advance();
+        }
+
+        if self.is_at_end() || self.current_char() == '\n' {
             return Ok(Some(Token::Command(String::from("verb"))));
         }
 
@@ -1220,6 +1261,51 @@ impl Lexer {
     fn is_at_end(&self) -> bool {
         self.position >= self.input.len()
     }
+}
+
+/// The classic TeX/LaTeX name of an expl3 primitive or kernel helper.
+fn expl_primitive(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "else:" => "else",
+        "fi:" => "fi",
+        "or:" => "or",
+        "if_true:" => "iftrue",
+        "if_false:" => "iffalse",
+        "if_meaning:w" => "ifx",
+        "if_int_compare:w" => "ifnum",
+        "if_int_odd:w" => "ifodd",
+        "if_dim:w" => "ifdim",
+        "if_case:w" => "ifcase",
+        "if_catcode:w" => "ifcat",
+        "if_charcode:w" => "if",
+        "if:w" => "if",
+        "if_mode_math:" => "ifmmode",
+        "if_mode_horizontal:" => "ifhmode",
+        "if_mode_vertical:" => "ifvmode",
+        "if_mode_inner:" => "ifinner",
+        "if_cs_exist:N" => "ifdefined",
+        "if_eof:w" => "ifeof",
+        "if_hbox:N" => "ifhbox",
+        "if_vbox:N" => "ifvbox",
+        "if_box_empty:N" => "ifvoid",
+        "exp_after:wN" => "expandafter",
+        "exp_stop_f:" | "scan_stop:" | "prg_do_nothing:" => "relax",
+        "use_none:n" => "@gobble",
+        "use_none:nn" => "@gobbletwo",
+        "use_i:nn" => "@firstoftwo",
+        "use_ii:nn" => "@secondoftwo",
+        "use_i:nnn" => "@firstofthree",
+        "group_begin:" => "begingroup",
+        "group_end:" => "endgroup",
+        "tex_def:D" => "def",
+        "tex_edef:D" => "edef",
+        "tex_gdef:D" => "gdef",
+        "tex_let:D" => "let",
+        "tex_relax:D" => "relax",
+        "tex_par:D" => "par",
+        "par:" => "par",
+        _ => return None,
+    })
 }
 
 /// Find environments a text defines as verbatim, with their listing

@@ -3261,7 +3261,7 @@ impl Parser {
                 return Ok(Some(None));
             }
             "hbox:n" | "vbox:n" | "hbox_overlap_right:n" | "hbox_overlap_left:n" | "hbox_overlap_center:n"
-            | "text_uppercase:n" | "text_lowercase:n" | "use:n" | "exp_not:n" | "tl_to_str:n" | "str_use:N"
+            | "text_uppercase:n" | "text_lowercase:n" | "use:n" | "exp_not:n" | "tl_to_str:n"
             | "text_titlecase:n" | "text_titlecase_first:n" => {
                 self.skip_whitespace_only();
                 let tokens = self.collect_braced_tokens();
@@ -3274,6 +3274,87 @@ impl Parser {
                     _ => tokens,
                 };
                 self.push_front(tokens);
+                return Ok(Some(None));
+            }
+            // x-/e-type expansion: constants, token-list variables and
+            // \exp_not:N resolved, then the result is read again
+            "use:x" | "use:e" => {
+                self.skip_whitespace_only();
+                let tokens = self.collect_braced_tokens();
+                let text = self.x_expand_tokens(&tokens, 0);
+                self.push_front(tex::lex_fragment(&text));
+                return Ok(Some(None));
+            }
+            // token-list / string variables are parameterless macros
+            "tl_set:Nn" | "tl_gset:Nn" | "tl_set:Nx" | "tl_gset:Nx" | "tl_set:Ne" | "tl_gset:Ne"
+            | "tl_set:No" | "tl_gset:No" | "str_set:Nn" | "str_gset:Nn" | "str_set:Nx" | "str_gset:Nx"
+            | "str_set:Ne" | "str_gset:Ne" | "tl_const:Nn" | "tl_const:Nx" | "tl_const:Ne" | "str_const:Nn"
+            | "tl_put_right:Nn" | "tl_gput_right:Nn" | "tl_put_right:Nx" | "tl_gput_right:Nx"
+            | "tl_put_right:Ne" | "tl_gput_right:Ne" | "tl_put_left:Nn" | "tl_gput_left:Nn"
+            | "tl_put_left:Nx" | "tl_gput_left:Nx" | "str_put_right:Nn" | "str_gput_right:Nn" => {
+                self.skip_whitespace_and_comments();
+                let Token::Command(name) = self.current_token().clone() else {
+                    return Ok(None);
+                };
+                self.advance();
+                self.skip_whitespace_and_comments();
+                let tokens = self.collect_braced_tokens();
+                let value = if cmd.ends_with('x') || cmd.ends_with('e') || cmd.ends_with('o') {
+                    self.x_expand_tokens(&tokens, 0)
+                } else {
+                    self.raw_token_text(&tokens)
+                };
+                let old = self.state.macros.get(&name).filter(|d| d.num_params == 0).map(|d| d.body.clone());
+                let body = if cmd.contains("put_right") {
+                    format!("{}{}", old.unwrap_or_default(), value)
+                } else if cmd.contains("put_left") {
+                    format!("{}{}", value, old.unwrap_or_default())
+                } else {
+                    value
+                };
+                if body.len() <= 1 << 20 {
+                    self.state.macros.insert(name, MacroDef { body, ..Default::default() });
+                }
+                return Ok(Some(None));
+            }
+            "tl_new:N" | "tl_gnew:N" | "str_new:N" | "tl_clear:N" | "tl_gclear:N" | "str_clear:N"
+            | "str_gclear:N" | "tl_clear_new:N" | "tl_gclear_new:N" => {
+                self.skip_whitespace_and_comments();
+                if let Token::Command(name) = self.current_token().clone() {
+                    self.advance();
+                    let keep = cmd.ends_with("new:N") && self.state.macros.contains_key(&name);
+                    if !keep {
+                        self.state.macros.insert(name, MacroDef::default());
+                    }
+                }
+                return Ok(Some(None));
+            }
+            "tl_set_eq:NN" | "tl_gset_eq:NN" | "str_set_eq:NN" | "str_gset_eq:NN" => {
+                let mut names = Vec::new();
+                for _ in 0..2 {
+                    self.skip_whitespace_and_comments();
+                    if let Token::Command(name) = self.current_token().clone() {
+                        self.advance();
+                        names.push(name);
+                    }
+                }
+                if let [a, b] = &names[..] {
+                    let def = self.state.macros.get(b).cloned().unwrap_or_default();
+                    self.state.macros.insert(a.clone(), def);
+                }
+                return Ok(Some(None));
+            }
+            "tl_use:N" | "str_use:N" | "tl_to_str:N" => {
+                self.skip_whitespace_and_comments();
+                if let Token::Command(name) = self.current_token().clone() {
+                    self.advance();
+                    let body = self.state.macros.get(&name).filter(|d| d.num_params == 0).map(|d| d.body.clone());
+                    if let Some(body) = body {
+                        if self.consume_expansion_budget(&name) && self.consume_expansion_bytes(&name, body.len()) {
+                            self.push_front(tex::lex_fragment(&body));
+                        }
+                    }
+                }
                 return Ok(Some(None));
             }
             _ => {}
@@ -3342,11 +3423,12 @@ impl Parser {
         }
         // expl3 code ignores spaces; `~` is the space
         let body = self.collect_braced_tokens();
+        // (the lexer already dropped expl3's ignored spaces; `~` is a space)
         let body: String = body
             .iter()
-            .filter(|t| !matches!(t, Token::Whitespace(_) | Token::Newline))
             .map(|t| match t {
-                Token::Tilde => String::from("\\space{}"),
+                Token::Whitespace(_) | Token::Tilde => String::from("~"),
+                Token::Newline => String::new(),
                 other => self.token_to_string(other),
             })
             .collect();
@@ -3358,6 +3440,115 @@ impl Parser {
         let tokens = tex::lex_fragment(&source);
         self.push_front(tokens);
         Ok(Some(None))
+    }
+
+    /// Tokens as source text, without re-escaping (an expansion's body).
+    fn raw_token_text(&mut self, tokens: &[Token]) -> String {
+        let was = std::mem::replace(&mut self.in_math_expansion, true);
+        let text: String = tokens.iter().map(|t| self.token_to_string(t)).collect();
+        self.in_math_expansion = was;
+        text
+    }
+
+    /// expl3 x-type expansion of a token list, as text: character constants,
+    /// parameterless expl3 variables (`\l_my_tl`) and `\exp_not:N`/`:n` are
+    /// resolved; other commands are kept. Spaces are ignored (expl3 syntax),
+    /// `~` is a space.
+    fn x_expand_tokens(&mut self, tokens: &[Token], depth: usize) -> String {
+        let was = std::mem::replace(&mut self.in_math_expansion, true);
+        let mut out = String::new();
+        let mut i = 0;
+        while i < tokens.len() && out.len() < 1 << 20 {
+            match &tokens[i] {
+                Token::Newline | Token::Comment(_) => {}
+                // spaces left in expl3 code are explicit (`~`)
+                Token::Whitespace(_) | Token::Tilde => out.push(' '),
+                Token::Command(name) if name == "exp_not:N" || name == "exp_not:n" || name == "exp_not:V" => {
+                    // the next token (or group) as is
+                    i += 1;
+                    while matches!(tokens.get(i), Some(Token::Whitespace(_) | Token::Newline)) {
+                        i += 1;
+                    }
+                    if name == "exp_not:n" && matches!(tokens.get(i), Some(Token::LeftBrace)) {
+                        // the group's content, verbatim
+                        let mut level = 0usize;
+                        while i < tokens.len() {
+                            match &tokens[i] {
+                                Token::LeftBrace => {
+                                    if level > 0 {
+                                        out.push('{');
+                                    }
+                                    level += 1;
+                                }
+                                Token::RightBrace => {
+                                    level -= 1;
+                                    if level == 0 {
+                                        break;
+                                    }
+                                    out.push('}');
+                                }
+                                t => out.push_str(&self.token_to_string(t)),
+                            }
+                            i += 1;
+                        }
+                    } else if let Some(t) = tokens.get(i) {
+                        out.push_str(&self.token_to_string(t));
+                        // keep a control word apart from letters after it
+                        let next = tokens[i + 1..].iter().find(|t| !matches!(t, Token::Whitespace(_) | Token::Newline));
+                        if matches!(t, Token::Command(n) if n.chars().all(|c| c.is_alphabetic()))
+                            && matches!(next, Some(Token::Text(x)) if x.starts_with(|c: char| c.is_alphabetic()))
+                        {
+                            out.push(' ');
+                        }
+                    }
+                }
+                Token::Command(name) => {
+                    let constant = match name.as_str() {
+                        "c_backslash_str" => Some("\\"),
+                        "c_left_brace_str" => Some("{"),
+                        "c_right_brace_str" => Some("}"),
+                        "c_hash_str" => Some("#"),
+                        "c_percent_str" => Some("%"),
+                        "c_colon_str" => Some(":"),
+                        "c_underscore_str" => Some("_"),
+                        "c_tilde_str" => Some("~"),
+                        "c_ampersand_str" => Some("&"),
+                        "c_space_tl" | "c_space_str" => Some(" "),
+                        "c_empty_tl" | "c_empty_str" => Some(""),
+                        _ => None,
+                    };
+                    let variable = self
+                        .state
+                        .macros
+                        .get(name)
+                        .filter(|d| d.num_params == 0 && name.contains('_') && !name.contains(':'))
+                        .map(|d| d.body.clone());
+                    if let Some(c) = constant {
+                        out.push_str(c);
+                    } else if let Some(body) = variable {
+                        if depth < 16 {
+                            let tokens = tex::lex_fragment(&body);
+                            out.push_str(&self.x_expand_tokens(&tokens, depth + 1));
+                        }
+                    } else if name.contains('_') && !name.contains(':') && name.starts_with(['l', 'g', 'c']) {
+                        // an unknown expl3 variable: empty
+                    } else {
+                        out.push_str(&self.token_to_string(&tokens[i]));
+                        if name.chars().all(|c| c.is_alphabetic()) {
+                            if let Some(Token::Text(t)) = tokens.get(i + 1) {
+                                if t.starts_with(|c: char| c.is_alphabetic()) {
+                                    out.push(' ');
+                                }
+                            }
+                        }
+                    }
+                }
+                t => out.push_str(&self.token_to_string(t)),
+            }
+            i += 1;
+        }
+        self.in_math_expansion = was;
+        out
     }
 
     /// Commands described by the knowledge tables plus assorted content
