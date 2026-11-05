@@ -347,6 +347,22 @@ pub fn prescan_verbatim_definitions(
     while let Some((content, depth)) = queue.pop() {
         envs.extend(crate::lexer::scan_verbatim_env_definitions(&content).into_iter().map(|(n, _)| n));
         commands.extend(crate::lexer::scan_verb_command_definitions(&content));
+        // l3doc makes | and " short-verb characters
+        if depth == 0 && uses_class(&content, "l3doc") {
+            for c in ['|', '"'] {
+                commands.push(format!("texed@shortverb:{}", c));
+            }
+        }
+        // a package's \MakeShortVerb{\|} applies to the document from the
+        // start (the main file's own takes effect where it appears)
+        if depth > 0 {
+            for c in short_verb_chars(&content) {
+                let marker = format!("texed@shortverb:{}", c);
+                if !commands.contains(&marker) {
+                    commands.push(marker);
+                }
+            }
+        }
         if depth >= 6 || files_read >= 200 {
             continue;
         }
@@ -372,6 +388,57 @@ pub fn prescan_verbatim_definitions(
         }
     }
     (envs, commands)
+}
+
+/// Whether the text's `\documentclass` is `class`.
+fn uses_class(text: &str, class: &str) -> bool {
+    let Some(pos) = text.find("\\documentclass") else {
+        return false;
+    };
+    let rest = &text[pos + "\\documentclass".len()..];
+    let rest = rest.trim_start();
+    let rest = match rest.strip_prefix('[') {
+        Some(r) => r.find(']').map(|e| &r[e + 1..]).unwrap_or(r),
+        None => rest,
+    };
+    rest.trim_start()
+        .strip_prefix('{')
+        .and_then(|r| r.find('}').map(|e| r[..e].trim() == class))
+        .unwrap_or(false)
+}
+
+/// Characters a text makes inline-verbatim delimiters with
+/// `\MakeShortVerb{\|}` (and does not delete again).
+fn short_verb_chars(text: &str) -> Vec<char> {
+    let mut chars: Vec<char> = Vec::new();
+    for (pattern, add) in [("\\MakeShortVerb", true), ("\\DeleteShortVerb", false)] {
+        let mut search = 0;
+        while let Some(pos) = text[search..].find(pattern) {
+            let start = search + pos + pattern.len();
+            search = start;
+            let line_start = text[..search - pattern.len()].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            if text[line_start..search - pattern.len()].contains('%') {
+                continue;
+            }
+            let rest = text[start..].trim_start_matches('*').trim_start();
+            let rest = rest.strip_prefix('{').unwrap_or(rest);
+            let mut it = rest.chars();
+            if it.next() == Some('\\') {
+                if let Some(c) = it.next() {
+                    if !c.is_alphanumeric() && !c.is_whitespace() {
+                        if add {
+                            if !chars.contains(&c) {
+                                chars.push(c);
+                            }
+                        } else {
+                            chars.retain(|x| *x != c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    chars
 }
 
 /// Local file names a text loads, with the extensions to try.

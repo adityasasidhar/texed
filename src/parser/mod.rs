@@ -245,6 +245,13 @@ pub struct Parser {
     /// babel shorthands: character sequences in text replaced by LaTeX
     /// (`"a` -> ä with german, `\defineshorthand{!!}{\foo}`).
     shorthands: Vec<(String, String)>,
+    /// TeX count registers (`\newcount\x`, `\countdef`, `\chardef`) and values.
+    count_registers: HashMap<String, i64>,
+    /// Environments currently open through a built-in parser although the
+    /// document redefined them (see `parse_environment`).
+    builtin_open: HashMap<String, usize>,
+    /// Bodies of plain TeX `\loop`s and how many rounds each ran.
+    loop_bodies: Vec<(Vec<Token>, usize)>,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -312,6 +319,9 @@ impl Parser {
             si_units: HashMap::new(),
             subfiles_loaded: false,
             shorthands: Vec::new(),
+            count_registers: HashMap::new(),
+            builtin_open: HashMap::new(),
+            loop_bodies: Vec::new(),
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -713,7 +723,7 @@ impl Parser {
                 self.document_ended = true;
                 Ok(None)
             }
-            Token::EndEnvironment(env) if self.state.environments.contains_key(env) => {
+            Token::EndEnvironment(env) if self.state.environments.contains_key(env) && !self.builtin_owns(env) => {
                 // Closing a user-defined environment: splice its end-definition
                 let end_def = self.state.environments[env].end_def.clone();
                 let env = env.clone();
@@ -897,6 +907,23 @@ impl Parser {
     }
 
     fn parse_environment(&mut self, env_name: String) -> Result<Option<Block>> {
+        // A document/class redefinition of an environment the parser handles
+        // itself (tufte's abstract, a local list style): the built-in parser
+        // owns it, so its \end is the built-in end, not the user end code
+        let owned = self.state.environments.contains_key(&env_name) && is_builtin_structural_env(&env_name);
+        if owned {
+            *self.builtin_open.entry(env_name.clone()).or_insert(0) += 1;
+        }
+        let result = self.parse_environment_dispatch(env_name.clone());
+        if owned {
+            if let Some(count) = self.builtin_open.get_mut(&env_name) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        result
+    }
+
+    fn parse_environment_dispatch(&mut self, env_name: String) -> Result<Option<Block>> {
         self.advance(); // consume BeginEnvironment
 
         match env_name.as_str() {
@@ -2079,6 +2106,16 @@ impl Parser {
                 }
                 Ok(Some(None))
             }
+            // Czech quotes \uv{...}: „...“
+            "uv" => {
+                self.skip_whitespace_only();
+                let content = self.parse_braced_inlines()?;
+                let mut out = vec![Inline::Text(String::from("\u{201E}"))];
+                out.extend(content);
+                out.push(Inline::Text(String::from("\u{201C}")));
+                Ok(Some(Some(span_or_single(out))))
+            }
+            "shyph" | "chyph" | "ehyph" => Ok(Some(None)),
             // letter class
             "opening" | "closing" | "cc" | "encl" => {
                 self.skip_whitespace_only();
@@ -2586,6 +2623,10 @@ impl Parser {
         let mut inlines = Vec::new();
 
         while !self.is_at_end() && self.current_token() != &end_token {
+            // a group cannot run past the end of its input file
+            if matches!(self.current_token(), Token::Command(c) if is_file_end_marker(c)) {
+                break;
+            }
             // A font declaration mid-group (`a \bf b`) styles the rest of it
             if let Some(style) = self.current_declaration() {
                 self.advance();
@@ -2727,7 +2768,7 @@ impl Parser {
             // The end of a user environment always runs its end code, in any
             // context: it may close something (a tabular) opened by its begin
             // code, which the enclosing parser is waiting for
-            Token::EndEnvironment(env) if self.state.environments.contains_key(env) => {
+            Token::EndEnvironment(env) if self.state.environments.contains_key(env) && !self.builtin_owns(env) => {
                 let env = env.clone();
                 let end_def = self.state.environments[&env].end_def.clone();
                 self.advance();
@@ -2798,6 +2839,12 @@ impl Parser {
 
     /// A `\label` met in running text: it belongs to the innermost open
     /// float/theorem, else to the current section (LaTeX's `\@currentlabel`).
+    /// Whether a built-in parser has `env` open (its `\end` is not the
+    /// document's end code).
+    fn builtin_owns(&self, env: &str) -> bool {
+        self.builtin_open.get(env).is_some_and(|n| *n > 0)
+    }
+
     fn attach_running_label(&mut self, key: String) {
         if let Some(target) = self.label_targets.last_mut() {
             if target.label.is_none() {
@@ -3018,7 +3065,7 @@ impl Parser {
             } else if cmd == "hskip" {
                 self.consume_tex_assignment(0, true);
             }
-            return Ok(Some(Inline::Text(String::from(" "))));
+            return Ok(Some(Inline::Space));
         }
         // A sectioning command reached as a command token (via \csuse,
         // \csname or an alias) becomes a proper Section token
@@ -3250,8 +3297,39 @@ impl Parser {
                 }))
             }
             "mbox" | "hbox" | "fbox" | "text" | "textnormal" | "textrm" | "textsf" | "textup"
-            | "textmd" | "centerline" | "makecell" | "smash" => {
-                let content = self.parse_braced_inlines()?;
+            | "textmd" | "centerline" | "makecell" | "smash" | "vbox" | "vtop" | "vcenter"
+            | "leftline" | "rightline" | "line" | "rlap" | "llap" | "clap" | "displaylines" => {
+                // \hbox to 2em{...}, \vbox spread 3pt{...}: the box size
+                // vertical boxes are columns of their own
+                let mut sized = matches!(cmd.as_str(), "vbox" | "vtop" | "vcenter");
+                let mut full_width = matches!(cmd.as_str(), "line" | "leftline" | "rightline");
+                if matches!(cmd.as_str(), "hbox" | "vbox" | "vtop" | "vcenter") {
+                    self.skip_whitespace_only();
+                    if let Token::Text(t) = self.current_token().clone() {
+                        if t.starts_with("to") || t.starts_with("spread") {
+                            sized = true;
+                            let mut spec = Vec::new();
+                            let mut guard = 0;
+                            while !self.is_at_end() && !matches!(self.current_token(), Token::LeftBrace) && guard < 12 {
+                                guard += 1;
+                                spec.push(self.current_token().clone());
+                                self.advance();
+                            }
+                            // `to \hsize` / `to \linewidth`: a whole line
+                            full_width = cmd == "hbox"
+                                && spec.len() <= 3
+                                && spec.iter().any(|t| matches!(t, Token::Command(c) if matches!(c.as_str(), "hsize" | "linewidth" | "textwidth" | "columnwidth")));
+                        }
+                    }
+                }
+                let mut content = self.parse_braced_inlines()?;
+                // a sized box is set apart from what follows; a full-width
+                // box (plain TeX's \line) is a line of its own
+                if full_width && !content.is_empty() {
+                    content.push(Inline::LineBreak);
+                } else if sized && !content.is_empty() {
+                    content.push(Inline::Space);
+                }
                 Ok(Some(Inline::Span {
                     attrs: HashMap::new(),
                     content,
@@ -4003,6 +4081,9 @@ impl Parser {
             }
             return Ok(Some(None));
         }
+        if self.parse_count_register(cmd) {
+            return Ok(Some(None));
+        }
         if let Some((operands, value)) = knowledge::tex_assignment(cmd) {
             // Remember declared registers so later assignments to them
             // (`\gnArgHgt=3pt`) are recognized
@@ -4417,6 +4498,348 @@ impl Parser {
     /// Consume a TeX assignment: `operands` control sequences, then (when
     /// `value`) an optional `=` and a number/dimension/glue specification
     /// (`0pt plus 1fil`, `\baselineskip`, `-\ht\box`, `2\parindent`).
+    /// Count registers: declaration, assignment (`\x=3`, `\x 3`) and
+    /// arithmetic (`\advance\x by 2`). Returns true when handled.
+    fn parse_count_register(&mut self, cmd: &str) -> bool {
+        let read_name = |parser: &mut Self| -> Option<String> {
+            parser.skip_whitespace_only();
+            match parser.current_token().clone() {
+                Token::Command(name) => {
+                    parser.advance();
+                    Some(name)
+                }
+                _ => None,
+            }
+        };
+        let read_equals = |parser: &mut Self| {
+            parser.skip_whitespace_only();
+            if let Token::Text(t) = parser.current_token().clone() {
+                if let Some(rest) = t.strip_prefix('=') {
+                    parser.advance();
+                    if !rest.is_empty() {
+                        parser.push_front(vec![Token::Text(rest.to_string())]);
+                    }
+                }
+            }
+        };
+        match cmd {
+            "newcount" => {
+                if let Some(name) = read_name(self) {
+                    self.count_registers.insert(name.clone(), 0);
+                    self.tex_registers.insert(name);
+                }
+                true
+            }
+            "countdef" | "chardef" | "mathchardef" => {
+                // the name may be a control symbol: \chardef\\=`\\, \chardef\{=`\{
+                self.skip_whitespace_only();
+                let name = match self.current_token().clone() {
+                    Token::Command(name) => name,
+                    Token::Backslash => String::from("\\"),
+                    Token::Text(t) if t.chars().count() == 1 => t,
+                    Token::Tilde => String::from("~"),
+                    _ => return true,
+                };
+                self.advance();
+                read_equals(self);
+                let value = self.read_char_or_number().unwrap_or(0);
+                self.count_registers.insert(name.clone(), if cmd == "countdef" { 0 } else { value });
+                self.tex_registers.insert(name);
+                true
+            }
+            // token-list parameters: \output={...}, \footline={...}, \toks0={...}
+            "output" | "footline" | "headline" | "everypar" | "everymath" | "everydisplay"
+            | "everycr" | "everyhbox" | "everyvbox" | "everyjob" | "everyeof" | "errhelp" | "toks"
+            | "pdfinfo" | "pdfcatalog" | "pdfnames" | "pdftrailer" => {
+                if cmd == "toks" {
+                    let _ = self.read_tex_number();
+                }
+                read_equals(self);
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBrace) {
+                    let _ = self.collect_braced_tokens();
+                }
+                true
+            }
+            // plain TeX \halign{preamble\cr row\cr ...}: a tabular
+            "halign" | "valign" => {
+                self.skip_whitespace_only();
+                // \halign to \hsize{...}
+                let mut guard = 0;
+                while !self.is_at_end() && !matches!(self.current_token(), Token::LeftBrace) && guard < 12 {
+                    guard += 1;
+                    self.advance();
+                }
+                let body = self.collect_braced_tokens();
+                let mut rows: Vec<Vec<Token>> = vec![Vec::new()];
+                let mut depth = 0usize;
+                for token in body {
+                    match &token {
+                        Token::LeftBrace => depth += 1,
+                        Token::RightBrace => depth = depth.saturating_sub(1),
+                        Token::Command(c) if depth == 0 && (c == "cr" || c == "crcr") => {
+                            rows.push(Vec::new());
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if let Some(row) = rows.last_mut() {
+                        row.push(token);
+                    }
+                }
+                // the first row is the template (u#v&...)
+                let template = rows.remove(0);
+                let columns = 1 + template.iter().filter(|t| matches!(t, Token::Ampersand)).count();
+                let rows: Vec<Vec<Token>> = rows
+                    .into_iter()
+                    .filter(|r| r.iter().any(|t| !matches!(t, Token::Whitespace(_) | Token::Newline | Token::Comment(_))))
+                    .collect();
+                if rows.is_empty() {
+                    return true;
+                }
+                let mut tokens = vec![
+                    Token::BeginEnvironment(String::from("tabular")),
+                    Token::LeftBrace,
+                    Token::Text("l".repeat(columns.min(64))),
+                    Token::RightBrace,
+                ];
+                for row in rows {
+                    tokens.extend(row.into_iter().filter(|t| !matches!(t, Token::Command(c) if c == "noalign")));
+                    tokens.push(Token::Backslash);
+                }
+                tokens.push(Token::EndEnvironment(String::from("tabular")));
+                self.push_front(tokens);
+                true
+            }
+            // \textfont0=\eightrm: math family fonts
+            "textfont" | "scriptfont" | "scriptscriptfont" | "fam" => {
+                if cmd != "fam" {
+                    let _ = self.read_char_or_number();
+                }
+                read_equals(self);
+                self.skip_whitespace_only();
+                match self.current_token() {
+                    Token::Command(_) => self.advance(),
+                    _ => {
+                        let _ = self.read_tex_number();
+                    }
+                }
+                true
+            }
+            // \catcode`\^=12, \lccode`\~=`\a: code tables (no output)
+            "catcode" | "lccode" | "uccode" | "sfcode" | "mathcode" | "delcode" => {
+                let _ = self.read_char_or_number();
+                read_equals(self);
+                self.skip_whitespace_only();
+                match self.current_token().clone() {
+                    Token::Command(c) if matches!(c.as_str(), "active" | "other" | "letter" | "z@" | "@ne" | "tw@" | "thr@@" | "m@ne") => {
+                        self.advance();
+                    }
+                    _ => {
+                        let _ = self.read_char_or_number();
+                    }
+                }
+                true
+            }
+            // \font\x=cmbx10 scaled \magstep2 / at 12pt: a font selection
+            "font" => {
+                let Some(name) = read_name(self) else {
+                    return true;
+                };
+                self.tex_registers.insert(name);
+                read_equals(self);
+                self.skip_whitespace_only();
+                // the file name: up to a space (\fontname\x also names one)
+                let mut guard = 0;
+                loop {
+                    guard += 1;
+                    if guard > 16 {
+                        break;
+                    }
+                    match self.current_token().clone() {
+                        Token::Text(_) => self.advance(),
+                        Token::Command(c) if c == "fontname" => {
+                            self.advance();
+                            let _ = read_name(self);
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                // optional `scaled n` / `at dimen`, possibly from a macro
+                for _ in 0..4 {
+                    let _ = self.expand_once_public();
+                    self.skip_whitespace_only();
+                    match self.current_token().clone() {
+                        Token::Text(t) if t.starts_with("scaled") || t.starts_with("at") => {
+                            self.advance();
+                            let keyword_len = if t.starts_with("scaled") { 6 } else { 2 };
+                            let rest = t[keyword_len..].to_string();
+                            if !rest.is_empty() {
+                                self.push_front(vec![Token::Text(rest)]);
+                            }
+                            self.skip_whitespace_only();
+                            match self.current_token().clone() {
+                                Token::Command(c) if c.starts_with("magstep") => {
+                                    self.advance();
+                                    if c == "magstep" {
+                                        let _ = self.read_tex_number();
+                                    }
+                                }
+                                _ => {
+                                    // a number or dimension
+                                    if let Token::Text(t) = self.current_token().clone() {
+                                        let len = t
+                                            .char_indices()
+                                            .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '.'))
+                                            .map(|(i, _)| i)
+                                            .unwrap_or(t.len());
+                                        self.advance();
+                                        if len < t.len() {
+                                            self.push_front(vec![Token::Text(t[len..].to_string())]);
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        Token::Command(c) if self.state.macros.contains_key(&c) => continue,
+                        _ => break,
+                    }
+                }
+                true
+            }
+            "advance" | "multiply" | "divide" => {
+                // only count registers are computed; other operands fall
+                // through to the generic assignment consumer
+                let target = (0..4)
+                    .map(|k| self.peek_at(k))
+                    .find(|t| !matches!(t, Some(Token::Whitespace(_) | Token::Newline)))
+                    .flatten()
+                    .cloned();
+                let Some(Token::Command(name)) = target else {
+                    return false;
+                };
+                if !self.count_registers.contains_key(&name) {
+                    return false;
+                }
+                let _ = read_name(self);
+                self.skip_whitespace_only();
+                if let Token::Text(t) = self.current_token().clone() {
+                    if let Some(rest) = t.strip_prefix("by") {
+                        self.advance();
+                        if !rest.trim().is_empty() {
+                            self.push_front(vec![Token::Text(rest.trim_start().to_string())]);
+                        }
+                    }
+                }
+                let operand = self.read_char_or_number().unwrap_or(0);
+                let current = self.count_registers.get(&name).copied().unwrap_or(0);
+                let value = match cmd {
+                    "advance" => current.saturating_add(operand),
+                    "multiply" => current.saturating_mul(operand),
+                    _ if operand != 0 => current / operand,
+                    _ => current,
+                };
+                self.count_registers.insert(name, value);
+                true
+            }
+            _ if self.count_registers.contains_key(cmd) => {
+                read_equals(self);
+                if let Some(value) = self.read_char_or_number() {
+                    self.count_registers.insert(cmd.to_string(), value);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A TeX number operand, also a character constant (`` `a ``, `` `\{ ``).
+    fn read_char_or_number(&mut self) -> Option<i64> {
+        self.skip_whitespace_only();
+        if let Token::Text(t) = self.current_token().clone() {
+            // the lexer turned the backquote into a quote character
+            if let Some(rest) = t.strip_prefix('\u{2018}').or_else(|| t.strip_prefix('`')) {
+                self.advance();
+                let mut chars = rest.chars();
+                if let Some(c) = chars.next() {
+                    let tail: String = chars.collect();
+                    if !tail.is_empty() {
+                        self.push_front(vec![Token::Text(tail)]);
+                    }
+                    return Some(c as i64);
+                }
+                return match self.current_token().clone() {
+                    Token::Command(name) => {
+                        self.advance();
+                        name.chars().next().map(|c| c as i64)
+                    }
+                    Token::Text(t) => {
+                        self.advance();
+                        let mut chars = t.chars();
+                        let c = chars.next()?;
+                        let tail: String = chars.collect();
+                        if !tail.is_empty() {
+                            self.push_front(vec![Token::Text(tail)]);
+                        }
+                        Some(c as i64)
+                    }
+                    Token::LeftBrace => {
+                        self.advance();
+                        Some('{' as i64)
+                    }
+                    Token::RightBrace => {
+                        self.advance();
+                        Some('}' as i64)
+                    }
+                    Token::Backslash => {
+                        self.advance();
+                        Some('\\' as i64)
+                    }
+                    Token::LeftBracket => {
+                        self.advance();
+                        Some('[' as i64)
+                    }
+                    Token::RightBracket => {
+                        self.advance();
+                        Some(']' as i64)
+                    }
+                    Token::Ampersand => {
+                        self.advance();
+                        Some('&' as i64)
+                    }
+                    Token::Tilde => {
+                        self.advance();
+                        Some('~' as i64)
+                    }
+                    _ => None,
+                };
+            }
+        }
+        // "8000 (hexadecimal), '177 (octal; the lexer made the quote typographic)
+        if let Token::Text(t) = self.current_token().clone() {
+            let (radix, digits) = if let Some(rest) = t.strip_prefix('"') {
+                (16, rest)
+            } else if let Some(rest) = t.strip_prefix('\u{2019}').or_else(|| t.strip_prefix('\'')) {
+                (8, rest)
+            } else {
+                (10, "")
+            };
+            if radix != 10 {
+                let len = digits.chars().take_while(|c| c.is_digit(radix)).count();
+                if len > 0 {
+                    self.advance();
+                    if len < digits.len() {
+                        self.push_front(vec![Token::Text(digits[len..].to_string())]);
+                    }
+                    return i64::from_str_radix(&digits[..len], radix).ok();
+                }
+            }
+        }
+        self.read_tex_number()
+    }
+
     fn consume_tex_assignment(&mut self, operands: usize, value: bool) {
         for _ in 0..operands {
             self.skip_whitespace_only();
@@ -5116,6 +5539,34 @@ impl Parser {
         let tex_style = std::mem::take(&mut self.macro_def_tex_style);
         self.skip_whitespace_only();
         // Both \newcommand{\name} and the unbraced \newcommand\name are valid
+        // a definition never reaches past the end of its file
+        if matches!(self.current_token(), Token::Command(c) if is_file_end_marker(c)) {
+            return Ok(());
+        }
+        // \def@{...}, \def%{...}, \def~{...}: an active character is defined;
+        // its meaning is not tracked, the definition is consumed
+        if tex_style {
+            let active = match self.current_token() {
+                Token::Text(t) => t.chars().count() == 1,
+                Token::Tilde => true,
+                _ => false,
+            };
+            if active {
+                self.advance();
+                let mut guard = 0;
+                while !self.is_at_end()
+                    && !matches!(self.current_token(), Token::LeftBrace | Token::ParBreak)
+                    && guard < 32
+                {
+                    self.advance();
+                    guard += 1;
+                }
+                if matches!(self.current_token(), Token::LeftBrace) {
+                    let _ = self.collect_braced_tokens();
+                }
+                return Ok(());
+            }
+        }
         let name_raw = if matches!(self.current_token(), Token::LeftBrace) {
             self.parse_braced_text()?
         } else if let Token::Command(name) = self.current_token() {
@@ -5146,6 +5597,7 @@ impl Parser {
             let mut guard = 0;
             while !self.is_at_end()
                 && !matches!(self.current_token(), Token::LeftBrace | Token::ParBreak)
+                && !matches!(self.current_token(), Token::Command(c) if is_file_end_marker(c))
                 && guard < 64
             {
                 param_text.push_str(&self.token_to_string(self.current_token()));
@@ -5183,7 +5635,10 @@ impl Parser {
         };
         let name = name_raw.trim().trim_start_matches('\\');
 
-        if !name.is_empty() {
+        // The engine's own primitives are never replaced: a document that
+        // seems to redefine \def or \begin was mis-read (an active `%` read
+        // as a comment, catcode tricks), and obeying would wreck the rest
+        if !name.is_empty() && !is_engine_primitive(name) {
             // \edef/\xdef expand their body when defined (so a definition
             // may refer to the macro's own previous value)
             let body = if std::mem::take(&mut self.macro_def_expand) {
@@ -5695,7 +6150,11 @@ impl Parser {
                 // the including document
                 let content = document_body(&content).unwrap_or(content);
                 if self.consume_expansion_budget(&format!("input:{}", filename)) {
-                    let at_letter = filename.ends_with(".sty") || filename.ends_with(".cls");
+                    // package-like files are read with `@` as a letter
+                    let at_letter = [".sty", ".cls", ".clo", ".def", ".cfg", ".fd", ".ldf", ".ltx", ".code.tex"]
+                        .iter()
+                        .any(|ext| filename.ends_with(ext))
+                        || resolved.to_string_lossy().ends_with(".clo");
                     self.note_verbatim_envs(&content);
                     let mut tokens = Lexer::new(&content)
                         .with_at_letter(at_letter)
@@ -5793,6 +6252,16 @@ impl Parser {
 
     /// Collect the raw tokens of a braced group (brace-aware), consuming it.
     fn collect_braced_tokens(&mut self) -> Vec<Token> {
+        // arguments and definition bodies are read unexpanded, as in TeX:
+        // no eager end-code expansion or label rewriting inside them
+        let was = std::mem::replace(&mut self.normalizing_label, true);
+        let tokens = self.collect_braced_tokens_raw();
+        self.normalizing_label = was;
+        self.normalize_current_label();
+        tokens
+    }
+
+    fn collect_braced_tokens_raw(&mut self) -> Vec<Token> {
         // TeX skips spaces and a single newline before an undelimited
         // argument: `\newenvironment{x}[1]\n{begin}\n{end}` is common.
         // Only consumed when a group really follows; never past \par.
@@ -6606,6 +7075,9 @@ impl Parser {
         // comment) is closed even inside loops scanning for that close
         let mut guard = 0;
         while let Some(Token::EndEnvironment(env)) = self.tokens.last() {
+            if self.builtin_owns(env) {
+                break;
+            }
             let Some(def) = self.state.environments.get(env) else {
                 break;
             };
@@ -6682,6 +7154,32 @@ fn zapf_dingbat(code: u32) -> Option<char> {
         0xA1..=0xFE => char::from_u32(0x2760 + code - 0xA0),
         _ => None,
     })
+}
+
+/// Environments with a dedicated built-in parser that keep it even when a
+/// class or package redefines them.
+fn is_builtin_structural_env(name: &str) -> bool {
+    matches!(
+        name,
+        "abstract" | "quote" | "quotation" | "verse" | "displayquote" | "itemize" | "enumerate"
+            | "description" | "figure" | "figure*" | "table" | "table*" | "tabular" | "tabular*"
+            | "tabularx" | "longtable" | "equation" | "equation*" | "align" | "align*" | "gather"
+            | "gather*" | "multline" | "multline*" | "eqnarray" | "eqnarray*" | "thebibliography"
+            | "center" | "flushleft" | "flushright" | "minipage" | "frame" | "proof"
+    )
+}
+
+/// Control sequences the parser itself is built on; definitions of them
+/// are ignored (see `parse_macro_definition_command`).
+fn is_engine_primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "def" | "gdef" | "edef" | "xdef" | "let" | "futurelet" | "begin" | "end" | "csname"
+            | "endcsname" | "expandafter" | "noexpand" | "if" | "ifx" | "ifnum" | "ifdim" | "ifcase"
+            | "else" | "fi" | "or" | "newcommand" | "renewcommand" | "providecommand"
+            | "newenvironment" | "renewenvironment" | "input" | "include" | "documentclass"
+            | "usepackage" | "RequirePackage" | "makeatletter" | "makeatother" | "@"
+    ) || name.starts_with("texed@")
 }
 
 /// The parser's markers for the end of an input file or package.
@@ -6761,8 +7259,8 @@ fn citation_mode_for(cmd: &str) -> CitationMode {
 /// Returns (number of braced args, whether an optional [arg] may precede them).
 fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
     match cmd {
-        // tabbing commands met outside tabbing
-        ">" | "<" | "+" => Some((0, false)),
+        // tabbing commands met outside tabbing; the space factor \@
+        ">" | "<" | "+" | "@" => Some((0, false)),
         // Zero-argument layout/font declarations
         "centering" | "raggedright" | "raggedleft" | "noindent" | "indent" | "newpage"
         | "clearpage" | "cleardoublepage" | "samepage" | "protect" | "relax"
@@ -6817,6 +7315,15 @@ fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
 fn text_symbol_command(cmd: &str) -> Option<&'static str> {
     Some(match cmd {
         "textbackslash" => "\\",
+        // german/ngerman quote macros
+        "glqq" => "\u{201E}",
+        "grqq" => "\u{201C}",
+        "glq" => "\u{201A}",
+        "grq" => "\u{2018}",
+        "flqq" => "\u{AB}",
+        "frqq" => "\u{BB}",
+        "flq" => "\u{2039}",
+        "frq" => "\u{203A}",
         "textasciitilde" => "~",
         "textasciicircum" => "^",
         "textasciigrave" => "`",

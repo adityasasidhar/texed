@@ -37,6 +37,21 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "setkeys" => sig(false, 2, false),
         "ExplSyntaxOn" | "ExplSyntaxOff" => sig(false, 0, false),
         "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile" => sig(false, 4, false),
+        // plain TeX page builder and output routine
+        "nopagenumbers" | "obeylines" | "folio" | "normalbottom" | "makeheadline" | "makefootline" | "pagebody" | "plainoutput" | "pagecontents" | "mdqoff" | "mdqon" | "openup" | "hfilneg" | "vfilneg" => sig(false, 0, false),
+        "shipout" => sig(false, 0, false),
+        "mark" | "insert" | "vadjust" | "noalign" => sig(false, 1, false),
+        // font size selection: \@setfontsize\normalsize\@xpt\@xiipt
+        "@setfontsize" | "@setsize" => sig(false, 3, false),
+        "@fontswitch" | "@newbaseline" | "@setnobreak" => sig(false, 0, false),
+        // kernel internals that only affect typesetting state
+        "dospecials" | "@vobeyspaces" | "@noligs" | "active" | "@toodeep" | "@sanitize" | "@makeother"
+        | "obeyspaces" | "@nobreakfalse" | "@nobreaktrue" | "@afterindentfalse" | "@afterindenttrue"
+        | "@empty@" | "@nil@" => sig(false, 0, false),
+        // sectsty / titlesec-like font set-up
+        "allsectionsfont" | "partfont" | "chapterfont" | "chaptertitlefont" | "chapternumberfont"
+        | "sectionfont" | "subsectionfont" | "subsubsectionfont" | "paragraphfont" | "subparagraphfont"
+        | "minisecfont" => sig(false, 1, false),
         // pgf layers, tabularray and reledmac set-up
         "pgfdeclarelayer" | "pgfsetlayers" | "SetTblrInner" | "SetTblrOuter" | "SetTblrDefault"
         | "SetTblrTemplate" | "SetTblrStyle" | "DefTblrTemplate" | "NewTblrTheme" | "NewTblrLibrary"
@@ -204,6 +219,8 @@ pub(super) fn tex_assignment(cmd: &str) -> Option<(usize, bool)> {
         | "defaultskewchar" | "overfullrule" | "holdinginserts" | "outputpenalty"
         | "maxdeadcycles" | "deadcycles" | "insertpenalties" | "prevdepth" | "unitlength" | "skip" | "dimen" | "count" | "toks" | "muskip" | "fontdimen" | "pdfpkresolution" | "pdfimageresolution"
         | "pdfinclusionerrorlevel" | "pdfsuppresswarningpagegroup" | "interfootnotelinepenalty" | "medmuskip" | "thinmuskip" | "thickmuskip"
+        | "normalbaselineskip" | "normallineskip" | "normallineskiplimit" | "tabskip" | "textfont"
+        | "scriptfont" | "scriptscriptfont" | "pagegoal" | "pagetotal" | "baselinestretch"
         | "linepenalty" | "adjdemerits" | "doublehyphendemerits" | "finalhyphendemerits"
         | "exhyphenchar" | "hyphenchar" | "skewchar" | "lccode" | "uccode" | "sfcode"
         | "mathcode" | "delcode" | "catcode" => (0, true),

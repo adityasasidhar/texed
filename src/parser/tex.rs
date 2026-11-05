@@ -128,6 +128,43 @@ impl Parser {
                 self.expand_after(0)?;
                 return Ok(Some(None));
             }
+            // plain TeX \loop body \if... more \repeat: body, test, and while
+            // the test holds, more and again (\repeat is \fi)
+            "loop" => {
+                let mut body = Vec::new();
+                let mut depth = 0usize;
+                while !self.is_at_end() {
+                    let token = self.current_token().clone();
+                    match &token {
+                        Token::LeftBrace => depth += 1,
+                        Token::RightBrace if depth == 0 => break,
+                        Token::RightBrace => depth -= 1,
+                        Token::Command(c) if c == "repeat" && depth == 0 => {
+                            self.advance();
+                            break;
+                        }
+                        Token::Command(c) if super::is_file_end_marker(c) => break,
+                        _ => {}
+                    }
+                    body.push(token);
+                    self.advance();
+                }
+                let id = self.loop_bodies.len();
+                self.loop_bodies.push((body, 0));
+                self.push_loop_iteration(id);
+                return Ok(Some(None));
+            }
+            "repeat" => {
+                // a stray \repeat closes a conditional, like \fi
+                self.cond_depth = self.cond_depth.saturating_sub(1);
+                return Ok(Some(None));
+            }
+            name if name.starts_with("texed@loop:") => {
+                if let Ok(id) = name["texed@loop:".len()..].parse::<usize>() {
+                    self.push_loop_iteration(id);
+                }
+                return Ok(Some(None));
+            }
             // etoolbox / kernel list loops
             "docsvlist" | "forcsvlist" | "dolistloop" | "forlistloop" | "dolistcsloop" | "forlistcsloop"
             | "@for" | "listadd" | "listgadd" | "listeadd" | "listxadd" | "listcsadd" | "listcsgadd" => {
@@ -648,6 +685,24 @@ impl Parser {
                     IfOperand::Unexpandable
                 }
             }
+            // \the / \number of a register expand to its digits
+            Token::Command(name) if matches!(name.as_str(), "the" | "number" | "arabic" | "value") => {
+                self.skip_whitespace_only();
+                let value = match self.current_token().clone() {
+                    Token::Command(register) if matches!(name.as_str(), "the" | "number") => {
+                        self.advance();
+                        self.command_numeric_value(&register)
+                    }
+                    _ => self.command_numeric_value(&name),
+                };
+                match value {
+                    Some(value) => {
+                        self.push_front(vec![Token::Text(value.to_string())]);
+                        self.read_if_operand(depth + 1)
+                    }
+                    None => IfOperand::Unexpandable,
+                }
+            }
             Token::LeftBrace => IfOperand::Char('{'),
             Token::RightBrace => IfOperand::Char('}'),
             Token::LeftBracket => IfOperand::Char('['),
@@ -773,6 +828,9 @@ impl Parser {
         if let Some(counter) = name.strip_prefix("c@") {
             return Some(self.counter_value(counter) as i64);
         }
+        if let Some(value) = self.count_registers.get(name) {
+            return Some(*value);
+        }
         self.state
             .macros
             .get(name)
@@ -780,7 +838,7 @@ impl Parser {
     }
 
     /// Read a TeX number (literal digits, `\value{}`, or a numeric macro).
-    fn read_tex_number(&mut self) -> Option<i64> {
+    pub(super) fn read_tex_number(&mut self) -> Option<i64> {
         self.skip_whitespace_and_comments();
         match self.current_token().clone() {
             Token::Text(t) => {
@@ -817,7 +875,8 @@ impl Parser {
             self.advance();
             if let Token::Command(name) = token {
                 match name.as_str() {
-                    "fi" => {
+                    // (\repeat is \let to \fi)
+                    "fi" | "repeat" => {
                         if depth == 0 {
                             return BranchEnd::Fi;
                         }
@@ -944,6 +1003,27 @@ impl Parser {
             Token::Command(name) => {
                 self.advance();
                 name
+            }
+            // an active character (`\let =\ ` after \obeyspaces, `\let~=\x`):
+            // consume `= value`, nothing to record
+            Token::Whitespace(_) | Token::Tilde | Token::Text(_) => {
+                self.advance();
+                self.skip_whitespace_and_comments();
+                if let Token::Text(t) = self.current_token().clone() {
+                    if let Some(rest) = t.strip_prefix('=') {
+                        self.advance();
+                        if !rest.is_empty() {
+                            self.push_front(vec![Token::Text(rest.to_string())]);
+                        }
+                    }
+                }
+                if matches!(self.current_token(), Token::Whitespace(_)) {
+                    self.advance();
+                }
+                if !self.is_at_end() {
+                    self.advance();
+                }
+                return Ok(());
             }
             _ => return Ok(()),
         };
@@ -1140,6 +1220,25 @@ impl Parser {
         Ok(())
     }
 
+    /// One round of a `\loop`: its body, then (on the true branch of the
+    /// body's final test) the next round, then the test's `\fi`.
+    fn push_loop_iteration(&mut self, id: usize) {
+        let Some((body, rounds)) = self.loop_bodies.get_mut(id) else {
+            return;
+        };
+        *rounds += 1;
+        if *rounds > 10_000 || body.is_empty() {
+            return;
+        }
+        let mut tokens = body.clone();
+        if !self.consume_expansion_budget("loop") {
+            return;
+        }
+        tokens.push(Token::Command(format!("texed@loop:{}", id)));
+        tokens.push(Token::Command(String::from("fi")));
+        self.push_front(tokens);
+    }
+
     /// `\expandafter A B`: expand B once, then read A again.
     pub(super) fn expand_after(&mut self, depth: usize) -> Result<()> {
         if self.is_at_end() || depth > 64 {
@@ -1155,6 +1254,15 @@ impl Parser {
         self.expand_once(depth)?;
         self.push_front(vec![first]);
         Ok(())
+    }
+
+    /// One-level expansion of the current token (see `expand_once`).
+    pub(super) fn expand_once_public(&mut self) -> Result<()> {
+        if matches!(self.current_token(), Token::Command(c) if self.state.macros.contains_key(c)) {
+            self.expand_once(0)
+        } else {
+            Ok(())
+        }
     }
 
     /// Replace the current token by its one-level expansion, where the

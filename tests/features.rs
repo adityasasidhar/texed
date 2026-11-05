@@ -515,3 +515,47 @@ fn transparent_preview_and_letter() {
     has(doc, "Body text.");
     has(doc, "Yours,");
 }
+
+// --- Plain TeX ----------------------------------------------------------------------
+
+#[test]
+fn plain_tex_count_registers_and_loops() {
+    let doc = "\\newcount\\n \\n=0\n\\loop \\advance\\n by 1 [\\the\\n]\\ifnum\\n<3 \\repeat. \\def\\cols{\\the\\n}\\if 3\\cols three\\else other\\fi";
+    has(doc, "[1] [2] [3].");
+    has(doc, "three");
+    lacks(doc, "other");
+}
+
+#[test]
+fn plain_tex_set_up_produces_nothing() {
+    let doc = "\\font\\big=cmbx10 scaled \\magstep2 \\font\\x=cmr10 at 12pt \\textfont0=\\big \\catcode`\\^=12 \\chardef\\{=`\\{ \\output={\\plainoutput} \\footline={\\hss\\folio} Visible.";
+    has(doc, "Visible.");
+    lacks(doc, "scaled");
+    lacks(doc, "=12");
+    lacks(doc, "cmbx");
+}
+
+#[test]
+fn plain_tex_full_width_boxes_are_lines() {
+    has("\\hbox to \\hsize{first}\\hbox to \\hsize{second}", "first  \nsecond");
+    has("\\hbox to 1em{\\hss.\\hss}x", ". x");
+}
+
+#[test]
+fn active_character_definitions_are_consumed() {
+    // \def%{...} with % made active must not swallow the next line
+    has("\\def\\x{X}\n\\gdef\\y{\\def%{pct}}\n\\x", "X");
+    lacks("\\def\\x{X}\n\\gdef\\y{\\def%{pct}}\n\\x", "pct");
+}
+
+#[test]
+fn space_factor_command_is_kept_out_of_arguments() {
+    has("\\def\\mk#1{[#1]}Begin with G\\@. Next \\mk\\@ x.", "Begin with G. Next");
+}
+
+#[test]
+fn redefined_builtin_environment_keeps_its_parser() {
+    // tufte-style redefinition of quote, wrapped by another environment
+    let doc = "\\makeatletter\\renewenvironment{quote}{\\list{}{}\\item\\relax}{\\endlist}\\makeatother\\newenvironment{docspec}{\\begin{quote}}{\\end{quote}}\\begin{docspec}Inside.\\end{docspec}\n\n\\section{After}\nText.";
+    has(doc, "> Inside.\n\n## After");
+}

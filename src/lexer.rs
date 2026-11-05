@@ -140,7 +140,17 @@ impl Lexer {
 
     /// Additional inline-verbatim commands defined elsewhere in the document.
     pub fn with_verb_commands<'a>(mut self, names: impl IntoIterator<Item = &'a String>) -> Self {
-        self.verb_commands.extend(names.into_iter().cloned());
+        for name in names {
+            // short-verb characters from the document's packages
+            match name.strip_prefix("texed@shortverb:").and_then(|c| c.chars().next()) {
+                Some(c) => {
+                    self.short_verb_chars.insert(c);
+                }
+                None => {
+                    self.verb_commands.insert(name.clone());
+                }
+            }
+        }
         self
     }
 
@@ -383,10 +393,15 @@ impl Lexer {
             return Ok(Some(Token::Text(String::from(" "))));
         }
 
-        // Discretionary hyphen \-, italic correction \/, spacing factor \@: no output
-        if matches!(ch, '-' | '/' | '*') || (ch == '@' && !self.at_letter) {
+        // Discretionary hyphen \-, italic correction \/: no output
+        if matches!(ch, '-' | '/' | '*') {
             self.advance();
             return Ok(None);
+        }
+        // The space factor \@ is a token (a macro argument: \makeactive\@)
+        if ch == '@' && !self.at_letter {
+            self.advance();
+            return Ok(Some(Token::Command(String::from("@"))));
         }
 
         // Lex command name
@@ -407,6 +422,17 @@ impl Lexer {
             }
             "ExplSyntaxOff" => self.expl_syntax = false,
             _ => {}
+        }
+
+        // \def%{...}, \let%=...: `%` was made active (catcode 13) for this; it
+        // is the name being defined, not a comment
+        if matches!(cmd_name.as_str(), "def" | "gdef" | "edef" | "xdef" | "let")
+            && !self.is_at_end()
+            && self.current_char() == '%'
+        {
+            self.advance();
+            self.pending.push(Token::Text(String::from("%")));
+            return Ok(Some(Token::Command(cmd_name)));
         }
 
         if cmd_name.is_empty() {
