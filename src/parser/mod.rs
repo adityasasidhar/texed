@@ -16,6 +16,7 @@ mod glossary;
 mod knowledge;
 mod math;
 mod siunitx;
+mod tables;
 mod tex;
 
 /// Baseline budget of macro expansions per document, guarding against
@@ -213,6 +214,8 @@ pub struct Parser {
     glossary: HashMap<String, glossary::GlossaryEntry>,
     /// Numbered algorithm floats so far.
     algorithm_counter: usize,
+    /// A \label found inside the caption just parsed.
+    pending_caption_label: Option<String>,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -267,6 +270,7 @@ impl Parser {
             expanded_bytes: 0,
             glossary: HashMap::new(),
             algorithm_counter: 0,
+            pending_caption_label: None,
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -808,11 +812,11 @@ impl Parser {
             | "eqnarray*" | "displaymath" | "math" | "split" => {
                 self.parse_math_environment(&env_name)
             }
-            "table" | "table*" | "sidewaystable" | "sidewaystable*" => {
+            "table" | "table*" | "sidewaystable" | "sidewaystable*" | "threeparttable"
+            | "threeparttablex" | "wraptable" | "margintable" | "SCtable" => {
                 self.parse_table_environment(&env_name)
             }
-            "tabular" | "tabular*" | "tabularx" | "longtable" | "array" | "tabu"
-            | "supertabular" => self.parse_tabular(&env_name),
+            name if tables::is_tabular_env(name) => self.parse_tabular(&env_name),
             "figure" | "figure*" | "sidewaysfigure" | "wrapfigure" => {
                 self.parse_figure_environment(&env_name)
             }
@@ -825,6 +829,7 @@ impl Parser {
             // Definition containers: their \acro / \newglossaryentry
             // commands are recorded, nothing is typeset here
             "acronym" => self.parse_transparent_environment(&env_name, 0, true),
+            "tablenotes" | "TableNotes" | "tnotes" => self.parse_list(&env_name, false),
             "keywords" | "IEEEkeywords" | "keyword" => {
                 let content = self.read_environment_inlines(&env_name)?;
                 let mut line = vec![Inline::Strong(vec![Inline::Text(String::from("Keywords:"))])];
@@ -1521,217 +1526,11 @@ impl Parser {
     }
 
     fn parse_table_environment(&mut self, env_name: &str) -> Result<Option<Block>> {
-        let mut caption = None;
-        let mut tabular_block = None;
-        let mut label = None;
-
-        // Skip optional placement specifier [htbp]
-        self.skip_whitespace_and_comments();
-        if matches!(self.current_token(), Token::LeftBracket) {
-            let _ = self.parse_bracketed_text()?;
-        }
-
-        while !self.is_at_end() {
-            self.skip_whitespace_and_comments();
-
-            if let Token::EndEnvironment(env) = self.current_token() {
-                if env == env_name {
-                    self.advance();
-                    break;
-                }
-            }
-
-            if let Token::Command(cmd) = self.current_token() {
-                if cmd == "caption" {
-                    self.advance();
-                    self.consume_text_star();
-                    if matches!(self.current_token(), Token::LeftBracket) {
-                        let _ = self.parse_bracketed_text()?;
-                    }
-                    let tokens = self.collect_braced_tokens();
-                    let (inlines, caption_label) = self.parse_inline_fragment_tokens(tokens)?;
-                    caption = Some(inlines);
-                    if caption_label.is_some() {
-                        label = caption_label;
-                    }
-                    continue;
-                }
-            }
-
-            if let Token::BeginEnvironment(env) = self.current_token() {
-                if matches!(
-                    env.as_str(),
-                    "tabular" | "tabular*" | "tabularx" | "longtable" | "array" | "tabu"
-                        | "supertabular"
-                ) {
-                    tabular_block = self.parse_environment(env.clone())?;
-                    continue;
-                }
-            }
-
-            if let Token::Label(l) = self.current_token() {
-                label = Some(l.clone());
-                self.advance();
-                continue;
-            }
-
-            self.advance();
-        }
-
-        // \caption steps the table counter (labels refer to it)
-        let number = caption.as_ref().map(|_| self.state.next_counter("table"));
-        if let Some(table_label) = &label {
-            let title = caption
-                .as_ref()
-                .map(|inlines| self.inlines_to_plain_text(inlines))
-                .filter(|text| !text.is_empty());
-            let number = number
-                .clone()
-                .unwrap_or_else(|| self.state.current_section_number.clone());
-            self.state
-                .add_label_with_number(table_label.clone(), LabelType::Table, number, title);
-        }
-        if let Some(Block::Table { alignments, headers, rows, .. }) = tabular_block {
-            Ok(Some(Block::Table {
-                caption,
-                alignments,
-                headers,
-                rows,
-            }))
-        } else {
-            Ok(None)
-        }
+        self.parse_table_float(env_name)
     }
 
     fn parse_tabular(&mut self, env_name: &str) -> Result<Option<Block>> {
-        // Optional position argument [t]/[b]
-        self.skip_whitespace_and_comments();
-        if matches!(self.current_token(), Token::LeftBracket) {
-            let _ = self.parse_bracketed_text()?;
-        }
-
-        // tabular* and tabularx take a width argument before the column spec
-        if matches!(env_name, "tabular*" | "tabularx" | "tabu") {
-            self.skip_whitespace_and_comments();
-            let _ = self.parse_braced_text()?;
-        }
-
-        // Parse column specification
-        self.skip_whitespace_and_comments();
-        let alignments = if matches!(self.current_token(), Token::LeftBrace) {
-            let spec = self.parse_braced_text()?;
-            self.parse_column_spec(&spec)
-        } else {
-            vec![Alignment::AlignDefault]
-        };
-
-        let mut rows: Vec<Vec<Vec<Block>>> = Vec::new();
-        let mut current_row: Vec<Vec<Block>> = Vec::new();
-        let mut cell_inlines: Vec<Inline> = Vec::new();
-        // Extra empty cells owed to \multicolumn spans
-        let mut pending_span_cells: usize = 0;
-
-        fn finish_cell(
-            cell_inlines: &mut Vec<Inline>,
-            current_row: &mut Vec<Vec<Block>>,
-            pending_span_cells: &mut usize,
-        ) {
-            let inlines = std::mem::take(cell_inlines);
-            let trimmed = trim_inline_whitespace(inlines);
-            if trimmed.is_empty() {
-                current_row.push(Vec::new());
-            } else {
-                current_row.push(vec![Block::Paragraph(trimmed)]);
-            }
-            for _ in 0..*pending_span_cells {
-                current_row.push(Vec::new());
-            }
-            *pending_span_cells = 0;
-        }
-
-        while !self.is_at_end() {
-            match self.current_token() {
-                Token::EndEnvironment(env) if env == env_name => {
-                    self.advance();
-                    break;
-                }
-                Token::Ampersand => {
-                    self.advance();
-                    finish_cell(&mut cell_inlines, &mut current_row, &mut pending_span_cells);
-                }
-                Token::Backslash => {
-                    self.advance();
-                    // Optional row spacing: \\[3pt]
-                    if matches!(self.current_token(), Token::LeftBracket) {
-                        let _ = self.parse_bracketed_text()?;
-                    }
-                    finish_cell(&mut cell_inlines, &mut current_row, &mut pending_span_cells);
-                    rows.push(std::mem::take(&mut current_row));
-                }
-                Token::Command(cmd) if is_table_rule_command(cmd) => {
-                    let cmd = cmd.clone();
-                    self.advance();
-                    self.consume_table_rule_args(&cmd)?;
-                }
-                Token::Command(cmd) if cmd == "multicolumn" => {
-                    self.advance();
-                    let span = self
-                        .parse_braced_text()?
-                        .trim()
-                        .parse::<usize>()
-                        .unwrap_or(1);
-                    let _alignment = self.parse_braced_text()?;
-                    let tokens = self.collect_braced_tokens();
-                    let (inlines, _) = self.parse_inline_fragment_tokens(tokens)?;
-                    cell_inlines.extend(inlines);
-                    pending_span_cells = pending_span_cells.max(span.saturating_sub(1));
-                }
-                Token::Command(cmd) if cmd == "multirow" => {
-                    self.advance();
-                    let _rows = self.parse_braced_text()?;
-                    if matches!(self.current_token(), Token::LeftBracket) {
-                        let _ = self.parse_bracketed_text()?;
-                    }
-                    let _width = self.parse_braced_text()?;
-                    let tokens = self.collect_braced_tokens();
-                    let (inlines, _) = self.parse_inline_fragment_tokens(tokens)?;
-                    cell_inlines.extend(inlines);
-                }
-                Token::Label(_) | Token::Comment(_) => {
-                    self.advance();
-                }
-                _ => {
-                    if let Some(inline) = self.parse_inline()? {
-                        cell_inlines.push(inline);
-                    }
-                }
-            }
-        }
-
-        // Final row without trailing \\
-        if !cell_inlines.is_empty()
-            || !current_row.is_empty()
-            || pending_span_cells > 0
-        {
-            finish_cell(&mut cell_inlines, &mut current_row, &mut pending_span_cells);
-            rows.push(current_row);
-        }
-
-        // Drop rows that are entirely empty (e.g. produced by a trailing \\)
-        rows.retain(|row| row.iter().any(|cell| !cell.is_empty()));
-
-        let headers = if !rows.is_empty() {
-            rows.remove(0)
-        } else {
-            Vec::new()
-        };
-
-        Ok(Some(Block::Table {
-            caption: None,
-            alignments,
-            headers,
-            rows,
-        }))
+        self.parse_standalone_tabular(env_name)
     }
 
     /// Consume the arguments of table rule commands like \cline{2-3} or
@@ -2769,6 +2568,10 @@ impl Parser {
                 } else {
                     span_or_single(content)
                 })));
+            }
+            "tnote" => {
+                let content = self.parse_braced_inlines()?;
+                return Ok(Some(Some(Inline::Superscript(content))));
             }
             "keywords" | "keyword" | "IEEEkeywords" | "kwd" | "terms" => {
                 self.skip_whitespace_only();

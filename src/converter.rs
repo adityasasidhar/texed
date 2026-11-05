@@ -404,13 +404,13 @@ impl MarkdownConverter {
     ) -> Result<()> {
         self.in_table = true;
 
-        // Caption before table
+        // Caption line before the table (the parser adds "Table n:")
         if let Some(cap) = caption {
             let text = self.render_inlines_trimmed(cap)?;
             if !text.is_empty() {
-                self.output.push_str("**");
+                let text = finalize_brackets(&escape_line_starts(&text.replace('\n', " ")));
                 self.output.push_str(&text);
-                self.output.push_str("**\n\n");
+                self.output.push_str("\n\n");
             }
         }
 
