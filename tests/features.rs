@@ -589,3 +589,22 @@ fn definitions_inside_math_macros_run() {
     let doc = "\\newcommand{\\iftagtext}{}\\newcommand{\\iftag}[3]{\\def\\iftagtext{#3}\\def\\do##1{\\iftoggle{##1}{\\def\\iftagtext{#2}}{}}\\docsvlist{#1}\\iftagtext}\\newtoggle{FOL}\\toggletrue{FOL}\n$\\iftag{FOL}{A}{B} + \\iftag{X}{C}{D}$";
     has(doc, "$A + D$");
 }
+
+#[test]
+fn dotless_i_accents() {
+    has("Mart{\\'\\i}n, Mart\\'{\\i}n, na\\\"\\i ve", "Martín, Martín, naïve");
+}
+
+#[test]
+fn subfloats_in_tables() {
+    let doc = "\\begin{table}\\subfloat[First.\\label{tab:a}]{\\begin{tabular}{cc}A & B\\\\1 & 2\\end{tabular}}\\subfloat[Second.\\label{tab:b}]{\\begin{tabular}{c}C\\\\3\\end{tabular}}\\caption{Both.\\label{tab:all}}\\end{table}See \\ref{tab:b}.";
+    has(doc, "**Table 1:** Both.\n\n(a) First.");
+    has(doc, "(b) Second.");
+    has(doc, "See 1b.");
+}
+
+#[test]
+fn etoolbox_booleans_and_inline_lists() {
+    has("\\newbool{d}\\booltrue{d}\\ifbool{d}{yes}{no} \\setbool{d}{false}\\ifbool{d}{yes}{no}", "yes no");
+    has("\\begin{enumerate*}\\item a \\item b\\end{enumerate*}", "1. a\n2. b");
+}

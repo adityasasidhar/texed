@@ -377,6 +377,26 @@ impl Parser {
                 }
                 return Ok(Some(None));
             }
+            // etoolbox booleans
+            "newbool" | "providebool" | "booltrue" | "boolfalse" => {
+                self.skip_whitespace_only();
+                let name = self.parse_braced_text()?.trim().to_string();
+                let value = cmd == "booltrue";
+                if cmd.ends_with("bool") {
+                    self.state.conditionals.entry(name).or_insert(false);
+                } else {
+                    self.state.conditionals.insert(name, value);
+                }
+                return Ok(Some(None));
+            }
+            "setbool" => {
+                self.skip_whitespace_only();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_only();
+                let value = self.parse_braced_text()?.trim().eq_ignore_ascii_case("true");
+                self.state.conditionals.insert(name, value);
+                return Ok(Some(None));
+            }
             "newboolean" | "provideboolean" => {
                 self.skip_whitespace_and_comments();
                 let name = self.parse_braced_text()?.trim().to_string();

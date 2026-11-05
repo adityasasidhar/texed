@@ -41,6 +41,8 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "nopagenumbers" | "obeylines" | "folio" | "normalbottom" | "makeheadline" | "makefootline" | "pagebody" | "plainoutput" | "pagecontents" | "mdqoff" | "mdqon" | "openup" | "hfilneg" | "vfilneg" => sig(false, 0, false),
         "shipout" => sig(false, 0, false),
         "mark" | "insert" | "vadjust" | "noalign" => sig(false, 1, false),
+        "xspace" | "end@float" | "end@dblfloat" => sig(false, 0, false),
+        "scalefont" | "@float" | "@dblfloat" => sig(false, 1, true),
         // font size selection: \@setfontsize\normalsize\@xpt\@xiipt
         "@setfontsize" | "@setsize" => sig(false, 3, false),
         "@fontswitch" | "@newbaseline" | "@setnobreak" => sig(false, 0, false),

@@ -25,6 +25,8 @@ pub(super) struct ParsedTabular {
     pub rows: Vec<Vec<Vec<Block>>>,
     pub caption: Option<(Vec<Inline>, bool)>,
     pub label: Option<String>,
+    /// `\subfloat[caption]{...}` around this tabular: its sub-caption and label
+    pub sub: Option<(Vec<Inline>, Option<String>)>,
 }
 
 impl Parser {
@@ -39,12 +41,33 @@ impl Parser {
         let mut tables: Vec<ParsedTabular> = Vec::new();
         let mut extra: Vec<Block> = Vec::new();
         let mut text: Vec<Inline> = Vec::new();
+        // \subfloat[caption]{\begin{tabular}...}: the next tabular's sub-caption
+        let mut pending_sub: Option<(Vec<Inline>, Option<String>)> = None;
 
         while !self.is_at_end() {
             match self.current_token().clone() {
                 Token::EndEnvironment(env) if env == env_name => {
                     self.advance();
                     break;
+                }
+                Token::Command(cmd) if cmd == "subfloat" || cmd == "subtable" || cmd == "subcaptionbox" => {
+                    self.advance();
+                    self.skip_whitespace_only();
+                    let tokens = if cmd == "subcaptionbox" {
+                        self.collect_braced_tokens()
+                    } else if matches!(self.current_token(), Token::LeftBracket) {
+                        let mut t = self.collect_bracketed_tokens();
+                        // \subfloat[list entry][caption]
+                        self.skip_whitespace_only();
+                        if matches!(self.current_token(), Token::LeftBracket) {
+                            t = self.collect_bracketed_tokens();
+                        }
+                        t
+                    } else {
+                        Vec::new()
+                    };
+                    let (inlines, sub_label) = self.parse_inline_fragment_tokens(tokens)?;
+                    pending_sub = Some((trim_inline_whitespace(inlines), sub_label));
                 }
                 Token::Label(l) => {
                     self.advance();
@@ -75,7 +98,8 @@ impl Parser {
                 }
                 Token::BeginEnvironment(env) if is_tabular_env(&env) => {
                     self.advance();
-                    let parsed = self.parse_tabular_body(&env)?;
+                    let mut parsed = self.parse_tabular_body(&env)?;
+                    parsed.sub = pending_sub.take();
                     tables.push(parsed);
                 }
                 Token::BeginEnvironment(env) if matches!(env.as_str(), "tablenotes" | "TableNotes" | "tnotes") => {
@@ -227,9 +251,29 @@ impl Parser {
 
         let mut blocks = Vec::new();
         let mut caption_inlines = caption_inlines;
-        for table in tables {
+        let mut letter = 0;
+        for mut table in tables {
             if table.headers.is_empty() && table.rows.is_empty() {
                 continue;
+            }
+            // sub-tables: "(a) caption" before each, labels numbered 1a, 1b
+            if let Some((sub_caption, sub_label)) = table.sub.take() {
+                letter += 1;
+                let mark = crate::state::alpha_number(letter, false);
+                if let Some(caption) = caption_inlines.take().filter(|c| !c.is_empty()) {
+                    blocks.push(Block::Paragraph(caption));
+                }
+                if let Some(sub_label) = sub_label {
+                    let n = format!("{}{}", number.clone().unwrap_or_default(), mark);
+                    let title = Some(self.inlines_to_plain_text(&sub_caption)).filter(|t| !t.is_empty());
+                    self.state.add_label_with_number(sub_label, LabelType::Table, n, title);
+                }
+                let mut line = vec![Inline::Text(format!("({})", mark))];
+                if !sub_caption.is_empty() {
+                    line.push(Inline::Space);
+                    line.extend(sub_caption);
+                }
+                blocks.push(Block::Paragraph(line));
             }
             blocks.push(Block::Table {
                 caption: caption_inlines.take(),
@@ -459,6 +503,7 @@ impl Parser {
             rows: all_rows,
             caption,
             label,
+            sub: None,
         })
     }
 
@@ -539,6 +584,7 @@ fn block_to_cell_inlines(block: Block) -> Vec<Inline> {
             rows,
             caption: caption.map(|c| (c, false)),
             label: None,
+            sub: None,
         }),
         Block::Section { title, .. } => vec![Inline::Strong(title)],
         _ => Vec::new(),

@@ -837,3 +837,20 @@ fn test_input_if_file_exists_takes_the_else_branch() {
     let output = String::from_utf8_lossy(&output.stdout).to_string();
     assert!(output.contains("File content. Fallback used."), "got: {}", output);
 }
+
+#[test]
+fn test_references_list_only_cited_entries() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    fs::write(
+        temp_dir.path().join("refs.bib"),
+        "@book{a, author={Ann A}, title={Cited Book}, year=2001}\n@book{b, author={Bob B}, title={Uncited Book}, year=2002}\n@book{c, author={Cy C}, title={Nocited Book}, year=2003}\n",
+    )
+    .unwrap();
+    fs::write(&input_file, "\\documentclass{article}\n\\begin{document}\nSee \\citep{a}.\\nocite{c}\n\\bibliographystyle{plainnat}\n\\bibliography{refs}\n\\end{document}\n").unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&input_file).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("Cited Book"), "got: {}", output);
+    assert!(output.contains("Nocited Book"), "got: {}", output);
+    assert!(!output.contains("Uncited Book"), "got: {}", output);
+}

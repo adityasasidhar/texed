@@ -16,6 +16,11 @@ pub struct CitationManager {
     
     /// Citation key to number mapping
     citation_numbers: HashMap<String, usize>,
+
+    /// Keys cited so far (\cite, \nocite): only these are listed, as BibTeX
+    /// does, unless `\nocite{*}` asked for every entry
+    cited: std::collections::HashSet<String>,
+    cite_all: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +53,8 @@ impl CitationManager {
             bibliography: HashMap::new(),
             citation_counter: 0,
             citation_numbers: HashMap::new(),
+            cited: std::collections::HashSet::new(),
+            cite_all: false,
         }
     }
 
@@ -86,6 +93,7 @@ impl CitationManager {
         prenote: Option<&str>,
         postnote: Option<&str>,
     ) -> String {
+        self.cited.extend(keys.iter().cloned());
         match &mode {
             CitationMode::Title => return self.entry_fields(keys, "title"),
             CitationMode::Url => return self.entry_fields(keys, "url"),
@@ -375,6 +383,32 @@ impl CitationManager {
         out
     }
 
+    /// `\nocite{keys}` (`*` for all): listed in the references without a
+    /// citation in the text; numbered after the cited ones.
+    pub fn nocite(&mut self, keys: &[String]) {
+        for key in keys {
+            if key == "*" {
+                self.cite_all = true;
+                continue;
+            }
+            self.cited.insert(key.clone());
+            if self.bibliography.contains_key(key) && !self.citation_numbers.contains_key(key) {
+                self.citation_counter += 1;
+                self.citation_numbers.insert(key.clone(), self.citation_counter);
+            }
+        }
+        if self.cite_all {
+            let mut keys: Vec<String> = self.bibliography.keys().cloned().collect();
+            keys.sort();
+            for key in keys {
+                if !self.citation_numbers.contains_key(&key) {
+                    self.citation_counter += 1;
+                    self.citation_numbers.insert(key, self.citation_counter);
+                }
+            }
+        }
+    }
+
     /// The reference list: `(marker, LaTeX source)` per entry, in order.
     /// Numeric style lists the cited entries by number (`[1]`); author-year
     /// and note styles list every entry, sorted by author and year, with no
@@ -395,7 +429,11 @@ impl CitationManager {
                     .collect()
             }
             CitationStyle::AuthorYear | CitationStyle::Note => {
-                let mut entries: Vec<_> = self.bibliography.values().collect();
+                let mut entries: Vec<_> = self
+                    .bibliography
+                    .values()
+                    .filter(|entry| self.cite_all || self.cited.contains(&entry.key))
+                    .collect();
                 entries.sort_by_key(|entry| {
                     (
                         entry

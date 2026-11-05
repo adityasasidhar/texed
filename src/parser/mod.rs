@@ -252,6 +252,8 @@ pub struct Parser {
     builtin_open: HashMap<String, usize>,
     /// Bodies of plain TeX `\loop`s and how many rounds each ran.
     loop_bodies: Vec<(Vec<Token>, usize)>,
+    /// Keys from \nocite, applied after the citations are numbered.
+    nocite_keys: Vec<String>,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -322,6 +324,7 @@ impl Parser {
             count_registers: HashMap::new(),
             builtin_open: HashMap::new(),
             loop_bodies: Vec::new(),
+            nocite_keys: Vec::new(),
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -356,6 +359,8 @@ impl Parser {
         // Second pass: resolve forward references and render citations now
         // that every label is known and the citation style/database is final.
         self.resolve_references_in_blocks(&mut blocks);
+        let nocite = std::mem::take(&mut self.nocite_keys);
+        self.citation_manager.nocite(&nocite);
         let footnote_inlines = std::mem::take(&mut self.footnote_inlines);
         let mut footnote_nums: Vec<usize> = footnote_inlines.keys().copied().collect();
         footnote_nums.sort();
@@ -939,6 +944,11 @@ impl Parser {
             }
             "abstract" => self.parse_abstract(),
             "itemize" => self.parse_itemize(),
+            // enumitem's inline lists (itemize*, enumerate*): lists here
+            "itemize*" | "inparaitem" => self.parse_list(&env_name, false),
+            "enumerate*" | "inparaenum" => self.parse_list(&env_name, true),
+            "linenomath" | "linenomath*" | "NoHyper" | "subtable" | "subtable*" | "landscape*"
+            | "ThreePartTable" | "adjustwidth*" => self.parse_transparent_environment(&env_name, 0, false),
             "enumerate" => self.parse_enumerate(),
             "description" => self.parse_description(),
             "quote" | "quotation" | "displayquote" | "verse" => {
@@ -2160,6 +2170,13 @@ impl Parser {
             "center" | "endcenter" | "flushleft" | "endflushleft" | "flushright" | "endflushright"
             | "quote" | "endquote" | "quotation" | "endquotation" | "trivlist" | "endtrivlist"
             | "endlist" | "endtableau" => Ok(Some(None)),
+            "nocite" => {
+                self.skip_whitespace_only();
+                let keys = self.parse_braced_text()?;
+                self.nocite_keys
+                    .extend(keys.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()));
+                Ok(Some(None))
+            }
             // Czech quotes \uv{...}: „...“
             "uv" => {
                 self.skip_whitespace_only();
@@ -5213,8 +5230,24 @@ impl Parser {
         accent: crate::lexer_extended::AccentType,
     ) -> Result<Option<Inline>> {
         match self.current_token().clone() {
+            // \'\i, \"\j: the dotless letters take the accent (í, ï)
+            Token::Command(c) if c == "i" || c == "j" => {
+                self.advance();
+                // the space after the control word \i is not a space
+                if matches!(self.current_token(), Token::Whitespace(_)) {
+                    self.advance();
+                }
+                let base = if c == "i" { 'i' } else { 'j' };
+                Ok(Some(Inline::Text(apply_accent_string(&accent, base))))
+            }
             Token::LeftBrace => {
                 let text = self.parse_braced_text()?;
+                // {\i}, {\j}
+                let text = match text.trim() {
+                    "\\i" => String::from("i"),
+                    "\\j" => String::from("j"),
+                    _ => text,
+                };
                 let mut chars = text.chars();
                 match chars.next() {
                     Some(base) => {
@@ -7385,7 +7418,7 @@ fn noop_command_signature(cmd: &str) -> Option<(usize, bool)> {
 
         // One braced argument
         "vspace" | "hspace" | "vskip" | "hskip" | "phantom" | "hphantom" | "vphantom"
-        | "pagenumbering" | "thispagestyle" | "pagestyle" | "linespread" | "nocite"
+        | "pagenumbering" | "thispagestyle" | "pagestyle" | "linespread"
         | "hyphenation" | "markright" | "enlargethispage" | "setstretch" | "index"
         | "glossary" | "hypersetup" | "geometry" | "usetikzlibrary" | "color"
         | "pagecolor" | "institute" | "titlerunning" | "authorrunning" | "acmConference"
