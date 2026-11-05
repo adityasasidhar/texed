@@ -792,3 +792,48 @@ fn test_inputminted_reads_the_file() {
     assert!(output.contains("```python\nprint('hi')\n```"), "got: {}", output);
     assert!(output.contains("Done."), "got: {}", output);
 }
+
+#[test]
+fn test_subfile_uses_main_preamble() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::create_dir_all(temp_dir.path().join("inc")).unwrap();
+    fs::create_dir_all(temp_dir.path().join("ch")).unwrap();
+    fs::write(
+        temp_dir.path().join("inc/main.tex"),
+        "\\documentclass{article}\n\\usepackage{subfiles}\n\\newcommand{\\hello}{Hello from main}\n\\begin{document}\nMain body.\n\\end{document}\n",
+    )
+    .unwrap();
+    let sub = temp_dir.path().join("ch/sec.tex");
+    fs::write(&sub, "\\documentclass[../inc/main]{subfiles}\n\\begin{document}\nSub: \\hello.\n\\end{document}\n").unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&sub).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("Sub: Hello from main."), "got: {}", output);
+    assert!(!output.contains("Main body"), "got: {}", output);
+}
+
+#[test]
+fn test_open_conditional_ends_with_its_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let main = temp_dir.path().join("main.tex");
+    fs::write(temp_dir.path().join("defs.tex"), "\\iffalse\nhidden\n").unwrap();
+    fs::write(&main, "\\documentclass{article}\n\\input{defs}\n\\begin{document}\nVisible body.\n\\end{document}\n").unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&main).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("Visible body."), "got: {}", output);
+    assert!(!output.contains("hidden"), "got: {}", output);
+}
+
+#[test]
+fn test_input_if_file_exists_takes_the_else_branch() {
+    let temp_dir = TempDir::new().unwrap();
+    let main = temp_dir.path().join("main.tex");
+    fs::write(temp_dir.path().join("present.tex"), "\\newcommand{\\fromfile}{File content}\n").unwrap();
+    fs::write(
+        &main,
+        "\\documentclass{article}\n\\InputIfFileExists{present}{}{\\newcommand{\\fromfile}{wrong}}\n\\InputIfFileExists{absent-config}{}{\\newcommand{\\fallback}{Fallback used}}\n\\begin{document}\n\\fromfile. \\fallback.\n\\end{document}\n",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&main).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("File content. Fallback used."), "got: {}", output);
+}

@@ -414,3 +414,63 @@ fn xparse_verbatim_argument_with_delimiter() {
 fn csquotes_textquote() {
     has("\\textquote[Knuth]{Premature optimisation}", "\"Premature optimisation\" (Knuth)");
 }
+
+#[test]
+fn expandafter_let_csname() {
+    let doc = "\\makeatletter\\def\\orig@x{Original}\\def\\x{Changed}\\expandafter\\let\\csname x\\expandafter\\endcsname\\csname orig@x\\endcsname\\makeatother\n\\x";
+    has(doc, "Original");
+    lacks(doc, "Changed");
+    has("\\expandafter\\def\\csname my name\\endcsname{Made}\\csname my name\\endcsname", "Made");
+}
+
+#[test]
+fn german_babel_shorthands() {
+    let doc = "\\documentclass{article}\\usepackage[ngerman]{babel}\\begin{document}Gr\"o\"se und Stra\"se, \"`Zitat\"' und Zucker\"-b\"acker.\\end{document}";
+    has(doc, "Größe und Straße, \u{201e}Zitat\u{201c} und Zuckerbäcker.");
+    // without German, a double quote stays a double quote
+    has("Say \"a\" here.", "\"a\"");
+}
+
+#[test]
+fn defined_shorthands() {
+    has("\\newcommand{\\tok}[1]{(#1)}\\useshorthands{!}\\defineshorthand{!!}{\\tok}Some !!{word} here.", "Some (word) here.");
+}
+
+#[test]
+fn branch_arguments_after_line_end() {
+    has("\\NewDocumentCommand{\\a}{s}{\\IfBooleanTF {#1}\n    {Y}{N}}\\a* \\a.", "Y N.");
+}
+
+#[test]
+fn indentation_after_comment_is_not_a_space() {
+    has("\\newcommand{\\x}{a%\n    b}\\x", "ab");
+}
+
+#[test]
+fn xparse_braced_token_argument() {
+    let doc = "\\DeclareDocumentCommand \\eq { t{/} o o } {\\IfNoValueTF {#3}{=}{\\IfBooleanTF{#1}{#2 N #3}{#2 E #3}}}\\eq[A][B] and \\eq/[A][B].";
+    has(doc, "A E B and A N B.");
+}
+
+#[test]
+fn newcommand_body_after_line_break() {
+    has("\\newcommand{\\ia}[1]\n  {(#1)}\\ia{x}", "(x)");
+}
+
+#[test]
+fn etoolbox_and_kernel_list_loops() {
+    has("\\renewcommand*{\\do}[1]{(#1)}\\docsvlist{a, b ,c}", "(a)(b)(c)");
+    has("\\makeatletter\\@for\\it:=a,b\\do{[\\it]}", "\\[a\\]\\[b\\]");
+    has("\\listadd{\\L}{one}\\listadd{\\L}{two}\\renewcommand*{\\do}[1]{<#1>}\\dolistloop{\\L}", "one>");
+    has("\\newcommand{\\iftag}[3]{\\def\\iftagtext{#3}\\def\\do##1{\\iftoggle{##1}{\\def\\iftagtext{#2}}{}}\\docsvlist{#1}\\iftagtext}\\newtoggle{X}\\toggletrue{X}\\iftag{X}{yes}{no} \\iftag{Y}{yes}{no}", "yes no");
+}
+
+#[test]
+fn xparse_nested_optional_arguments() {
+    has("\\NewDocumentCommand{\\q}{o o}{\\IfNoValueTF{#2}{#1}{#1:#2}}\\q[a][\\q[b][c]]", "a:b:c");
+}
+
+#[test]
+fn prooftree_is_kept_as_latex() {
+    has("\\begin{prooftree}\\AxiomC{A}\\UnaryInfC{B}\\end{prooftree}", "```latex\n\\begin{prooftree}");
+}

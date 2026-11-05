@@ -180,6 +180,19 @@ impl Lexer {
         if self.math_mode {
             match ch {
                 '\\' => return self.lex_command(),
+                // comments exist in math too (macro bodies expanded there)
+                '%' => {
+                    while !self.is_at_end() && self.current_char() != '\n' {
+                        self.advance();
+                    }
+                    if !self.is_at_end() {
+                        self.advance();
+                    }
+                    while !self.is_at_end() && matches!(self.current_char(), ' ' | '\t') {
+                        self.advance();
+                    }
+                    return Ok(None);
+                }
                 '{' => {
                     self.advance();
                     return Ok(Some(Token::LeftBrace));
@@ -362,10 +375,11 @@ impl Lexer {
             return Ok(Some(Token::Command(ch.to_string())));
         }
 
-        // Explicit interword space: "\ " or backslash before line end
+        // Explicit interword space: "\ " or backslash before line end. A
+        // control space is a real space: never skipped like ordinary ones
         if ch == ' ' || ch == '\t' || ch == '\n' {
             self.advance();
-            return Ok(Some(Token::Whitespace(String::from(" "))));
+            return Ok(Some(Token::Text(String::from(" "))));
         }
 
         // Discretionary hyphen \-, italic correction \/, spacing factor \@: no output
@@ -1119,6 +1133,10 @@ impl Lexer {
                 lookahead >= self.input.len() || self.input[lookahead] == '\n';
             if !blank_line_follows {
                 self.advance();
+                // TeX skips the spaces at the start of every line
+                while self.position < lookahead {
+                    self.advance();
+                }
             }
         }
 
@@ -1605,6 +1623,9 @@ pub fn is_verbatim_environment(name: &str) -> bool {
             | "filecontents"
             | "filecontents*"
             | "tikzpicture"
+            | "prooftree"
+            | "prooftree*"
+            | "bprooftree"
             | "tikzcd"
             | "pgfpicture"
             | "circuitikz"

@@ -22,6 +22,26 @@ impl MacroProcessor {
         // Common LaTeX macros. Layout commands (\par, \newline, \smallskip, ...)
         // are intentionally NOT defined here: the parser gives them structural
         // meaning, which text substitution would destroy.
+        // Caption/heading names (babel's English defaults) and the theorem
+        // names that thmtools/translations-based classes refer to
+        for (name, text) in [
+            ("figurename", "Figure"), ("tablename", "Table"), ("chaptername", "Chapter"),
+            ("partname", "Part"), ("appendixname", "Appendix"), ("contentsname", "Contents"),
+            ("abstractname", "Abstract"), ("refname", "References"), ("bibname", "Bibliography"),
+            ("indexname", "Index"), ("listfigurename", "List of Figures"),
+            ("listtablename", "List of Tables"), ("proofname", "Proof"), ("glossaryname", "Glossary"),
+            ("seename", "see"), ("alsoname", "see also"), ("ccname", "cc"), ("enclname", "encl"),
+            ("pagename", "Page"), ("headtoname", "To"),
+            ("theoremname", "Theorem"), ("lemmaname", "Lemma"), ("propositionname", "Proposition"),
+            ("corollaryname", "Corollary"), ("definitionname", "Definition"), ("examplename", "Example"),
+            ("remarkname", "Remark"), ("exercisename", "Exercise"), ("problemname", "Problem"),
+            ("conjecturename", "Conjecture"), ("claimname", "Claim"), ("factname", "Fact"),
+            ("notationname", "Notation"), ("axiomname", "Axiom"), ("assumptionname", "Assumption"),
+            ("observationname", "Observation"), ("questionname", "Question"), ("solutionname", "Solution"),
+            ("notename", "Note"), ("casename", "Case"), ("algorithmname", "Algorithm"),
+        ] {
+            self.define_builtin(name, 0, text);
+        }
         self.define_builtin("LaTeX", 0, "LaTeX");
         self.define_builtin("TeX", 0, "TeX");
         self.define_builtin("LaTeXe", 0, "LaTeX2e");

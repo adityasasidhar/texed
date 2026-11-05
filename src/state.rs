@@ -146,6 +146,8 @@ pub enum XArg {
     Optional(Option<String>),
     /// `s`: star; `t<c>`: test for token c
     Token(char),
+    /// `!s` / `!t<c>`: the token must follow immediately (no space skipping)
+    TokenExact(char),
     /// `d<>` / `D<>{default}` / `r<>`: delimited
     Delimited(char, char, Option<String>),
     /// `v`: verbatim group

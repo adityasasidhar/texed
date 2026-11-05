@@ -240,6 +240,11 @@ pub struct Parser {
     label_targets: Vec<LabelTarget>,
     /// Units declared with `\DeclareSIUnit\name{symbol}` (symbol as text).
     si_units: HashMap<String, String>,
+    /// A subfile's main preamble was read (`\documentclass[main]{subfiles}`).
+    subfiles_loaded: bool,
+    /// babel shorthands: character sequences in text replaced by LaTeX
+    /// (`"a` -> ä with german, `\defineshorthand{!!}{\foo}`).
+    shorthands: Vec<(String, String)>,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -305,6 +310,8 @@ impl Parser {
             float_envs: HashMap::from([(String::from("listing"), String::from("Listing"))]),
             label_targets: Vec::new(),
             si_units: HashMap::new(),
+            subfiles_loaded: false,
+            shorthands: Vec::new(),
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -841,7 +848,7 @@ impl Parser {
             // Graphics code: kept whole (with its \begin/\end) so it can be
             // re-rendered, as a LaTeX code block
             "tikzpicture" | "tikzcd" | "pgfpicture" | "circuitikz" | "pspicture" | "forest"
-            | "tikzonimage" | "dot2tex" => Some(Block::CodeBlock {
+            | "tikzonimage" | "dot2tex" | "prooftree" | "prooftree*" | "bprooftree" => Some(Block::CodeBlock {
                 language: Some(String::from("latex")),
                 content: format!("\\begin{{{}}}{}\\end{{{}}}", name, content, name),
             }),
@@ -1372,6 +1379,34 @@ impl Parser {
         tokens
     }
 
+    /// An xparse optional argument: like `collect_bracketed_tokens`, but
+    /// nested `[...]` pairs are matched (`\foo[\bar[x]]`), as ltcmd does.
+    fn collect_xparse_optional(&mut self) -> Vec<Token> {
+        if !matches!(self.current_token(), Token::LeftBracket) {
+            return Vec::new();
+        }
+        self.advance();
+        let (mut braces, mut brackets) = (0usize, 0usize);
+        let mut tokens = Vec::new();
+        while !self.is_at_end() {
+            match self.current_token() {
+                Token::RightBracket if braces == 0 && brackets == 0 => {
+                    self.advance();
+                    break;
+                }
+                Token::ParBreak => break,
+                Token::LeftBrace => braces += 1,
+                Token::RightBrace => braces = braces.saturating_sub(1),
+                Token::LeftBracket if braces == 0 => brackets += 1,
+                Token::RightBracket if braces == 0 => brackets -= 1,
+                _ => {}
+            }
+            tokens.push(self.current_token().clone());
+            self.advance();
+        }
+        tokens
+    }
+
     fn parse_description(&mut self) -> Result<Option<Block>> {
         let mut items = Vec::new();
 
@@ -1819,6 +1854,55 @@ impl Parser {
         Ok(())
     }
 
+    /// Split text at its first babel shorthand: the text before, the
+    /// shorthand's LaTeX, the text after (shorthands in it are found when
+    /// it is read again).
+    fn apply_shorthands(&mut self, text: &str) -> Option<Vec<Token>> {
+        let (pos, seq, code) = self
+            .shorthands
+            .iter()
+            .filter_map(|(seq, code)| text.find(seq.as_str()).map(|pos| (pos, seq, code)))
+            .min_by_key(|(pos, seq, _)| (*pos, usize::MAX - seq.len()))?;
+        let (seq_len, code) = (seq.len(), code.clone());
+        if !self.consume_expansion_budget("babel-shorthand") {
+            return None;
+        }
+        let mut tokens = Vec::new();
+        if pos > 0 {
+            tokens.push(Token::Text(text[..pos].to_string()));
+        }
+        // the code is read as a group-less fragment; plain text is literal
+        if code.contains('\\') {
+            tokens.extend(tex::lex_fragment(&code));
+        } else if !code.is_empty() {
+            tokens.push(Token::Text(code));
+        }
+        let rest = &text[pos + seq_len..];
+        if !rest.is_empty() {
+            tokens.push(Token::Text(rest.to_string()));
+        }
+        Some(tokens)
+    }
+
+    /// The German shorthands of babel (german, ngerman, austrian, ...).
+    fn enable_german_shorthands(&mut self) {
+        if self.shorthands.iter().any(|(s, _)| s == "\"a") {
+            return;
+        }
+        for (seq, code) in [
+            ("\"a", "ä"), ("\"o", "ö"), ("\"u", "ü"), ("\"A", "Ä"), ("\"O", "Ö"), ("\"U", "Ü"),
+            ("\"e", "ë"), ("\"i", "ï"), ("\"E", "Ë"), ("\"I", "Ï"),
+            ("\"s", "ß"), ("\"z", "ß"), ("\"S", "SS"), ("\"Z", "SZ"),
+            ("\"ck", "ck"), ("\"ff", "ff"), ("\"ll", "ll"), ("\"mm", "mm"), ("\"nn", "nn"),
+            ("\"pp", "pp"), ("\"rr", "rr"), ("\"tt", "tt"),
+            ("\"`", "\u{201e}"), ("\"\u{2018}", "\u{201e}"), ("\"'", "\u{201c}"), ("\"\u{2019}", "\u{201c}"),
+            ("\"<", "\u{ab}"), ("\">", "\u{bb}"), ("\"-", ""), ("\"\"", ""), ("\"|", ""),
+            ("\"~", "-"), ("\"=", "-"), ("\"/", "/"),
+        ] {
+            self.shorthands.push((seq.to_string(), code.to_string()));
+        }
+    }
+
     /// Float type declarations: float's `\newfloat{name}{pos}{ext}[within]`
     /// and `\floatname{name}{Caption}`, newfloat's
     /// `\DeclareFloatingEnvironment[name=..,within=..]{name}` and
@@ -1988,6 +2072,34 @@ impl Parser {
                 if !name.is_empty() {
                     self.si_units.insert(name, symbol);
                 }
+                Ok(Some(None))
+            }
+            // babel: \defineshorthand[langs]{seq}{code}, \useshorthands{c}
+            "defineshorthand" | "declare@shorthand" => {
+                self.skip_whitespace_and_comments();
+                if cmd == "defineshorthand" && matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                if cmd == "declare@shorthand" {
+                    let _ = self.parse_braced_text()?;
+                }
+                self.skip_whitespace_and_comments();
+                let seq = self.parse_braced_raw_text();
+                self.skip_whitespace_and_comments();
+                let tokens = self.collect_braced_tokens();
+                let code = self.raw_token_text(&tokens);
+                let seq = seq.trim().to_string();
+                if !seq.is_empty() && seq.len() <= 8 && !seq.contains(char::is_whitespace) {
+                    self.shorthands.retain(|(s, _)| *s != seq);
+                    self.shorthands.push((seq, code));
+                }
+                Ok(Some(None))
+            }
+            "useshorthands" | "useshorthands*" | "shorthandon" | "shorthandoff" | "initiate@active@char"
+            | "bbl@activate" | "bbl@deactivate" => {
+                self.consume_text_star();
+                self.skip_whitespace_and_comments();
+                let _ = self.parse_braced_raw_text();
                 Ok(Some(None))
             }
             "fcolorbox" => {
@@ -2191,6 +2303,15 @@ impl Parser {
                 counter_key: env_type.to_string(),
                 within: None,
             });
+        // \newtheorem{defn}{\definitionname}: the name is expanded when used
+        let mut theorem_def = theorem_def;
+        if theorem_def.display_name.contains('\\') {
+            let inlines = self.latex_to_inlines(&theorem_def.display_name);
+            let name = self.inlines_to_plain_text(&inlines).trim().to_string();
+            if !name.is_empty() {
+                theorem_def.display_name = name;
+            }
+        }
         let number = self.state.next_theorem_number(env_type);
         // Optional [title], parsed as inline LaTeX (may hold math, \cite, ...)
         let mut label = None;
@@ -2344,6 +2465,9 @@ impl Parser {
                 Some(Token::Command(c)) if matches!(c.as_str(), "maketitle" | "chapter" | "section" | "par") => {
                     return true
                 }
+                // a group left open at the end of an input file: dissolve it
+                // rather than let it run into the including document
+                Some(Token::Command(c)) if is_file_end_marker(c) => return true,
                 _ => {}
             }
         }
@@ -2377,8 +2501,23 @@ impl Parser {
 
         match token {
             Token::Text(text) => {
-                let text = text.clone();
+                let mut text = text.clone();
                 self.advance();
+                if !self.shorthands.is_empty() {
+                    // `"` + a quote the lexer already made typographic
+                    if text.ends_with('"') {
+                        if let Token::Text(next) = self.current_token().clone() {
+                            if next.starts_with(['\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}']) {
+                                self.advance();
+                                text.push_str(&next);
+                            }
+                        }
+                    }
+                    if let Some(tokens) = self.apply_shorthands(&text) {
+                        self.push_front(tokens);
+                        return Ok(None);
+                    }
+                }
                 Ok(Some(Inline::Text(text)))
             }
             Token::Whitespace(_) | Token::Newline => {
@@ -4744,7 +4883,7 @@ impl Parser {
 
     fn parse_macro_definition_command(&mut self, mode: MacroDefinitionMode) -> Result<()> {
         let tex_style = std::mem::take(&mut self.macro_def_tex_style);
-        self.skip_whitespace_and_comments();
+        self.skip_whitespace_only();
         // Both \newcommand{\name} and the unbraced \newcommand\name are valid
         let name_raw = if matches!(self.current_token(), Token::LeftBrace) {
             self.parse_braced_text()?
@@ -4787,15 +4926,16 @@ impl Parser {
             delimiters = d;
             num_params = n;
         } else {
-            self.skip_whitespace_and_comments();
+            // LaTeX skips spaces and line ends between \newcommand's parts
+            self.skip_whitespace_only();
             if matches!(self.current_token(), Token::LeftBracket) {
                 num_params = self.parse_bracketed_text()?.trim().parse::<usize>().unwrap_or(0).min(9);
             }
-            self.skip_whitespace_and_comments();
+            self.skip_whitespace_only();
             if matches!(self.current_token(), Token::LeftBracket) {
                 optional_param = Some(self.parse_bracketed_text()?);
             }
-            self.skip_whitespace_and_comments();
+            self.skip_whitespace_only();
         }
 
         let body = if matches!(self.current_token(), Token::LeftBrace) {
@@ -5097,14 +5237,16 @@ impl Parser {
                 XArg::Optional(default) => {
                     self.skip_whitespace_only();
                     if matches!(self.current_token(), Token::LeftBracket) {
-                        let tokens = self.collect_bracketed_tokens();
+                        let tokens = self.collect_xparse_optional();
                         args.push(tokens.iter().map(|t| self.token_to_string(t)).collect());
                     } else {
                         args.push(default.clone().unwrap_or_else(|| String::from("-NoValue-")));
                     }
                 }
-                XArg::Token(c) => {
-                    self.skip_whitespace_only();
+                XArg::Token(c) | XArg::TokenExact(c) => {
+                    if matches!(xarg, XArg::Token(_)) {
+                        self.skip_whitespace_only();
+                    }
                     let present = match self.current_token() {
                         Token::Text(t) => t.starts_with(*c),
                         _ => false,
@@ -5455,6 +5597,9 @@ impl Parser {
                     }
                     tokens.push(Token::RightBrace);
                 }
+                // "File ended while scanning use of ...": the argument ends
+                // with its file
+                Token::Command(c) if is_file_end_marker(c) => break,
                 token => tokens.push(token.clone()),
             }
             self.advance();
@@ -5523,6 +5668,8 @@ impl Parser {
 
     fn token_to_string(&self, token: &Token) -> String {
         match token {
+            // a control space (the only single-space text token)
+            Token::Text(t) if t == " " => String::from("\\ "),
             // Math-mode tokens keep escapes as commands: their text is raw
             Token::Text(t) if self.in_math_expansion => t.clone(),
             Token::Text(t) => escape_text_token(t),
@@ -5585,6 +5732,13 @@ impl Parser {
                 {
                     self.state.has_chapters = true;
                 }
+                // babel's German shorthands via class options (or the
+                // 2.09 german style option)
+                if options.split(',').any(|o| {
+                    matches!(o.trim(), "german" | "ngerman" | "austrian" | "naustrian" | "swissgerman" | "nswissgerman")
+                }) {
+                    self.enable_german_shorthands();
+                }
                 // LaTeX 2.09: \documentstyle[amssymb,epsf]{article} lists
                 // packages as options
                 if cmd == "documentstyle" {
@@ -5592,6 +5746,11 @@ impl Parser {
                         let package = package.to_string();
                         self.load_local_package(&package);
                     }
+                }
+                // subfiles: the main document's preamble applies
+                if class == "subfiles" && !options.trim().is_empty() {
+                    self.load_subfiles_main(options.trim());
+                    return Ok(None);
                 }
                 // A local .cls next to the document carries its macros
                 if !class.is_empty() {
@@ -5638,6 +5797,14 @@ impl Parser {
                 }
                 for package in packages.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                     let package = package.to_string();
+                    let german = |o: &str| {
+                        matches!(o.trim(), "german" | "ngerman" | "austrian" | "naustrian" | "swissgerman" | "nswissgerman")
+                    };
+                    if matches!(package.as_str(), "german" | "ngerman")
+                        || (package == "babel" && options.split(',').any(german))
+                    {
+                        self.enable_german_shorthands();
+                    }
                     // biblatex declares its citation style as a package option
                     if package == "biblatex" {
                         let author_year = options.split(',').any(|opt| {
@@ -5984,6 +6151,65 @@ impl Parser {
     /// Read a package/class file found next to the document (local style
     /// files hold the document's macro and theorem definitions) and splice
     /// it in. Packages not found locally are standard ones: nothing to do.
+    /// `\documentclass[main]{subfiles}`: read the main document's preamble
+    /// (its class, packages and macros) as subfiles does. Relative paths in
+    /// it resolve from the subfile's directory, as in a subfile compile.
+    fn load_subfiles_main(&mut self, main: &str) {
+        if self.subfiles_loaded || main.contains('\\') {
+            return;
+        }
+        self.subfiles_loaded = true;
+        let mut bases: Vec<PathBuf> = Vec::new();
+        if let Some((dir, _)) = self.input_stack.last() {
+            bases.push(dir.clone());
+        }
+        if let Some(base) = &self.base_path {
+            bases.push(base.clone());
+        }
+        bases.push(PathBuf::new());
+        let names = if main.ends_with(".tex") {
+            vec![main.to_string()]
+        } else {
+            vec![format!("{}.tex", main), main.to_string()]
+        };
+        let path = bases
+            .iter()
+            .flat_map(|base| names.iter().map(move |n| base.join(n)))
+            .find(|p| p.is_file());
+        let Some(path) = path else {
+            self.state.warn(format!("subfiles main document `{}` not found", main));
+            return;
+        };
+        let Ok(content) = crate::decode::read_file(&path) else {
+            return;
+        };
+        let preamble = match find_uncommented(&content, "\\begin{document}", false) {
+            Some(end) => &content[..end],
+            None => &content[..],
+        };
+        if !self.consume_expansion_bytes("subfiles", preamble.len()) {
+            return;
+        }
+        self.note_verbatim_envs(preamble);
+        let mut tokens = Lexer::new(preamble)
+            .with_verbatim_envs(self.verbatim_envs.keys())
+            .with_verb_commands(self.verb_commands.iter())
+            .tokenize()
+            .unwrap_or_default();
+        if matches!(tokens.last(), Some(Token::Eof)) {
+            tokens.pop();
+        }
+        tokens.push(Token::Command(String::from("texed@endpackage")));
+        tokens.push(Token::Command(String::from("texed@popdir")));
+        self.account_source_tokens(&tokens);
+        let dir = self.input_stack.last().map(|(d, _)| d.clone()).or_else(|| self.base_path.clone()).unwrap_or_default();
+        self.input_stack.push((dir, String::new()));
+        let was_preamble = self.in_preamble;
+        self.in_preamble = true;
+        self.package_preamble_restore.push(was_preamble);
+        self.push_front(tokens);
+    }
+
     fn load_local_package(&mut self, package: &str) {
         // Relative to the file being read (a package loading a sibling
         // package), then to the main document
@@ -6191,6 +6417,11 @@ impl Parser {
     fn is_at_end(&self) -> bool {
         matches!(self.current_token(), Token::Eof)
     }
+}
+
+/// The parser's markers for the end of an input file or package.
+fn is_file_end_marker(name: &str) -> bool {
+    matches!(name, "texed@endfile" | "texed@popdir" | "texed@endpackage")
 }
 
 static EOF_TOKEN: Token = Token::Eof;
@@ -7140,12 +7371,17 @@ fn parse_xparse_spec(spec: &str) -> Vec<crate::state::XArg> {
         }
         None
     };
+    let mut exact = false;
     while i < chars.len() && out.len() < 9 {
         let c = chars[i];
         i += 1;
+        let bang = std::mem::take(&mut exact);
         match c {
-            // `+` (long) and `!` (no space skipping) are modifiers
-            '+' | '!' | ' ' | '\t' | '\n' => {}
+            // `!` (no space skipping) applies to the next argument
+            '!' => exact = true,
+            // `+` (long) is a modifier
+            // `+` (long) is a modifier; `!` survives it and spaces
+            '+' | ' ' | '\t' | '\n' => exact = bang,
             'm' | 'l' | 'u' => out.push(XArg::Mandatory),
             'v' => out.push(XArg::Verbatim),
             'b' => out.push(XArg::Mandatory),
@@ -7154,12 +7390,18 @@ fn parse_xparse_spec(spec: &str) -> Vec<crate::state::XArg> {
                 let default = read_group(&mut i).unwrap_or_default();
                 out.push(XArg::Optional(Some(default)));
             }
-            's' => out.push(XArg::Token('*')),
+            's' => out.push(if bang { XArg::TokenExact('*') } else { XArg::Token('*') }),
             't' => {
                 if i < chars.len() {
-                    let token = chars[i];
-                    i += 1;
-                    out.push(XArg::Token(token));
+                    // t/ or t{/}
+                    let token = if chars[i] == '{' {
+                        let group = read_group(&mut i).unwrap_or_default();
+                        group.trim().chars().next().unwrap_or('*')
+                    } else {
+                        i += 1;
+                        chars[i - 1]
+                    };
+                    out.push(if bang { XArg::TokenExact(token) } else { XArg::Token(token) });
                 }
             }
             'd' | 'r' | 'D' | 'R' => {

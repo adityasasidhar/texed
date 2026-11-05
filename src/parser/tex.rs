@@ -124,7 +124,17 @@ impl Parser {
     /// without alias resolution.
     pub(super) fn parse_tex_primitive(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         match cmd {
-            "global" | "long" | "outer" | "protected" | "immediate" | "expandafter"
+            "expandafter" => {
+                self.expand_after(0)?;
+                return Ok(Some(None));
+            }
+            // etoolbox / kernel list loops
+            "docsvlist" | "forcsvlist" | "dolistloop" | "forlistloop" | "dolistcsloop" | "forlistcsloop"
+            | "@for" | "listadd" | "listgadd" | "listeadd" | "listxadd" | "listcsadd" | "listcsgadd" => {
+                self.parse_list_loop(cmd)?;
+                return Ok(Some(None));
+            }
+            "global" | "long" | "outer" | "protected" | "immediate"
             | "noexpand" | "unexpanded" | "ignorespaces" | "makeatletter" | "makeatother"
             | "ExplSyntaxOn" | "ExplSyntaxOff" | "endcsname" => return Ok(Some(None)),
             "let" => {
@@ -162,9 +172,21 @@ impl Parser {
                 let value = match cmd {
                     "@ifundefined" => !self.is_defined_command(subject.trim().trim_start_matches('\\')),
                     "@ifdefinable" => true,
+                    // a local file is looked up; a bare name not found here
+                    // is assumed to be an installed package file
+                    "IfFileExists" | "InputIfFileExists" => {
+                        let name = self.expand_parameterless_macros(&subject);
+                        let name = name.trim();
+                        self.local_file_exists(name)
+                            || (cmd == "IfFileExists" && !name.contains('/') && !subject.contains('\\'))
+                    }
                     // We behave as a current LaTeX with the usual packages
                     _ => true,
                 };
+                if cmd == "InputIfFileExists" && !value {
+                    self.push_front(no);
+                    return Ok(Some(None));
+                }
                 if cmd == "InputIfFileExists" {
                     // \InputIfFileExists{file}{before}{else}: run `before`;
                     // the file itself is resolved like \input
@@ -201,7 +223,7 @@ impl Parser {
             // xparse value tests (arguments arrive as -NoValue- / \BooleanTrue)
             "IfNoValueTF" | "IfNoValueT" | "IfNoValueF" | "IfValueTF" | "IfValueT"
             | "IfValueF" | "IfBooleanTF" | "IfBooleanT" | "IfBooleanF" => {
-                self.skip_whitespace_and_comments();
+                self.skip_whitespace_only();
                 let arg = self.parse_braced_text()?;
                 let arg = arg.trim();
                 let condition = if cmd.starts_with("IfBoolean") {
@@ -476,7 +498,8 @@ impl Parser {
 
     /// One branch argument: a braced group's tokens, or a single token.
     pub(super) fn take_branch_tokens(&mut self) -> Vec<Token> {
-        self.skip_whitespace_and_comments();
+        // TeX skips spaces and a line end before an undelimited argument
+        self.skip_whitespace_only();
         if matches!(self.current_token(), Token::LeftBrace) {
             self.collect_braced_tokens()
         } else if self.is_at_end() {
@@ -785,6 +808,11 @@ impl Parser {
     fn skip_branch(&mut self, stop_at_else: bool, stop_at_or: bool) -> BranchEnd {
         let mut depth = 0usize;
         while !self.is_at_end() {
+            // a file ends a skipped conditional, as in TeX ("Incomplete \if;
+            // all text was ignored after line n")
+            if matches!(self.current_token(), Token::Command(c) if c.starts_with("texed@end") || c == "texed@popdir") {
+                return BranchEnd::Fi;
+            }
             let token = self.current_token().clone();
             self.advance();
             if let Token::Command(name) = token {
@@ -908,10 +936,20 @@ impl Parser {
     fn parse_let(&mut self) -> Result<()> {
         self.skip_whitespace_and_comments();
         let target = match self.current_token().clone() {
-            Token::Command(name) => name,
+            // \let\csname name\endcsname ...
+            Token::Command(name) if name == "csname" => {
+                self.advance();
+                self.collect_csname()
+            }
+            Token::Command(name) => {
+                self.advance();
+                name
+            }
             _ => return Ok(()),
         };
-        self.advance();
+        if target.is_empty() {
+            return Ok(());
+        }
         self.skip_whitespace_and_comments();
         if let Token::Text(t) = self.current_token().clone() {
             if let Some(rest) = t.strip_prefix('=') {
@@ -925,8 +963,18 @@ impl Parser {
         if matches!(self.current_token(), Token::Whitespace(_)) {
             self.advance();
         }
-        let source = self.current_token().clone();
-        self.advance();
+        let source = match self.current_token().clone() {
+            Token::Command(name) if name == "csname" => {
+                self.advance();
+                let name = self.collect_csname();
+                // an undefined \csname is \relax
+                Token::Command(if name.is_empty() { String::from("relax") } else { name })
+            }
+            other => {
+                self.advance();
+                other
+            }
+        };
 
         self.state.aliases.remove(&target);
         match source {
@@ -962,6 +1010,188 @@ impl Parser {
         Ok(())
     }
 
+    /// Whether `name` (or `name.tex`) exists next to the file being read or
+    /// the main document.
+    pub(super) fn local_file_exists(&self, name: &str) -> bool {
+        if name.is_empty() || name.contains('\0') {
+            return false;
+        }
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some((dir, _)) = self.input_stack.last() {
+            dirs.push(dir.clone());
+        }
+        if let Some(base) = &self.base_path {
+            dirs.push(base.clone());
+        }
+        if dirs.is_empty() {
+            dirs.push(std::path::PathBuf::new());
+        }
+        dirs.iter().any(|dir| {
+            dir.join(name).is_file() || dir.join(format!("{}.tex", name)).is_file()
+        })
+    }
+
+    /// `\docsvlist{a,b}` -> `\do{a}\do{b}`; `\forcsvlist{\h}{a,b}`;
+    /// etoolbox lists built with `\listadd` and run with `\dolistloop` /
+    /// `\forlistloop`; the kernel's `\@for\x:=a,b\do{body}`.
+    fn parse_list_loop(&mut self, cmd: &str) -> Result<()> {
+        const SEP: char = '\u{1f}';
+        let handler = |parser: &mut Self| -> String {
+            parser.skip_whitespace_only();
+            let tokens = parser.take_branch_tokens();
+            parser.raw_token_text(&tokens).trim().to_string()
+        };
+        let (handler, items): (String, Vec<String>) = match cmd {
+            "listadd" | "listgadd" | "listeadd" | "listxadd" | "listcsadd" | "listcsgadd" => {
+                self.skip_whitespace_only();
+                let name = if cmd.starts_with("listcs") {
+                    self.parse_braced_text()?.trim().to_string()
+                } else {
+                    let tokens = self.take_branch_tokens();
+                    self.raw_token_text(&tokens).trim().trim_start_matches('\\').to_string()
+                };
+                self.skip_whitespace_only();
+                let tokens = self.take_branch_tokens();
+                let mut item = self.raw_token_text(&tokens);
+                if matches!(cmd, "listeadd" | "listxadd") {
+                    item = self.expand_parameterless_macros(&item);
+                }
+                if !name.is_empty() && !item.trim().is_empty() {
+                    let mut body = self.state.macros.get(&name).map(|d| d.body.clone()).unwrap_or_default();
+                    if !body.is_empty() {
+                        body.push(SEP);
+                    }
+                    body.push_str(&item);
+                    if body.len() <= 1 << 20 {
+                        self.state.macros.insert(name, crate::state::MacroDef { body, literal: false, ..Default::default() });
+                    }
+                }
+                return Ok(());
+            }
+            "docsvlist" | "forcsvlist" => {
+                let handler = if cmd == "forcsvlist" { handler(self) } else { String::from("\\do") };
+                self.skip_whitespace_only();
+                let tokens = self.take_branch_tokens();
+                let text = self.raw_token_text(&tokens);
+                let text = if text.trim_start().starts_with('\\') && !text.contains(',') {
+                    self.expand_parameterless_macros(&text)
+                } else {
+                    text
+                };
+                (handler, split_top_level(&text, ','))
+            }
+            "dolistloop" | "forlistloop" | "dolistcsloop" | "forlistcsloop" => {
+                let handler = if cmd.starts_with("for") { handler(self) } else { String::from("\\do") };
+                self.skip_whitespace_only();
+                let name = if cmd.contains("cs") {
+                    self.parse_braced_text()?.trim().to_string()
+                } else {
+                    let tokens = self.take_branch_tokens();
+                    self.raw_token_text(&tokens).trim().trim_start_matches('\\').to_string()
+                };
+                let body = self.state.macros.get(&name).map(|d| d.body.clone()).unwrap_or_default();
+                (handler, body.split(SEP).map(str::to_string).collect())
+            }
+            _ => {
+                // \@for\x:=list\do{body}
+                self.skip_whitespace_only();
+                let Token::Command(var) = self.current_token().clone() else {
+                    return Ok(());
+                };
+                self.advance();
+                let mut list = Vec::new();
+                let mut guard = 0;
+                while !self.is_at_end() && guard < 10_000 {
+                    guard += 1;
+                    if matches!(self.current_token(), Token::Command(c) if c == "do") {
+                        self.advance();
+                        break;
+                    }
+                    list.push(self.current_token().clone());
+                    self.advance();
+                }
+                let text = self.raw_token_text(&list);
+                let text = text.trim_start().strip_prefix(":=").unwrap_or(&text).to_string();
+                let text = if text.trim_start().starts_with('\\') {
+                    self.expand_parameterless_macros(&text)
+                } else {
+                    text
+                };
+                self.skip_whitespace_only();
+                let body_tokens = self.take_branch_tokens();
+                let body = self.raw_token_text(&body_tokens);
+                let mut source = String::new();
+                for item in split_top_level(&text, ',') {
+                    source.push_str(&format!("\\def\\{}{{{}}}{}", var, item, body));
+                }
+                if self.consume_expansion_bytes("@for", source.len()) && self.consume_expansion_budget("@for") {
+                    self.push_front(lex_fragment(&source));
+                }
+                return Ok(());
+            }
+        };
+        let mut source = String::new();
+        for item in items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
+            source.push_str(&format!("{}{{{}}}", handler, item));
+        }
+        if !source.is_empty() && self.consume_expansion_bytes(cmd, source.len()) && self.consume_expansion_budget(cmd) {
+            self.push_front(lex_fragment(&source));
+        }
+        Ok(())
+    }
+
+    /// `\expandafter A B`: expand B once, then read A again.
+    pub(super) fn expand_after(&mut self, depth: usize) -> Result<()> {
+        if self.is_at_end() || depth > 64 {
+            return Ok(());
+        }
+        // spaces after a control word are not tokens in TeX
+        self.skip_whitespace_only();
+        let first = self.current_token().clone();
+        self.advance();
+        if matches!(first, Token::Command(_)) {
+            self.skip_whitespace_only();
+        }
+        self.expand_once(depth)?;
+        self.push_front(vec![first]);
+        Ok(())
+    }
+
+    /// Replace the current token by its one-level expansion, where the
+    /// engine knows it: `\csname...\endcsname`, `\expandafter`, a user
+    /// macro, a `\let` alias. Anything else is left as is.
+    fn expand_once(&mut self, depth: usize) -> Result<()> {
+        let Token::Command(name) = self.current_token().clone() else {
+            return Ok(());
+        };
+        match name.as_str() {
+            "csname" => {
+                self.advance();
+                let name = self.collect_csname();
+                self.push_front(vec![Token::Command(if name.is_empty() { String::from("relax") } else { name })]);
+            }
+            "expandafter" => {
+                self.advance();
+                self.expand_after(depth + 1)?;
+            }
+            _ if self.state.aliases.contains_key(&name) => {
+                let target = self.state.aliases[&name].clone();
+                if self.consume_expansion_budget(&name) {
+                    self.advance();
+                    self.push_front(vec![Token::Command(target)]);
+                }
+            }
+            _ if self.macro_processor.is_defined(&self.state, &name) && !self.state.macros.get(&name).is_some_and(|d| d.literal) => {
+                self.advance();
+                if let Some(Inline::Text(text)) = self.parse_macro_expansion(&name)? {
+                    self.push_front(vec![Token::Text(text)]);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Collect a control sequence name up to `\endcsname`.
     fn collect_csname(&mut self) -> String {
         let mut name = String::new();
@@ -973,6 +1203,10 @@ impl Parser {
             self.advance();
             match token {
                 Token::Command(c) if c == "endcsname" => break,
+                // \csname a\expandafter\endcsname\csname b\endcsname
+                Token::Command(c) if c == "expandafter" => {
+                    let _ = self.expand_after(0);
+                }
                 Token::Command(c) => {
                     // \csname\string\foo\endcsname and similar: expand to name
                     if let Some(def) = self.state.macros.get(&c) {
@@ -1133,7 +1367,46 @@ pub(super) fn lex_fragment(fragment: &str) -> Vec<Token> {
     if matches!(tokens.last(), Some(Token::Eof)) {
         tokens.pop();
     }
-    tokens
+    drop_spaces_after_control_words(tokens)
+}
+
+/// TeX's tokenizer skips the spaces, and one line end, after a control
+/// word: `\def\x{\foo bar}` is `\foo` then `bar`. Applied to macro bodies
+/// and other re-read fragments (document text keeps its spaces, which is
+/// kinder to `\LaTeX is` typos).
+fn drop_spaces_after_control_words(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len());
+    let mut iter = tokens.into_iter().peekable();
+    while let Some(token) = iter.next() {
+        let word = matches!(&token, Token::Command(name) if name.ends_with(|c: char| c.is_alphabetic() || c == '@'));
+        out.push(token);
+        if !word {
+            continue;
+        }
+        // the spaces (and one line end) after a control word
+        let mut skipped = Vec::new();
+        let mut newline_seen = false;
+        while let Some(next) = iter.peek() {
+            match next {
+                Token::Whitespace(_) => skipped.push(iter.next().unwrap()),
+                Token::Newline if !newline_seen => {
+                    newline_seen = true;
+                    skipped.push(iter.next().unwrap());
+                }
+                _ => break,
+            }
+        }
+        // keep one space before letters: token lists are written back to
+        // text, where `\foo bar` must not become `\foobar`
+        if !skipped.is_empty() {
+            if let Some(Token::Text(t)) = iter.peek() {
+                if t.starts_with(|c: char| c.is_alphabetic() || c == '@') {
+                    out.push(Token::Whitespace(String::from(" ")));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Does the text use expl3 function names (`\clist_set:Nx`)? Such text
@@ -1374,7 +1647,19 @@ impl Parser {
                         if matches!(expansion.last(), Some(Token::Eof)) {
                             expansion.pop();
                         }
-                        self.push_front(expansion);
+                        // a macro body's layout (indentation, line breaks) is
+                        // not the formula's: one space at most
+                        let mut compact: Vec<Token> = Vec::with_capacity(expansion.len());
+                        for token in expansion {
+                            if matches!(token, Token::Whitespace(_) | Token::Newline) {
+                                if !matches!(compact.last(), Some(Token::Whitespace(_)) | None) {
+                                    compact.push(Token::Whitespace(String::from(" ")));
+                                }
+                            } else {
+                                compact.push(token);
+                            }
+                        }
+                        self.push_front(compact);
                     } else {
                         push_math_piece(&mut out, &format!("\\{}", name));
                     }
@@ -1462,6 +1747,23 @@ impl Parser {
         self.active_expansions = saved_expansions;
         self.cond_depth = saved_cond;
         self.in_math_expansion = saved_in_math;
+        if out != math {
+            // spaces are insignificant in math: tidy what expansion left
+            out = out
+                .lines()
+                .map(|line| {
+                    let mut tidy = String::with_capacity(line.len());
+                    for c in line.trim_end().chars() {
+                        if c == ' ' && tidy.ends_with(' ') && !tidy.ends_with("\\ ") {
+                            continue;
+                        }
+                        tidy.push(c);
+                    }
+                    tidy
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
         out
     }
 }
@@ -1476,4 +1778,25 @@ fn push_math_piece(out: &mut String, piece: &str) {
         }
     }
     out.push_str(piece);
+}
+
+/// Split at `sep` outside braces.
+fn split_top_level(text: &str, sep: char) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for c in text.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
+                items.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+    }
+    items.push(current);
+    items
 }
