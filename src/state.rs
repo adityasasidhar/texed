@@ -269,6 +269,37 @@ impl ParserState {
         }
     }
 
+    /// A float type declared by `\newfloat`/`\DeclareFloatingEnvironment`
+    /// (or a package's `listing`): its counter resets with `within`.
+    pub fn declare_float(&mut self, name: &str, within: Option<&str>) {
+        self.user_counters.entry(name.to_string()).or_insert(0);
+        if let Some(within) = within.filter(|w| level_of_sectioning(w).is_some()) {
+            let resets = self.counter_resets.entry(within.to_string()).or_default();
+            if !resets.iter().any(|c| c == name) {
+                resets.push(name.to_string());
+            }
+            self.numberwithin.insert(name.to_string(), within.to_string());
+        }
+    }
+
+    /// Step a declared float's counter and return its formatted number.
+    pub fn next_float_number(&mut self, name: &str) -> String {
+        let counter = self.user_counters.entry(name.to_string()).or_insert(0);
+        *counter += 1;
+        let value = *counter;
+        match self.counter_parent_level(name) {
+            Some(level) => {
+                let prefix = self.section_number_up_to(level);
+                if prefix.is_empty() {
+                    value.to_string()
+                } else {
+                    format!("{}.{}", prefix, value)
+                }
+            }
+            None => value.to_string(),
+        }
+    }
+
     /// Reset the counters numbered within `parent` (recursively).
     pub fn reset_dependents(&mut self, parent: &str) {
         let mut stack = vec![parent.to_string()];

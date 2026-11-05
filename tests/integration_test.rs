@@ -728,3 +728,67 @@ fn test_inline_input_splices_file() {
         .success()
         .stdout(predicate::str::contains("Before inserted text after."));
 }
+
+#[test]
+fn test_bibliography_fields_are_latex() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("input.tex");
+    let bib_file = temp_dir.path().join("refs.bib");
+    let latex = "\\documentclass{article}\n\\addbibresource{refs.bib}\n\\begin{document}\nSee \\cite{k}, \\citetitle{w}, \\cites[p.~3]{k}{w} and \\fullcite{after}.\n\\printbibliography\n\\end{document}\n";
+    let bibtex = concat!(
+        "@string{tug = \"TeX Users Group\"}\n",
+        "@article{k, author = {Donald E. Knuth}, title = {The {\\TeX}book: under_score}, journal = tug # \" Journal\", year = 1984, pages = {1--10}}\n",
+        "@online{w, author = {J{\\\"u}rgen M{\\\"u}ller}, title = {A *star* \\& friends}, date = {2021-03-04}, url = {https://example.com/a_b}}\n",
+        "@book{broken, title = {Never closed\n",
+        "@misc{after, title = {After broken}, year = 2000}\n",
+    );
+    fs::write(&input_file, latex).unwrap();
+    fs::write(&bib_file, bibtex).unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&input_file).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("TeX Users Group Journal"), "got: {}", output);
+    assert!(output.contains("The TeXbook: under\\_score"), "got: {}", output);
+    assert!(output.contains("Jürgen Müller"), "got: {}", output);
+    assert!(output.contains("A \\*star\\* & friends"), "got: {}", output);
+    assert!(output.contains("pp. 1–10") || output.contains("pp.\u{a0}1–10"), "got: {}", output);
+    assert!(output.contains("<https://example.com/a_b>"), "got: {}", output);
+    assert!(output.contains("After broken"), "got: {}", output);
+}
+
+#[test]
+fn test_chapter_with_documentclass_in_example_is_not_a_subfile() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("main.tex");
+    let chapter = temp_dir.path().join("chap.tex");
+    fs::write(
+        &input_file,
+        "\\documentclass{book}\n\\begin{document}\n\\include{chap}\n\\end{document}\n",
+    )
+    .unwrap();
+    fs::write(
+        &chapter,
+        "% a chapter\n\\chapter{Intro}\nOpening text.\n\\begin{verbatim}\n\\documentclass{article}\n\\begin{document}\nHi\n\\end{document}\n\\end{verbatim}\nClosing text.\n",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&input_file).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("# Intro"), "got: {}", output);
+    assert!(output.contains("Opening text."), "got: {}", output);
+    assert!(output.contains("Closing text."), "got: {}", output);
+}
+
+#[test]
+fn test_inputminted_reads_the_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_file = temp_dir.path().join("main.tex");
+    fs::write(temp_dir.path().join("hello.py"), "print('hi')\n").unwrap();
+    fs::write(
+        &input_file,
+        "\\documentclass{article}\n\\begin{document}\nCode:\n\\inputminted{python}{hello.py}\nDone.\n\\end{document}\n",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("texed").unwrap().arg(&input_file).output().unwrap();
+    let output = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.contains("```python\nprint('hi')\n```"), "got: {}", output);
+    assert!(output.contains("Done."), "got: {}", output);
+}

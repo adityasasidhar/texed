@@ -93,7 +93,15 @@ impl Parser {
     fn expand_alias(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         if let Some(target) = self.state.aliases.get(cmd).cloned() {
             if self.consume_expansion_budget(cmd) {
-                let tokens = lex_fragment(&format!("\\{}", target));
+                // a control-sequence name (letters, `@`, expl3 `_`/`:`) is
+                // used as is: re-lexing would split `\c_backslash_str`
+                let is_name = !target.is_empty()
+                    && target.chars().all(|c| c.is_alphabetic() || matches!(c, '@' | '_' | ':'));
+                let tokens = if is_name {
+                    vec![Token::Command(target.clone())]
+                } else {
+                    lex_fragment(&format!("\\{}", target))
+                };
                 // \let captures the *built-in* meaning: mark plain commands so
                 // a later \renewcommand of the original name is bypassed
                 let tokens = tokens

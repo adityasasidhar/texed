@@ -86,7 +86,9 @@ impl MarkdownConverter {
             if !self.output.ends_with("\n\n") {
                 self.output.push('\n');
             }
-            self.output.push_str(bibliography);
+            for block in bibliography {
+                self.convert_block(block)?;
+            }
         }
 
         // Literal brackets not yet resolved by a paragraph-level pass

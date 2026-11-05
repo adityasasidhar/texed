@@ -96,11 +96,17 @@ pub(super) fn format_unit(spec: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] != '\\' {
-            let ch = chars[i];
-            if !ch.is_whitespace() && !matches!(ch, '{' | '}' | '~' | '.') {
-                b.push(&ch.to_string());
+            // a run of literal characters is one unit (`{pc}`, `px`)
+            let start = i;
+            while i < chars.len() && chars[i] != '\\' && !chars[i].is_whitespace() && !matches!(chars[i], '{' | '}' | '~' | '.') {
+                i += 1;
             }
-            i += 1;
+            if i > start {
+                let unit: String = chars[start..i].iter().collect();
+                b.push(&unit);
+            } else {
+                i += 1;
+            }
             continue;
         }
         let start = i + 1;

@@ -330,3 +330,87 @@ fn deep_nesting_is_safe() {
     let doc = format!("{}x{}", "{".repeat(50_000), "}".repeat(50_000));
     has(&doc, "x");
 }
+
+// --- Floats, labels, programming layers ------------------------------------------
+
+#[test]
+fn declared_floats_are_numbered_with_captions() {
+    let doc = "\\documentclass{book}\\usepackage{float}\\newfloat{program}{tbp}{lop}[chapter]\\floatname{program}{Program}\n\\begin{document}\\chapter{One}\n\\begin{program}\\begin{verbatim}\nx = 1\n\\end{verbatim}\n\\caption{Assign}\\label{p:a}\\end{program}\nSee \\ref{p:a}.\\end{document}";
+    has(doc, "**Program 1.1:** Assign");
+    has(doc, "See 1.1.");
+    has(doc, "x = 1");
+}
+
+#[test]
+fn minted_listing_float() {
+    let doc = "\\begin{listing}\\begin{minted}{python}\nprint(1)\n\\end{minted}\n\\caption{Hello}\\label{lst:h}\\end{listing} \\autoref{lst:h}";
+    has(doc, "```python\nprint(1)\n```");
+    has(doc, "**Listing 1:** Hello");
+    has(doc, "Listing 1");
+    lacks(doc, "\\begin{listing}");
+}
+
+#[test]
+fn declare_floating_environment_name_option() {
+    let doc = "\\DeclareFloatingEnvironment[name=Snippet]{snip}\\begin{snip}Body.\\caption{Cap}\\end{snip}";
+    has(doc, "**Snippet 1:** Cap");
+}
+
+#[test]
+fn label_in_running_text_refers_to_section() {
+    has("\\section{A}\\section{B}Text \\label{here}. See \\ref{here}.", "See 2.");
+}
+
+#[test]
+fn label_inside_theorem_body_refers_to_theorem() {
+    has("\\newtheorem{thm}{Theorem}\\begin{thm}Claim \\label{t}.\\end{thm}\\begin{thm}Two\\end{thm} \\ref{t}", " 1");
+}
+
+#[test]
+fn user_environment_inside_raw_capture_is_not_expanded() {
+    // `lined` opens a tabular in its begin code; inside a raw-captured
+    // environment its \end must stay as written
+    let doc = "\\newenvironment{lined}{\\begin{tabular}{l}}{\\end{tabular}}\\begin{mysteryfloat}\\begin{lined}x\\end{lined}\\end{mysteryfloat}\n\nAfter.";
+    has(doc, "\\end{lined}");
+    has(doc, "After.");
+}
+
+#[test]
+fn trivlist_is_transparent() {
+    has("\\begin{trivlist}\\item Inside.\\end{trivlist}", "Inside.");
+    lacks("\\begin{trivlist}\\item Inside.\\end{trivlist}", "trivlist");
+}
+
+#[test]
+fn new_command_copy_is_let() {
+    has("\\newcommand{\\foo}{Batman}\\NewCommandCopy{\\copied}{\\foo}\\renewcommand{\\foo}{Robin}\\copied{} \\foo", "Batman Robin");
+}
+
+#[test]
+fn expl3_definitions_and_constants() {
+    let doc = "\\ExplSyntaxOn\\cs_set_eq:NN \\bs \\c_backslash_str\\cs_new:Npn \\my_greet:n #1 { Hello~#1! }\\cs_new:Nn \\my_twice:n { #1#1 }\\NewDocumentCommand{\\greet}{m}{\\my_greet:n {#1}}\\NewDocumentCommand{\\twice}{m}{\\my_twice:n {#1}}\\ExplSyntaxOff\nA \\bs{} B \\greet{World} \\twice{ab}.";
+    has(doc, "A \\\\ B Hello World! abab.");
+}
+
+#[test]
+fn expl3_private_names_lex_as_one_command() {
+    let doc = "\\ProvidesExplFile{x}{d}{v}{desc}\n\\cs_new:Npn \\__mod_get:n #1 { \\str_case:nn {#1} { {g}{global} } }\nText.";
+    has(doc, "Text.");
+    lacks(doc, "mod");
+}
+
+#[test]
+fn declared_si_units() {
+    has("\\DeclareSIUnit\\parsec{pc}\\qty{3}{\\kilo\\parsec}", "3\u{a0}kpc");
+}
+
+#[test]
+fn xparse_verbatim_argument_with_delimiter() {
+    has("\\NewDocumentCommand{\\code}{v}{\\texttt{#1}}\\code|a$b$c| after", "a$b$c");
+    has("\\NewDocumentCommand{\\code}{v}{[#1]}\\code|x| after", "after");
+}
+
+#[test]
+fn csquotes_textquote() {
+    has("\\textquote[Knuth]{Premature optimisation}", "\"Premature optimisation\" (Knuth)");
+}

@@ -159,7 +159,7 @@ pub struct Document {
     pub metadata: HashMap<String, String>,
     pub blocks: Vec<Block>,
     pub footnotes: HashMap<usize, String>,
-    pub bibliography: Option<String>,
+    pub bibliography: Option<Vec<Block>>,
     /// Conversion diagnostics: constructs that could not be converted
     /// faithfully (unknown commands, unresolved references, ...).
     pub warnings: Vec<String>,
@@ -231,6 +231,15 @@ pub struct Parser {
     algorithm_counter: usize,
     /// A \label found inside the caption just parsed.
     pending_caption_label: Option<String>,
+    /// Float environments declared by the document or its packages
+    /// (`\newfloat`, `\DeclareFloatingEnvironment`, minted's `listing`),
+    /// with their caption names.
+    float_envs: HashMap<String, String>,
+    /// Enclosing constructs a `\label` (or `\caption`) met inside running
+    /// text belongs to: floats, theorems. `None` slots are still free.
+    label_targets: Vec<LabelTarget>,
+    /// Units declared with `\DeclareSIUnit\name{symbol}` (symbol as text).
+    si_units: HashMap<String, String>,
     /// Macros whose expansion was refused (warned once).
     refused_macros: HashSet<String>,
     /// Footnote bodies kept as inlines until end of parse so forward
@@ -293,6 +302,9 @@ impl Parser {
             glossary: HashMap::new(),
             algorithm_counter: 0,
             pending_caption_label: None,
+            float_envs: HashMap::from([(String::from("listing"), String::from("Listing"))]),
+            label_targets: Vec::new(),
+            si_units: HashMap::new(),
             refused_macros: HashSet::new(),
             footnote_inlines: HashMap::new(),
         }
@@ -459,7 +471,7 @@ impl Parser {
                             prenote.as_deref(),
                             postnote.as_deref(),
                         );
-                        *content = vec![Inline::Text(text)];
+                        *content = self.latex_to_inlines(&text);
                     }
                 }
                 Inline::Emph(content)
@@ -537,17 +549,50 @@ impl Parser {
         None
     }
 
-    fn render_bibliography(&self) -> Option<String> {
-        let bibliography = self.citation_manager.generate_bibliography();
-        let has_entries = bibliography
-            .lines()
-            .skip(1)
-            .any(|line| !line.trim().is_empty());
-
-        if has_entries {
-            Some(bibliography)
+    /// The reference list generated from the loaded `.bib` files: a
+    /// "References" heading and one paragraph (numeric) or list item per
+    /// entry, the entries' LaTeX rendered like document text.
+    fn render_bibliography(&mut self) -> Option<Vec<Block>> {
+        let items = self.citation_manager.bibliography_items();
+        if items.is_empty() {
+            return None;
+        }
+        let numbered = items.iter().any(|(marker, _)| marker.is_some());
+        let mut paragraphs = Vec::new();
+        let mut list = Vec::new();
+        for (marker, source) in items {
+            let mut inlines = Vec::new();
+            if let Some(marker) = marker {
+                inlines.push(Inline::Text(marker));
+                inlines.push(Inline::Space);
+            }
+            inlines.extend(self.latex_to_inlines(&source));
+            if numbered {
+                paragraphs.push(Block::Paragraph(inlines));
+            } else {
+                list.push(vec![Block::Paragraph(inlines)]);
+            }
+        }
+        let mut blocks = vec![Block::Section {
+            level: 1,
+            title: vec![Inline::Text(String::from("References"))],
+            label: None,
+        }];
+        if numbered {
+            blocks.extend(paragraphs);
         } else {
-            None
+            blocks.push(Block::BulletList(list));
+        }
+        Some(blocks)
+    }
+
+    /// Parse a LaTeX fragment (a bibliography field, a formatted citation)
+    /// into inline content.
+    fn latex_to_inlines(&mut self, source: &str) -> Vec<Inline> {
+        let tokens = tex::lex_fragment(source);
+        match self.parse_inline_fragment_tokens(tokens) {
+            Ok((inlines, _)) => trim_inline_whitespace(inlines),
+            Err(_) => vec![Inline::Text(source.to_string())],
         }
     }
 
@@ -871,7 +916,9 @@ impl Parser {
                 self.parse_figure_environment(&env_name)
             }
             "center" | "flushleft" | "flushright" | "sloppypar" | "samepage" | "titlepage"
-            | "singlespace" | "landscape" | "footnotesize" | "small" | "large" => {
+            | "singlespace" | "landscape" | "footnotesize" | "small" | "large" | "trivlist"
+            | "RaggedRight"
+            | "minipage*" => {
                 self.parse_transparent_environment(&env_name, 0, false)
             }
             "minipage" => self.parse_transparent_environment(&env_name, 1, true),
@@ -962,6 +1009,9 @@ impl Parser {
                 }
                 if self.state.environments.contains_key(&env_name) {
                     return self.expand_user_environment_begin(&env_name);
+                }
+                if let Some(display) = self.float_envs.get(&env_name).cloned() {
+                    return self.parse_generic_float(&env_name, &display);
                 }
                 // Any declaration works as an environment: \begin{em} = {\em ...}
                 if let Some(style) = declaration_style(&env_name) {
@@ -1731,6 +1781,401 @@ impl Parser {
         self.parse_figure_float(env_name)
     }
 
+    /// Blocks of an environment body up to `\end{env_type}`; a `\label` at
+    /// block level is stored in `label`.
+    fn parse_theorem_body(
+        &mut self,
+        env_type: &str,
+        content: &mut Vec<Block>,
+        label: &mut Option<String>,
+    ) -> Result<()> {
+        while !self.is_at_end() {
+            self.skip_whitespace_and_comments();
+
+            if let Token::EndEnvironment(env) = self.current_token() {
+                if env == env_type {
+                    self.advance();
+                    break;
+                }
+            }
+
+            if let Token::Label(l) = self.current_token() {
+                if label.is_none() {
+                    *label = Some(l.clone());
+                }
+                self.advance();
+                continue;
+            }
+
+            match self.parse_block()? {
+                Some(block) => content.push(block),
+                None => continue,
+            }
+        }
+        Ok(())
+    }
+
+    /// Float type declarations: float's `\newfloat{name}{pos}{ext}[within]`
+    /// and `\floatname{name}{Caption}`, newfloat's
+    /// `\DeclareFloatingEnvironment[name=..,within=..]{name}` and
+    /// `\SetupFloatingEnvironment{name}[options]`.
+    fn parse_float_declaration(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        match cmd {
+            "newfloat" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                for _ in 0..2 {
+                    self.skip_whitespace_and_comments();
+                    if matches!(self.current_token(), Token::LeftBrace) {
+                        let _ = self.collect_braced_tokens();
+                    }
+                }
+                self.skip_whitespace_only();
+                let within = if matches!(self.current_token(), Token::LeftBracket) {
+                    Some(self.parse_bracketed_text()?.trim().to_string())
+                } else {
+                    None
+                };
+                self.declare_float_env(&name, within.as_deref(), None);
+            }
+            "DeclareFloatingEnvironment" | "SetupFloatingEnvironment" => {
+                self.skip_whitespace_and_comments();
+                let mut options = if matches!(self.current_token(), Token::LeftBracket) {
+                    self.parse_bracketed_text()?
+                } else {
+                    String::new()
+                };
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    options.push(',');
+                    options.push_str(&self.parse_bracketed_text()?);
+                }
+                let mut display = None;
+                let mut within = if cmd == "SetupFloatingEnvironment" { None } else { Some(String::from("chapter")) };
+                for option in options.split(',') {
+                    let (key, value) = match option.split_once('=') {
+                        Some((k, v)) => (k.trim(), v.trim().trim_matches(|c| c == '{' || c == '}')),
+                        None => (option.trim(), ""),
+                    };
+                    match key {
+                        "name" => display = Some(value.to_string()),
+                        "within" => within = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+                if cmd == "SetupFloatingEnvironment" && !self.float_envs.contains_key(&name) {
+                    return Ok(Some(None));
+                }
+                self.declare_float_env(&name, within.as_deref(), display);
+            }
+            "floatname" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_and_comments();
+                let display = self.parse_braced_inlines()?;
+                let display = self.inlines_to_plain_text(&display).trim().to_string();
+                if let Some(entry) = self.float_envs.get_mut(&name) {
+                    if !display.is_empty() {
+                        *entry = display;
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(None))
+    }
+
+    /// Replace document-declared siunitx units (`\DeclareSIUnit`) in a
+    /// unit specification by their symbols.
+    fn substitute_si_units(&self, spec: &str) -> String {
+        if self.si_units.is_empty() || !spec.contains('\\') {
+            return spec.to_string();
+        }
+        let mut out = String::with_capacity(spec.len());
+        let mut rest = spec;
+        while let Some(pos) = rest.find('\\') {
+            out.push_str(&rest[..pos]);
+            let after = &rest[pos + 1..];
+            let name_len = after.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+            let name = &after[..name_len];
+            match self.si_units.get(name) {
+                Some(symbol) if name_len > 0 => {
+                    out.push('{');
+                    out.push_str(symbol);
+                    out.push('}');
+                }
+                _ => {
+                    out.push('\\');
+                    out.push_str(name);
+                }
+            }
+            rest = &after[name_len..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Assorted package commands with structure: `\NewCommandCopy`,
+    /// `\DeclareSIUnit`, `\inputminted`, `\fcolorbox`, csquotes'
+    /// `\textquote`.
+    fn parse_misc_package_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        match cmd {
+            // \NewCommandCopy{\new}{\old} = \let\new\old (LaTeX 2023)
+            "NewCommandCopy" | "RenewCommandCopy" | "DeclareCommandCopy" | "NewEnvironmentCopy"
+            | "RenewEnvironmentCopy" | "DeclareEnvironmentCopy" => {
+                let mut names = Vec::new();
+                for _ in 0..2 {
+                    self.skip_whitespace_and_comments();
+                    let tokens = if matches!(self.current_token(), Token::LeftBrace) {
+                        self.collect_braced_tokens()
+                    } else {
+                        let t = self.current_token().clone();
+                        self.advance();
+                        vec![t]
+                    };
+                    let text: String = tokens.iter().map(|t| self.token_to_string(t)).collect();
+                    names.push(text.trim().trim_start_matches('\\').to_string());
+                }
+                let (new, old) = (&names[0], &names[1]);
+                if new.is_empty() || old.is_empty() {
+                    return Ok(Some(None));
+                }
+                if cmd.contains("Environment") {
+                    if let Some(def) = self.state.environments.get(old).cloned() {
+                        self.state.environments.insert(new.clone(), def);
+                    } else if let Some(def) = self.state.get_theorem_env(old).cloned() {
+                        self.state.theorem_envs.insert(new.clone(), def);
+                    }
+                    return Ok(Some(None));
+                }
+                self.push_front(vec![
+                    Token::Command(String::from("let")),
+                    Token::Command(new.clone()),
+                    Token::Command(old.clone()),
+                ]);
+                Ok(Some(None))
+            }
+            "DeclareSIUnit" => {
+                self.skip_whitespace_and_comments();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                self.skip_whitespace_and_comments();
+                let name = match self.current_token().clone() {
+                    Token::Command(n) => {
+                        self.advance();
+                        n
+                    }
+                    Token::LeftBrace => self.parse_braced_text()?.trim().trim_start_matches('\\').to_string(),
+                    _ => return Ok(Some(None)),
+                };
+                self.skip_whitespace_and_comments();
+                let tokens = self.collect_braced_tokens();
+                let source: String = tokens.iter().map(|t| self.token_to_string(t)).collect();
+                let symbol = siunitx::format_unit(&self.substitute_si_units(&source));
+                let symbol = if symbol.trim().is_empty() {
+                    let inlines = self.latex_to_inlines(&source);
+                    self.inlines_to_plain_text(&inlines)
+                } else {
+                    symbol
+                };
+                if !name.is_empty() {
+                    self.si_units.insert(name, symbol);
+                }
+                Ok(Some(None))
+            }
+            "fcolorbox" => {
+                for _ in 0..2 {
+                    self.skip_whitespace_only();
+                    if matches!(self.current_token(), Token::LeftBracket) {
+                        let _ = self.parse_bracketed_text()?;
+                    }
+                    let _ = self.parse_braced_text()?;
+                }
+                let content = self.parse_braced_inlines()?;
+                Ok(Some(Some(Inline::Span {
+                    attrs: HashMap::new(),
+                    content,
+                })))
+            }
+            // csquotes: \textquote[cite][punct]{text}
+            "textquote" | "textquote*" | "Textquote" | "foreigntextquote" | "hyphentextquote" => {
+                self.consume_text_star();
+                if cmd == "foreigntextquote" || cmd == "hyphentextquote" {
+                    let _ = self.parse_braced_text()?;
+                }
+                let mut cite = None;
+                for i in 0..2 {
+                    self.skip_whitespace_only();
+                    if matches!(self.current_token(), Token::LeftBracket) {
+                        let tokens = self.collect_bracketed_tokens();
+                        if i == 0 {
+                            cite = Some(self.parse_inline_fragment_tokens(tokens)?.0);
+                        }
+                    }
+                }
+                self.skip_whitespace_only();
+                let content = self.parse_braced_inlines()?;
+                let mut out = vec![Inline::Quoted {
+                    quote_type: QuoteType::DoubleQuote,
+                    content,
+                }];
+                if let Some(cite) = cite.filter(|c| !c.is_empty()) {
+                    out.push(Inline::Space);
+                    out.push(Inline::Text(String::from("(")));
+                    out.extend(cite);
+                    out.push(Inline::Text(String::from(")")));
+                }
+                Ok(Some(Some(span_or_single(out))))
+            }
+            // \inputminted[options]{language}{file}, \lstinputlisting[options]{file},
+            // \verbatiminput{file}
+            "inputminted" | "lstinputlisting" | "verbatiminput" | "VerbatimInput" | "LVerbatimInput"
+            | "BVerbatimInput" => {
+                self.consume_text_star();
+                self.skip_whitespace_only();
+                let mut options = String::new();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    options = self.parse_bracketed_text()?;
+                }
+                let mut language = None;
+                if cmd == "inputminted" {
+                    self.skip_whitespace_only();
+                    language = Some(self.parse_braced_text()?.trim().to_string());
+                } else if cmd == "lstinputlisting" {
+                    language = options.split(',').find_map(|o| {
+                        let (k, v) = o.split_once('=')?;
+                        (k.trim() == "language").then(|| v.trim().trim_matches(|c| c == '{' || c == '}').to_lowercase())
+                    });
+                }
+                self.skip_whitespace_only();
+                let file = self.parse_braced_raw_text();
+                let file = file.trim();
+                let content = self.read_listing_file(file);
+                if content.is_none() {
+                    self.state.warn(format!("listing file `{}` not found", file));
+                }
+                let code = content.unwrap_or_else(|| format!("% {}", file));
+                // a code block: delivered as a captured verbatim environment
+                let token = match language.filter(|l| !l.is_empty() && !l.contains(['{', '}'])) {
+                    Some(language) => Token::VerbatimEnv {
+                        name: String::from("minted"),
+                        content: format!("{{{}}}\n{}", language, code),
+                    },
+                    None => Token::VerbatimEnv {
+                        name: String::from("verbatim"),
+                        content: format!("\n{}", code),
+                    },
+                };
+                self.push_front(vec![token]);
+                Ok(Some(None))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Read a file named by a listing command, relative to the directory
+    /// of the file being parsed (bounded in size).
+    fn read_listing_file(&self, name: &str) -> Option<String> {
+        if name.is_empty() || name.contains('\0') {
+            return None;
+        }
+        let mut candidates = Vec::new();
+        if let Some((dir, _)) = self.input_stack.last() {
+            candidates.push(dir.join(name));
+        }
+        // LaTeX resolves against the directory it runs in, which may be the
+        // main file's or a parent of it (a build run from the project root)
+        if let Some(base) = &self.base_path {
+            candidates.extend(base.ancestors().take(3).map(|dir| dir.join(name)));
+        }
+        candidates.push(std::path::PathBuf::from(name));
+        for path in candidates {
+            if path.is_file() {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+                if size > 4 * 1024 * 1024 {
+                    return None;
+                }
+                if let Ok(text) = crate::decode::read_file(&path) {
+                    return Some(text.trim_end_matches('\n').to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn declare_float_env(&mut self, name: &str, within: Option<&str>, display: Option<String>) {
+        if name.is_empty() || name.contains('\\') {
+            return;
+        }
+        let display = display.filter(|d| !d.is_empty()).unwrap_or_else(|| capitalize_first(name));
+        self.float_envs.insert(name.to_string(), display);
+        self.state.declare_float(name, within.filter(|w| *w != "none"));
+    }
+
+    /// A float of a declared type (`listing`, `\newfloat{program}...`): any
+    /// body, a numbered caption ("Listing 3: ...") below it, and a label
+    /// referring to that number.
+    fn parse_generic_float(&mut self, env_name: &str, display: &str) -> Result<Option<Block>> {
+        self.skip_whitespace_and_comments();
+        if matches!(self.current_token(), Token::LeftBracket) {
+            let _ = self.collect_bracketed_tokens();
+        }
+        if !self.state.user_counters.contains_key(env_name) {
+            self.state.declare_float(env_name, Some("chapter"));
+        }
+        let mut content = Vec::new();
+        let mut label = None;
+        self.label_targets.push(LabelTarget {
+            takes_caption: true,
+            ..Default::default()
+        });
+        let result = self.parse_theorem_body(env_name, &mut content, &mut label);
+        let target = self.label_targets.pop().unwrap_or_default();
+        result?;
+        // a \label before the \caption refers to the enclosing section in
+        // LaTeX, but in practice means the float
+        let label = target.label.or(label);
+        let caption = target.caption;
+        let number = caption.as_ref().map(|_| self.state.next_float_number(env_name));
+        let display = self
+            .state
+            .macros
+            .get(&format!("{}name", env_name))
+            .or_else(|| self.state.macros.get(&format!("{}scaption", env_name)))
+            .filter(|d| d.num_params == 0 && !d.body.contains('\\'))
+            .map(|d| d.body.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| display.to_string());
+        if let Some(label) = label {
+            let title = caption.as_ref().map(|c| self.inlines_to_plain_text(c));
+            let n = number
+                .clone()
+                .unwrap_or_else(|| self.state.current_section_number.clone());
+            self.state
+                .add_label_with_number(label, LabelType::Other(display.clone()), n, title);
+        }
+        if let Some(caption) = caption {
+            let mut line = vec![Inline::Strong(vec![Inline::Text(format!(
+                "{} {}:",
+                display,
+                number.unwrap_or_default()
+            ))])];
+            if !caption.is_empty() {
+                line.push(Inline::Space);
+                line.extend(caption);
+            }
+            content.push(Block::Paragraph(line));
+        }
+        Ok(match content.len() {
+            0 => None,
+            1 => content.pop(),
+            _ => Some(Block::Composite(content)),
+        })
+    }
+
     fn parse_theorem_like(&mut self, env_type: &str) -> Result<Option<Block>> {
         let theorem_def = self
             .state
@@ -1762,28 +2207,14 @@ impl Parser {
         };
 
         let mut content = Vec::new();
-
-        while !self.is_at_end() {
-            self.skip_whitespace_and_comments();
-
-            if let Token::EndEnvironment(env) = self.current_token() {
-                if env == env_type {
-                    self.advance();
-                    break;
-                }
-            }
-
-            if let Token::Label(l) = self.current_token() {
-                label = Some(l.clone());
-                self.advance();
-                continue;
-            }
-
-            match self.parse_block()? {
-                Some(block) => content.push(block),
-                None => continue,
+        self.label_targets.push(LabelTarget::default());
+        let result = self.parse_theorem_body(env_type, &mut content, &mut label);
+        if let Some(target) = self.label_targets.pop() {
+            if label.is_none() {
+                label = target.label;
             }
         }
+        result?;
 
         if let (Some(theorem_label), Some(theorem_number)) = (&label, &number) {
             self.state.add_label_with_number(
@@ -2051,10 +2482,31 @@ impl Parser {
                     content: Vec::new(),
                 }))
             }
+            Token::Label(l) => {
+                let key = l.clone();
+                self.advance();
+                self.attach_running_label(key);
+                Ok(None)
+            }
             _ => {
                 self.advance();
                 Ok(None)
             }
+        }
+    }
+
+    /// A `\label` met in running text: it belongs to the innermost open
+    /// float/theorem, else to the current section (LaTeX's `\@currentlabel`).
+    fn attach_running_label(&mut self, key: String) {
+        if let Some(target) = self.label_targets.last_mut() {
+            if target.label.is_none() {
+                target.label = Some(key);
+            }
+            return;
+        }
+        if self.state.get_label(&key).is_none() && !self.in_preamble {
+            let number = self.state.current_section_number.clone();
+            self.state.add_label_with_number(key, LabelType::Section, number, None);
         }
     }
 
@@ -2192,6 +2644,12 @@ impl Parser {
                 }
             }
             return Ok(None);
+        }
+        if let Some(result) = self.parse_float_declaration(&cmd)? {
+            return Ok(result);
+        }
+        if let Some(result) = self.parse_misc_package_command(&cmd)? {
+            return Ok(result);
         }
         // \hfill and \hspace separate things on a line: a space
         if matches!(cmd.as_str(), "hfill" | "hspace" | "hskip" | "quad" | "qquad" | "enspace") {
@@ -2381,7 +2839,7 @@ impl Parser {
                 let text = self.parse_braced_inlines()?;
                 Ok(Some(Inline::Link { text, url, title: None }))
             }
-            "url" => {
+            "url" | "Url" | "URL" => {
                 let url = self.parse_braced_raw_text();
                 Ok(Some(Inline::Link {
                     text: vec![Inline::Text(url.clone())],
@@ -2501,12 +2959,19 @@ impl Parser {
                 }))
             }
             "caption" => {
-                // Stray caption outside figure/table environments
+                // Caption of an enclosing generic float, or a stray caption
+                // outside figure/table environments
                 self.consume_text_star();
                 if matches!(self.current_token(), Token::LeftBracket) {
                     let _ = self.parse_bracketed_text()?;
                 }
                 let content = self.parse_braced_inlines()?;
+                if let Some(target) = self.label_targets.last_mut().filter(|t| t.takes_caption) {
+                    if target.caption.is_none() {
+                        target.caption = Some(content);
+                        return Ok(None);
+                    }
+                }
                 Ok(Some(Inline::Strong(content)))
             }
 
@@ -2759,6 +3224,142 @@ impl Parser {
         }
     }
 
+    /// expl3 definitions that matter for output: `\cs_new:Npn \f #1 {..}`,
+    /// `\cs_new:Nn \f:nn {..}` (macros), `\cs_set_eq:NN \a \b` (`\let`),
+    /// and the character constants (`\c_backslash_str`).
+    fn parse_expl3_definition(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
+        let constant = match cmd {
+            "c_backslash_str" => Some("\\"),
+            "c_left_brace_str" => Some("{"),
+            "c_right_brace_str" => Some("}"),
+            "c_hash_str" => Some("#"),
+            "c_percent_str" => Some("%"),
+            "c_colon_str" => Some(":"),
+            "c_underscore_str" => Some("_"),
+            "c_tilde_str" => Some("~"),
+            "c_ampersand_str" => Some("&"),
+            "c_dollar_str" => Some("$"),
+            "c_circumflex_str" => Some("^"),
+            "c_space_tl" | "c_space_str" | "c_catcode_other_space_tl" => Some(" "),
+            "c_empty_tl" | "c_empty_str" | "c_novalue_tl" => Some(""),
+            _ => None,
+        };
+        if let Some(text) = constant {
+            return Ok(Some((!text.is_empty()).then(|| Inline::Text(text.to_string()))));
+        }
+        // expl3 boxes: the same model as \sbox / \usebox
+        match cmd {
+            "hbox_set:Nn" | "hbox_gset:Nn" | "vbox_set:Nn" | "vbox_gset:Nn" | "hbox_set:cn"
+            | "hbox_gset:cn" | "vbox_set_top:Nn" => {
+                self.push_front(vec![Token::Command(String::from("sbox"))]);
+                return Ok(Some(None));
+            }
+            "box_use:N" | "box_use:c" | "box_use_drop:N" | "box_use_drop:c" | "hbox_unpack:N"
+            | "hbox_unpack_drop:N" | "vbox_unpack:N" | "vbox_unpack_drop:N" | "box_use_clear:N" => {
+                let keep = matches!(cmd, "box_use:N" | "box_use:c" | "hbox_unpack:N" | "vbox_unpack:N");
+                self.push_front(vec![Token::Command(String::from(if keep { "usebox" } else { "unhbox" }))]);
+                return Ok(Some(None));
+            }
+            "hbox:n" | "vbox:n" | "hbox_overlap_right:n" | "hbox_overlap_left:n" | "hbox_overlap_center:n"
+            | "text_uppercase:n" | "text_lowercase:n" | "use:n" | "exp_not:n" | "tl_to_str:n" | "str_use:N"
+            | "text_titlecase:n" | "text_titlecase_first:n" => {
+                self.skip_whitespace_only();
+                let tokens = self.collect_braced_tokens();
+                let tokens = match cmd {
+                    "text_uppercase:n" | "text_lowercase:n" => {
+                        let text: String = tokens.iter().map(|t| self.token_to_string(t)).collect();
+                        let text = if cmd == "text_uppercase:n" { text.to_uppercase() } else { text.to_lowercase() };
+                        tex::lex_fragment(&text)
+                    }
+                    _ => tokens,
+                };
+                self.push_front(tokens);
+                return Ok(Some(None));
+            }
+            _ => {}
+        }
+        let Some(rest) = cmd.strip_prefix("cs_") else {
+            return Ok(None);
+        };
+        let (kind, signature) = match rest.rsplit_once(':') {
+            Some(parts) => parts,
+            None => return Ok(None),
+        };
+        let defines = matches!(
+            kind,
+            "new" | "set" | "gset" | "new_protected" | "set_protected" | "gset_protected" | "new_nopar"
+                | "set_nopar" | "gset_nopar" | "new_protected_nopar" | "set_protected_nopar"
+        );
+        let equates = matches!(kind, "set_eq" | "new_eq" | "gset_eq");
+        if equates && matches!(signature, "NN" | "Nc" | "cN" | "cc") {
+            let mut names = Vec::new();
+            for kind in signature.chars() {
+                self.skip_whitespace_and_comments();
+                let name = match (kind, self.current_token().clone()) {
+                    ('N', Token::Command(n)) => {
+                        self.advance();
+                        n
+                    }
+                    _ => self.parse_braced_text()?.trim().to_string(),
+                };
+                names.push(name);
+            }
+            if names.iter().all(|n| !n.is_empty()) {
+                self.push_front(vec![
+                    Token::Command(String::from("let")),
+                    Token::Command(names[0].clone()),
+                    Token::Command(names[1].clone()),
+                ]);
+            }
+            return Ok(Some(None));
+        }
+        if !defines || !matches!(signature, "Npn" | "Npx" | "Npe" | "Nn" | "Nx" | "Ne" | "cpn" | "cn") {
+            return Ok(None);
+        }
+        self.skip_whitespace_and_comments();
+        let name = match self.current_token().clone() {
+            Token::Command(n) if signature.starts_with('N') => {
+                self.advance();
+                n
+            }
+            Token::LeftBrace if signature.starts_with('c') => self.parse_braced_text()?.trim().to_string(),
+            _ => return Ok(Some(None)),
+        };
+        // parameter text: explicit (p) or from the name's own signature
+        let mut params = String::new();
+        if signature.contains('p') {
+            let mut guard = 0;
+            while !self.is_at_end() && !matches!(self.current_token(), Token::LeftBrace) && guard < 64 {
+                guard += 1;
+                params.push_str(&self.token_to_string(self.current_token()));
+                self.advance();
+            }
+        } else if let Some((_, args)) = name.rsplit_once(':') {
+            let count = args.chars().filter(|c| !matches!(c, 'T' | 'F' | 'p' | 'w' | 'D')).count().min(9);
+            for i in 1..=count {
+                params.push_str(&format!("#{}", i));
+            }
+        }
+        // expl3 code ignores spaces; `~` is the space
+        let body = self.collect_braced_tokens();
+        let body: String = body
+            .iter()
+            .filter(|t| !matches!(t, Token::Whitespace(_) | Token::Newline))
+            .map(|t| match t {
+                Token::Tilde => String::from("\\space{}"),
+                other => self.token_to_string(other),
+            })
+            .collect();
+        if name.is_empty() {
+            return Ok(Some(None));
+        }
+        let def = if kind.starts_with('g') { "gdef" } else { "def" };
+        let source = format!("\\{}\\{}{}{{{}}}", def, name, params.trim(), body);
+        let tokens = tex::lex_fragment(&source);
+        self.push_front(tokens);
+        Ok(Some(None))
+    }
+
     /// Commands described by the knowledge tables plus assorted content
     /// commands. Returns `Ok(Some(result))` when handled.
     fn parse_knowledge_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
@@ -2783,6 +3384,9 @@ impl Parser {
                 let _ = self.collect_braced_tokens();
             }
             return Ok(Some(None));
+        }
+        if let Some(result) = self.parse_expl3_definition(cmd)? {
+            return Ok(Some(result));
         }
         // expl3 functions (`\clist_map_inline:Nn`): programming, no output;
         // their arguments follow the signature after the colon
@@ -3115,7 +3719,9 @@ impl Parser {
                 let _ = parser.collect_bracketed_tokens();
                 parser.skip_whitespace_only();
             }
-            parser.parse_braced_text()
+            // \DeclareSIUnit units resolved, the rest left to the formatter
+            let raw = parser.parse_braced_text()?;
+            Ok(parser.substitute_si_units(&raw))
         };
         let nbsp = '\u{00A0}';
         let list = |items: &[String]| -> String {
@@ -3572,9 +4178,17 @@ impl Parser {
     }
     
     fn is_citation_command(&self, cmd: &str) -> bool {
-        matches!(cmd, "cite" | "citep" | "citet" | "citealt" | "citealp" | 
+        matches!(cmd, "cite" | "citep" | "citet" | "citealt" | "citealp" |
                       "citeauthor" | "citeyear" | "citeyearpar" |
-                      "autocite" | "textcite" | "parencite" | "footcite")
+                      "autocite" | "textcite" | "parencite" | "footcite" |
+                      "Cite" | "Citep" | "Citet" | "Citealt" | "Citealp" | "Citeauthor" |
+                      "Autocite" | "Textcite" | "Parencite" | "smartcite" | "Smartcite" |
+                      "supercite" | "footcitetext" | "citetitle" | "citeurl" | "citedate" |
+                      "citeurldate" | "fullcite" | "footfullcite" | "citefield" | "citelist" |
+                      "citename" | "citenum" | "citepalias" | "citetalias" | "citeA" | "citeN" |
+                      "shortcite" | "shortciteN" | "citeNP" | "citeyearNP" | "citeasnoun" |
+                      "cites" | "parencites" | "textcites" | "autocites" | "footcites" |
+                      "supercites" | "smartcites" | "Cites" | "Parencites" | "Textcites" | "Autocites")
     }
     
     fn is_reference_command(&self, cmd: &str) -> bool {
@@ -3585,24 +4199,77 @@ impl Parser {
                 | "namecref" | "nameCref" | "lcnamecref" | "namecrefs" | "nameCrefs"
                 | "lcnamecrefs" | "subref" | "labelcpageref" | "vpageref" | "zref"
                 | "cref*" | "Cref*" | "autoref*" | "ref*" | "fref" | "Fref" | "prettyref"
+                | "autopageref" | "autopageref*" | "pageref*" | "Pageref"
         )
     }
     
     fn parse_citation_command(&mut self, cmd: &str) -> Result<Option<Inline>> {
+        self.consume_text_star();
+        // biblatex multicite: \cites(global pre)(global post)[pre][post]{k1}[post]{k2}...
+        let multi = cmd.ends_with("cites");
+        if multi {
+            for _ in 0..2 {
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::Text(t) if t.starts_with('(')) {
+                    self.skip_parenthesized_text();
+                }
+            }
+        }
         // Optional note arguments precede the keys: \citep[postnote]{keys}
         // or \citep[prenote][postnote]{keys}
         let mut prenote = None;
         let mut postnote = None;
-        if matches!(self.current_token(), Token::LeftBracket) {
-            let first = self.parse_bracketed_text()?;
+        let mut keys: Vec<String> = Vec::new();
+        loop {
+            self.skip_whitespace_only();
             if matches!(self.current_token(), Token::LeftBracket) {
-                prenote = Some(first);
-                postnote = Some(self.parse_bracketed_text()?);
-            } else {
-                // A single optional argument is the postnote
-                postnote = Some(first);
+                let first = self.parse_bracketed_text()?;
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    if prenote.is_none() {
+                        prenote = Some(first);
+                    }
+                    let post = self.parse_bracketed_text()?;
+                    if postnote.is_none() || !post.trim().is_empty() {
+                        postnote = Some(post);
+                    }
+                } else if postnote.is_none() || !first.trim().is_empty() {
+                    // A single optional argument is the postnote
+                    postnote = Some(first);
+                }
+            }
+            self.skip_whitespace_only();
+            if !matches!(self.current_token(), Token::LeftBrace) {
+                break;
+            }
+            let args_text = self.parse_braced_text()?;
+            let (group, _, _) = parse_citation_args(&format!("{{{}}}", args_text));
+            keys.extend(group.into_iter().filter(|k| !k.is_empty()));
+            if !multi {
+                break;
+            }
+            // another [..]{..} or {..} group continues the multicite
+            let next = (0..4)
+                .map(|n| self.peek_at(n))
+                .find(|t| !matches!(t, Some(Token::Whitespace(_))))
+                .flatten();
+            if !matches!(next, Some(Token::LeftBrace | Token::LeftBracket)) {
+                break;
             }
         }
+        let mode = match cmd {
+            "citefield" => {
+                // \citefield{key}[format]{field}
+                self.skip_whitespace_only();
+                if matches!(self.current_token(), Token::LeftBracket) {
+                    let _ = self.parse_bracketed_text()?;
+                }
+                self.skip_whitespace_only();
+                let field = self.parse_braced_text()?;
+                CitationMode::Field(field.trim().to_lowercase())
+            }
+            _ => citation_mode_for(cmd),
+        };
         // Trim separators the citation formatter adds itself; resolve TeX ties
         let clean_note = |note: String| {
             let note = note
@@ -3616,18 +4283,48 @@ impl Parser {
         let prenote = prenote.and_then(clean_note);
         let postnote = postnote.and_then(clean_note);
 
-        let args_text = self.parse_braced_text()?;
-        let (keys, _, _) = parse_citation_args(&format!("{{{}}}", args_text));
-
         Ok(Some(Inline::Cite {
             citations: keys,
-            mode: citation_mode_for(cmd),
+            mode,
             prenote,
             postnote,
             content: Vec::new(),
         }))
     }
     
+    /// Skip a `(...)` argument (biblatex's multicite global notes) that
+    /// starts at the current text token; text after `)` is kept.
+    fn skip_parenthesized_text(&mut self) {
+        let mut depth = 0usize;
+        let mut guard = 0;
+        while !self.is_at_end() && guard < 10_000 {
+            guard += 1;
+            match self.current_token().clone() {
+                Token::Text(text) => {
+                    self.advance();
+                    for (i, c) in text.char_indices() {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    let rest = &text[i + 1..];
+                                    if !rest.is_empty() {
+                                        self.push_front(vec![Token::Text(rest.to_string())]);
+                                    }
+                                    return;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Token::ParBreak => return,
+                _ => self.advance(),
+            }
+        }
+    }
+
     fn parse_reference_command(&mut self, cmd: &str) -> Result<Option<Inline>> {
         self.consume_text_star();
         self.skip_whitespace_only();
@@ -3640,6 +4337,7 @@ impl Parser {
             "fref" | "vref" | "prettyref" | "zref" => "cref",
             "Fref" | "Vref" => "Cref",
             "subref" | "vpageref" => "ref",
+            "autopageref" | "Pageref" => "pageref",
             other => other,
         };
         Ok(Some(self.render_reference(kind, &label)))
@@ -4126,6 +4824,71 @@ impl Parser {
         Ok(args)
     }
 
+    /// An xparse `v` argument: `{text}` or `|text|` with any delimiter.
+    /// The tokens were lexed normally, so the text is their serialization
+    /// (math, commands and escapes reproduce the source); the argument ends
+    /// at the delimiter, or at a paragraph break.
+    fn parse_verbatim_argument(&mut self) -> String {
+        self.skip_whitespace_only();
+        let was = std::mem::replace(&mut self.in_math_expansion, true);
+        let text = self.parse_verbatim_argument_inner();
+        self.in_math_expansion = was;
+        text
+    }
+
+    fn parse_verbatim_argument_inner(&mut self) -> String {
+        if matches!(self.current_token(), Token::LeftBrace) {
+            let tokens = self.collect_braced_tokens();
+            return tokens.iter().map(|t| self.token_to_string(t)).collect();
+        }
+        let first = match self.current_token().clone() {
+            Token::Text(t) => t,
+            Token::Verb(code) => {
+                // \verb-like token already captured
+                self.advance();
+                return code;
+            }
+            other => {
+                self.advance();
+                return self.token_to_string(&other);
+            }
+        };
+        self.advance();
+        let mut chars = first.chars();
+        let Some(delimiter) = chars.next() else {
+            return String::new();
+        };
+        let mut text = String::new();
+        let mut rest: String = chars.collect();
+        let mut guard = 0;
+        loop {
+            if let Some(pos) = rest.find(delimiter) {
+                text.push_str(&rest[..pos]);
+                let after = &rest[pos + delimiter.len_utf8()..];
+                if !after.is_empty() {
+                    self.push_front(vec![Token::Text(after.to_string())]);
+                }
+                return text;
+            }
+            text.push_str(&rest);
+            guard += 1;
+            if self.is_at_end() || guard > 10_000 || matches!(self.current_token(), Token::ParBreak) {
+                return text;
+            }
+            match self.current_token().clone() {
+                Token::Text(t) => {
+                    self.advance();
+                    rest = t;
+                }
+                other => {
+                    self.advance();
+                    rest = String::new();
+                    text.push_str(&self.token_to_string(&other));
+                }
+            }
+        }
+    }
+
     /// Arguments for an xparse-defined command. Absent optional arguments
     /// become `-NoValue-`, stars `\BooleanTrue`/`\BooleanFalse`, as xparse
     /// passes them (tested by \IfNoValueTF / \IfBooleanTF).
@@ -4134,7 +4897,8 @@ impl Parser {
         let mut args = Vec::new();
         for xarg in xargs {
             match xarg {
-                XArg::Mandatory | XArg::Verbatim => args.push(self.parse_undelimited_argument()?),
+                XArg::Mandatory => args.push(self.parse_undelimited_argument()?),
+                XArg::Verbatim => args.push(self.parse_verbatim_argument()),
                 XArg::Optional(default) => {
                     self.skip_whitespace_only();
                     if matches!(self.current_token(), Token::LeftBracket) {
@@ -4509,6 +5273,17 @@ impl Parser {
     /// that a user environment's end-code would have produced), so a
     /// missing `\end{name}` can never swallow the rest of the document.
     fn read_until_end_environment(&mut self, env_name: &str) -> Result<String> {
+        // raw capture: no eager end-code expansion or label rewriting, the
+        // text is reproduced as written
+        let was = std::mem::replace(&mut self.normalizing_label, true);
+        let content = self.read_until_end_environment_raw(env_name);
+        self.normalizing_label = was;
+        // the token that ended the capture may be a user environment's end
+        self.normalize_current_label();
+        content
+    }
+
+    fn read_until_end_environment_raw(&mut self, env_name: &str) -> Result<String> {
         let mut content = String::new();
         let mut open: Vec<String> = Vec::new();
 
@@ -5225,6 +6000,15 @@ impl Parser {
 
 static EOF_TOKEN: Token = Token::Eof;
 
+/// What a `\label`/`\caption` in running text attaches to.
+#[derive(Debug, Default)]
+struct LabelTarget {
+    label: Option<String>,
+    caption: Option<Vec<Inline>>,
+    /// Whether a `\caption` here belongs to this target (floats only).
+    takes_caption: bool,
+}
+
 /// Reverse a lexed token sequence into the parser's stack order, dropping
 /// end-of-input markers (end of input is simply an empty stack).
 fn reverse_tokens(tokens: Vec<Token>) -> Vec<Token> {
@@ -5254,6 +6038,22 @@ fn citation_style_for(style: &str) -> Option<crate::state::CitationStyle> {
 
 /// Map a \cite-family command name to its formatting mode.
 fn citation_mode_for(cmd: &str) -> CitationMode {
+    let lower = cmd.to_ascii_lowercase();
+    match lower.trim_end_matches('s') {
+        "citetitle" => return CitationMode::Title,
+        "citeurl" => return CitationMode::Url,
+        "citedate" => return CitationMode::Field(String::from("date")),
+        "citeurldate" => return CitationMode::Field(String::from("urldate")),
+        "fullcite" | "footfullcite" => return CitationMode::Full,
+        "citeasnoun" | "citen" | "textcite" => return CitationMode::Textual,
+        "citename" | "citeauthor" => return CitationMode::Author,
+        "citeyearnp" => return CitationMode::Year,
+        "parencite" | "citeyearpar" | "citep" => {
+            return if lower == "citeyearpar" { CitationMode::YearPar } else { CitationMode::Parenthetical }
+        }
+        "citet" => return CitationMode::Textual,
+        _ => {}
+    }
     match cmd {
         "citet" | "textcite" => CitationMode::Textual,
         "citep" | "parencite" => CitationMode::Parenthetical,
@@ -5892,19 +6692,64 @@ fn is_overlay_spec(text: &str) -> bool {
 /// The body of a complete LaTeX document (between `\begin{document}` and
 /// `\end{document}`, ignoring commented-out occurrences), if it is one.
 fn document_body(content: &str) -> Option<String> {
-    let begin = find_uncommented(content, "\\begin{document}", false)?;
     // A complete document declares its class first (subfiles, standalone);
-    // a \begin{document} in a chapter's verbatim example does not count
-    let class = find_uncommented(content, "\\documentclass", false)
-        .or_else(|| find_uncommented(content, "\\documentstyle", false))?;
-    if class > begin {
+    // a \documentclass/\begin{document} in a chapter's verbatim example
+    // does not make the chapter a document
+    if !starts_with_documentclass(content) {
         return None;
     }
+    let begin = find_uncommented(content, "\\begin{document}", false)?;
     let start = begin + "\\begin{document}".len();
     let end = find_uncommented(&content[start..], "\\end{document}", true)
         .map(|e| start + e)
         .unwrap_or(content.len());
     Some(content[start..end].to_string())
+}
+
+/// Whether the first command of the file (after comments, blank lines and
+/// the few things allowed before a class: `\RequirePackage`,
+/// `\DocumentMetadata`, `\pdfoutput=1`, ...) is `\documentclass`.
+fn starts_with_documentclass(content: &str) -> bool {
+    const BEFORE_CLASS: &[&str] = &[
+        "\\RequirePackage",
+        "\\PassOptionsToPackage",
+        "\\PassOptionsToClass",
+        "\\DocumentMetadata",
+        "\\NeedsTeXFormat",
+        "\\pdfoutput",
+        "\\listfiles",
+        "\\nonstopmode",
+        "\\batchmode",
+        "\\errorcontextlines",
+        "\\relax",
+    ];
+    let mut in_filecontents = false;
+    for line in content.lines() {
+        if in_filecontents {
+            in_filecontents = !line.contains("\\end{filecontents");
+            continue;
+        }
+        let code = match line.char_indices().find(|&(i, c)| c == '%' && !line[..i].ends_with('\\')) {
+            Some((i, _)) => &line[..i],
+            None => line,
+        };
+        let code = code.trim();
+        if code.is_empty() {
+            continue;
+        }
+        if code.starts_with("\\documentclass") || code.starts_with("\\documentstyle") {
+            return true;
+        }
+        if code.starts_with("\\begin{filecontents") {
+            in_filecontents = !code.contains("\\end{filecontents");
+            continue;
+        }
+        if BEFORE_CLASS.iter().any(|p| code.starts_with(p)) {
+            continue;
+        }
+        return false;
+    }
+    false
 }
 
 /// Position of `needle` outside `%` comments (first, or last if `last`).

@@ -330,14 +330,17 @@ impl Lexer {
         }
 
         // Escaped literal characters: \% \$ \& \# \_ \{ \}
-        if matches!(ch, '%' | '$' | '&' | '#' | '_' | '{' | '}') {
+        // (under expl3 syntax `_` is a letter: `\__module_fn:n`)
+        if matches!(ch, '%' | '$' | '&' | '#' | '{' | '}') || (ch == '_' && !self.expl_syntax) {
             self.advance();
             return Ok(Some(Token::Text(ch.to_string())));
         }
 
         // Accent and spacing control symbols: emitted as single-char commands,
         // resolved by the parser (\' \` \^ \" \~ \= \. accents; \, \; \: \! spacing)
-        if matches!(ch, '\'' | '`' | '^' | '"' | '~' | '=' | '.' | ',' | ';' | ':' | '!') {
+        if matches!(ch, '\'' | '`' | '^' | '"' | '~' | '=' | '.' | ',' | ';' | '!')
+            || (ch == ':' && !self.expl_syntax)
+        {
             self.advance();
             return Ok(Some(Token::Command(ch.to_string())));
         }
@@ -359,7 +362,10 @@ impl Lexer {
         match cmd_name.as_str() {
             "makeatletter" => self.at_letter = true,
             "makeatother" => self.at_letter = false,
-            "ExplSyntaxOn" => self.expl_syntax = true,
+            // expl3 packages/classes are read with expl3 syntax on
+            "ExplSyntaxOn" | "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile" => {
+                self.expl_syntax = true
+            }
             "ExplSyntaxOff" => self.expl_syntax = false,
             _ => {}
         }

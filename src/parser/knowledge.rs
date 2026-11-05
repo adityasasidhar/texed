@@ -36,6 +36,7 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         "define@key" => sig(false, 3, false),
         "setkeys" => sig(false, 2, false),
         "ExplSyntaxOn" | "ExplSyntaxOff" => sig(false, 0, false),
+        "ProvidesExplPackage" | "ProvidesExplClass" | "ProvidesExplFile" => sig(false, 4, false),
 
         // Diagnostics
         "typeout" | "message" | "wlog" | "errmessage" | "GenericInfo" | "showthe" => sig(false, 1, false),
@@ -201,6 +202,9 @@ pub(super) fn tex_assignment(cmd: &str) -> Option<(usize, bool)> {
         // LaTeX kernel scratch registers
         "@tempcnta" | "@tempcntb" | "@tempdima" | "@tempdimb" | "@tempdimc" | "@tempskipa"
         | "@tempskipb" | "count@" | "dimen@" | "dimen@i" | "dimen@ii" | "skip@" | "@tempcnt"
+        | "@beginparpenalty" | "@endparpenalty" | "@itempenalty" | "@lowpenalty" | "@medpenalty"
+        | "@highpenalty" | "@secpenalty" | "@topsepadd" | "@totalleftmargin" | "@listdepth"
+        | "@mparbottom" | "@textfloatsheight" | "@colroom" | "@colht" | "@floatpenalty"
         => (0, true),
         // Register allocation: one control sequence
         "newcount" | "newdimen" | "newskip" | "newmuskip" | "newtoks" | "newbox" | "newread"
