@@ -90,6 +90,13 @@ pub struct ParserState {
 
     /// `\let\new\old` aliases of built-in commands (new -> old).
     pub aliases: HashMap<String, String>,
+
+    /// Counters from `\newcounter` (name -> value).
+    pub user_counters: HashMap<String, usize>,
+
+    /// Counters reset when another counter steps (parent -> children),
+    /// from `\newcounter{x}[parent]` and `\counterwithin`.
+    pub counter_resets: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +132,9 @@ pub struct MacroDef {
     /// xparse argument specification (`\NewDocumentCommand{\x}{s o m}`);
     /// when set it replaces `num_params`/`optional_param` for parsing.
     pub xparse: Option<Vec<XArg>>,
+    /// The body is literal text (from \verbtocs and friends), never
+    /// re-read as LaTeX — it may contain unbalanced braces.
+    pub literal: bool,
 }
 
 /// One xparse argument specifier.
@@ -198,6 +208,8 @@ impl ParserState {
             numberwithin: HashMap::new(),
             conditionals: HashMap::new(),
             aliases: HashMap::new(),
+            user_counters: HashMap::new(),
+            counter_resets: HashMap::new(),
         }
     }
 
@@ -236,9 +248,45 @@ impl ParserState {
             "figure" => self.figure_counter = value,
             "table" => self.table_counter = value,
             "footnote" => self.footnote_counter = value,
-            _ => return,
+            other => {
+                if let Some(counter) = self.user_counters.get_mut(other) {
+                    *counter = value;
+                }
+                return;
+            }
         }
         self.update_section_number();
+    }
+
+    /// `\newcounter{name}[parent]`.
+    pub fn new_counter(&mut self, name: &str, parent: Option<&str>) {
+        self.user_counters.entry(name.to_string()).or_insert(0);
+        if let Some(parent) = parent.filter(|p| !p.is_empty()) {
+            self.counter_resets
+                .entry(parent.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+    }
+
+    /// Reset the counters numbered within `parent` (recursively).
+    pub fn reset_dependents(&mut self, parent: &str) {
+        let mut stack = vec![parent.to_string()];
+        let mut guard = 0;
+        while let Some(p) = stack.pop() {
+            guard += 1;
+            if guard > 256 {
+                break;
+            }
+            if let Some(children) = self.counter_resets.get(&p).cloned() {
+                for child in children {
+                    if let Some(value) = self.user_counters.get_mut(&child) {
+                        *value = 0;
+                    }
+                    stack.push(child);
+                }
+            }
+        }
     }
 
     /// Parent sectioning level a float/equation counter is numbered within.
@@ -340,6 +388,12 @@ impl ParserState {
 
             self.current_level = level;
             self.update_section_number();
+            for name in ["chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph"]
+                .iter()
+                .skip(level)
+            {
+                self.reset_dependents(name);
+            }
         }
     }
 
@@ -415,6 +469,8 @@ impl ParserState {
         within: Option<String>,
     ) {
         let counter_key = counter_key.unwrap_or_else(|| env_name.clone());
+        // a theorem definition replaces a same-named user environment
+        self.environments.remove(&env_name);
         self.theorem_envs.insert(
             env_name,
             TheoremEnvDef {
@@ -529,6 +585,14 @@ pub fn substitute_params(body: &str, args: &[String]) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
     while let Some(ch) = chars.next() {
+        // `\#` is an escaped literal, not a parameter
+        if ch == '\\' {
+            out.push(ch);
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
         if ch == '#' {
             match chars.peek().copied() {
                 Some('#') => {

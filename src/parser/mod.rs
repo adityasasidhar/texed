@@ -17,6 +17,7 @@ mod knowledge;
 mod math;
 mod siunitx;
 mod tables;
+mod xstring;
 mod tex;
 
 /// Baseline budget of macro expansions per document, guarding against
@@ -199,6 +200,10 @@ pub struct Parser {
     normalizing_label: bool,
     /// Registers declared with \newdimen, \newcount, \chardef, ...
     tex_registers: HashSet<String>,
+    /// Saved boxes (\sbox, \setbox, lrbox): their content as tokens.
+    boxes: HashMap<String, Vec<Token>>,
+    /// Verbatim environments defined by the document (name -> language).
+    verbatim_envs: HashMap<String, Option<String>>,
     /// `\end{document}` was reached (possibly inside an included file).
     document_ended: bool,
     /// Preamble state to restore when each loaded package ends.
@@ -271,6 +276,8 @@ impl Parser {
             in_math_expansion: false,
             normalizing_label: false,
             tex_registers: HashSet::new(),
+            boxes: HashMap::new(),
+            verbatim_envs: HashMap::new(),
             document_ended: false,
             package_preamble_restore: Vec::new(),
             input_stack: Vec::new(),
@@ -562,6 +569,7 @@ impl Parser {
                 | "DeclareDocumentCommand"
                 | "newenvironment"
                 | "renewenvironment"
+                | "provideenvironment"
                 | "newtheorem"
                 | "newtheorem*"
                 | "bibliography"
@@ -797,7 +805,18 @@ impl Parser {
                     content: code,
                 })
             }
-            _ => Some(Block::Verbatim(body)),
+            _ => match self.verbatim_envs.get(name) {
+                // a document-defined listing environment
+                Some(language) => {
+                    // \begin{code}[options] may carry options
+                    let (_, code) = split_leading_bracket_group(&body);
+                    Some(Block::CodeBlock {
+                        language: language.clone(),
+                        content: code,
+                    })
+                }
+                None => Some(Block::Verbatim(body)),
+            },
         }
     }
 
@@ -841,6 +860,10 @@ impl Parser {
             // Definition containers: their \acro / \newglossaryentry
             // commands are recorded, nothing is typeset here
             "acronym" => self.parse_transparent_environment(&env_name, 0, true),
+            "lrbox" => {
+                self.parse_lrbox()?;
+                Ok(None)
+            }
             // Framed/boxed content: a quotation of the content
             "framed" | "oframed" | "shaded" | "shaded*" | "snugshade" | "snugshade*" | "leftbar"
             | "mdframed" | "tcolorbox" | "boxedminipage" | "fminipage" | "fbox" | "titled-frame"
@@ -1325,14 +1348,17 @@ impl Parser {
             }
 
             if let Token::EndEnvironment(env) = self.current_token() {
-                if env == env_name {
+                // our list ends, or an enclosing environment does (input
+                // missing its \end{itemize}): either way the item is over
+                if env == env_name || !self.state.environments.contains_key(env) {
                     break;
                 }
             }
 
-            match self.parse_block()? {
-                Some(block) => blocks.push(block),
-                None => break,
+            // No block (a definition, an expansion spliced in): keep going;
+            // parse_block always consumes, so this cannot spin
+            if let Some(block) = self.parse_block()? {
+                blocks.push(block);
             }
         }
 
@@ -1776,6 +1802,13 @@ impl Parser {
             let token = self.current_token();
 
             match token {
+                // Inline environments (lrbox, text-only user environments)
+                // stay inside the paragraph
+                Token::BeginEnvironment(env) | Token::EndEnvironment(env) if self.env_is_inline(env) => {
+                    if let Some(inline) = self.parse_inline()? {
+                        inlines.push(inline);
+                    }
+                }
                 Token::ParBreak
                 | Token::BeginEnvironment(_)
                 | Token::Section(..)
@@ -1929,6 +1962,28 @@ impl Parser {
                 let code = code.clone();
                 self.advance();
                 Ok(Some(Inline::Code(code)))
+            }
+            Token::BeginEnvironment(env) if self.env_is_inline(env) => {
+                let env = env.clone();
+                self.advance();
+                if env == "lrbox" {
+                    self.parse_lrbox()?;
+                } else {
+                    let _ = self.expand_user_environment_begin(&env)?;
+                }
+                Ok(None)
+            }
+            // The end of a user environment always runs its end code, in any
+            // context: it may close something (a tabular) opened by its begin
+            // code, which the enclosing parser is waiting for
+            Token::EndEnvironment(env) if self.state.environments.contains_key(env) => {
+                let env = env.clone();
+                let end_def = self.state.environments[&env].end_def.clone();
+                self.advance();
+                if self.consume_expansion_budget(&format!("end{}", env)) {
+                    self.splice_fragment_tokens(&end_def)?;
+                }
+                Ok(None)
             }
             // Brackets outside an optional-argument position are literal text
             Token::LeftBracket => {
@@ -2101,6 +2156,34 @@ impl Parser {
     /// Commands with built-in meaning (everything but user macros).
     fn parse_builtin_command(&mut self, cmd: String) -> Result<Option<Inline>> {
 
+        // \label / \begin / \end reached as command tokens (aliases like
+        // \let\l=\label, or malformed input the lexer could not group):
+        // structure only when a short, well-formed argument follows
+        if matches!(cmd.as_str(), "label" | "begin" | "end") {
+            self.skip_whitespace_only();
+            if let Some(tokens) = self.collect_short_braced_tokens() {
+                let key: String = tokens.iter().map(|t| self.token_to_string(t)).collect();
+                let key = key.trim().to_string();
+                if !key.is_empty() {
+                    self.push_front(vec![match cmd.as_str() {
+                        "label" => Token::Label(key),
+                        "begin" => Token::BeginEnvironment(key),
+                        _ => Token::EndEnvironment(key),
+                    }]);
+                }
+            }
+            return Ok(None);
+        }
+        // \hfill and \hspace separate things on a line: a space
+        if matches!(cmd.as_str(), "hfill" | "hspace" | "hskip" | "quad" | "qquad" | "enspace") {
+            self.consume_text_star();
+            if cmd == "hspace" {
+                let _ = self.collect_braced_tokens();
+            } else if cmd == "hskip" {
+                self.consume_tex_assignment(0, true);
+            }
+            return Ok(Some(Inline::Text(String::from(" "))));
+        }
         // A sectioning command reached as a command token (via \csuse,
         // \csname or an alias) becomes a proper Section token
         if let Some(level) = sectioning_level(&cmd) {
@@ -2160,6 +2243,29 @@ impl Parser {
                         self.state.set_counter(&name, value + 1);
                     }
                 }
+                self.state.reset_dependents(&name);
+                return Ok(None);
+            }
+            "newcounter" => {
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                let parent = if matches!(self.current_token(), Token::LeftBracket) {
+                    Some(self.parse_bracketed_text()?.trim().to_string())
+                } else {
+                    None
+                };
+                if !name.is_empty() {
+                    self.state.new_counter(&name, parent.as_deref());
+                }
+                return Ok(None);
+            }
+            "counterwithin" | "counterwithin*" => {
+                self.consume_text_star();
+                self.skip_whitespace_and_comments();
+                let name = self.parse_braced_text()?.trim().to_string();
+                self.skip_whitespace_and_comments();
+                let parent = self.parse_braced_text()?.trim().to_string();
+                self.state.new_counter(&name, Some(&parent));
                 return Ok(None);
             }
             "numberwithin" => {
@@ -2225,8 +2331,11 @@ impl Parser {
                 Ok(Some(Inline::Underline(content)))
             }
             "texttt" | "verb" | "code" => {
-                let content = self.parse_braced_text()?;
-                Ok(Some(Inline::Code(content)))
+                // Typewriter text is LaTeX (\texttt{a\_b}, macros inside):
+                // parse it, then flatten to the code span's characters
+                let content = self.parse_braced_inlines()?;
+                let text = inlines_to_code_text(&content);
+                Ok(Some(Inline::Code(text.trim().to_string())))
             }
             "ensuremath" => {
                 let content = self.parse_braced_text()?;
@@ -2249,12 +2358,12 @@ impl Parser {
                 if matches!(self.current_token(), Token::LeftBracket) {
                     let _ = self.parse_bracketed_text()?;
                 }
-                let url = self.parse_braced_text()?;
+                let url = self.parse_braced_raw_text();
                 let text = self.parse_braced_inlines()?;
                 Ok(Some(Inline::Link { text, url, title: None }))
             }
             "url" => {
-                let url = self.parse_braced_text()?;
+                let url = self.parse_braced_raw_text();
                 Ok(Some(Inline::Link {
                     text: vec![Inline::Text(url.clone())],
                     url,
@@ -2537,6 +2646,52 @@ impl Parser {
         Ok(Some(Block::Quote(blocks)))
     }
 
+    /// Does this environment produce only inline material (so it does not
+    /// end the current paragraph)? `lrbox`, and user environments whose
+    /// begin/end code has no block structure.
+    fn env_is_inline(&self, env: &str) -> bool {
+        if env == "lrbox" {
+            return true;
+        }
+        let Some(def) = self.state.environments.get(env) else {
+            return false;
+        };
+        let code = format!("{}{}", def.begin_def, def.end_def);
+        let block_markers = [
+            "\\par", "\\section", "\\chapter", "\\subsection", "\\item", "\\[", "$$",
+            "\\noindent", "\\centering", "\\vspace", "\\medskip", "\\bigskip", "\\smallskip",
+            "\\newline", "\\\\", "\\maketitle", "\\caption", "\\clearpage", "\\newpage",
+        ];
+        if block_markers.iter().any(|m| code.contains(m)) {
+            return false;
+        }
+        // nested environments must themselves be inline
+        let mut rest = code.as_str();
+        while let Some(pos) = rest.find("\\begin{") {
+            let after = &rest[pos + 7..];
+            let name: String = after.chars().take_while(|&c| c != '}').collect();
+            if name != "lrbox" && (name == env || !self.env_is_inline_shallow(&name)) {
+                return false;
+            }
+            rest = &after[name.len().min(after.len())..];
+        }
+        true
+    }
+
+    /// One level of env_is_inline (no recursion into nested definitions).
+    fn env_is_inline_shallow(&self, env: &str) -> bool {
+        if env == "lrbox" {
+            return true;
+        }
+        match self.state.environments.get(env) {
+            Some(def) => {
+                let code = format!("{}{}", def.begin_def, def.end_def);
+                !code.contains("\\begin{") && !code.contains("\\par") && !code.contains("\\item")
+            }
+            None => false,
+        }
+    }
+
     /// Parse blocks up to `\end{env_name}`.
     fn parse_environment_blocks(&mut self, env_name: &str) -> Result<Vec<Block>> {
         let mut blocks = Vec::new();
@@ -2590,6 +2745,80 @@ impl Parser {
     fn parse_knowledge_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         if let Some(result) = self.parse_glossary_command(cmd)? {
             return Ok(Some(result));
+        }
+        if self.parse_box_or_xstring(cmd)?.is_some() {
+            return Ok(Some(None));
+        }
+        // \write<stream>{...}, \protected@write<stream>{}{...}: aux-file
+        // output, never typeset
+        if matches!(cmd, "write" | "protected@write" | "@writefile" | "addtocontents@write") {
+            self.skip_whitespace_only();
+            if matches!(self.current_token(), Token::Command(_) | Token::Text(_)) && cmd != "@writefile" {
+                self.advance();
+            }
+            let groups = match cmd {
+                "protected@write" | "@writefile" => 2,
+                _ => 1,
+            };
+            for _ in 0..groups {
+                let _ = self.collect_braced_tokens();
+            }
+            return Ok(Some(None));
+        }
+        // expl3 functions (`\clist_map_inline:Nn`): programming, no output;
+        // their arguments follow the signature after the colon
+        if let Some((_, signature)) = cmd.rsplit_once(':') {
+            if cmd.contains('_') || signature.chars().all(|c| c.is_ascii_alphabetic()) && !signature.is_empty() {
+                let keep_first = matches!(cmd, "use:n" | "use_i:nn" | "tl_use:N");
+                let mut kept = Vec::new();
+                for (i, kind) in signature.chars().enumerate() {
+                    self.skip_whitespace_only();
+                    match kind {
+                        'n' | 'x' | 'o' | 'f' | 'e' | 'V' | 'v' | 'c' | 'T' | 'F' | 'p' => {
+                            let group = self.collect_braced_tokens();
+                            if keep_first && i == 0 {
+                                kept = group;
+                            }
+                        }
+                        'N' => {
+                            if !self.is_at_end() && !matches!(self.current_token(), Token::RightBrace) {
+                                self.advance();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.push_front(kept);
+                return Ok(Some(None));
+            }
+        }
+        // Verbatim environment definitions: remember the name for files
+        // read later (the current file was pre-scanned by its lexer)
+        if matches!(
+            cmd,
+            "lstnewenvironment" | "DefineVerbatimEnvironment" | "RecustomVerbatimEnvironment"
+                | "CustomVerbatimEnvironment" | "newtcblisting" | "NewTCBListing"
+                | "DeclareTCBListing" | "newminted"
+        ) {
+            self.consume_text_star();
+            self.skip_whitespace_only();
+            let explicit = if matches!(self.current_token(), Token::LeftBracket) {
+                Some(self.parse_bracketed_text()?.trim().to_string())
+            } else {
+                None
+            };
+            self.skip_whitespace_only();
+            let first = self.parse_braced_text()?.trim().to_string();
+            let (name, language) = if cmd == "newminted" {
+                (explicit.unwrap_or_else(|| format!("{}code", first)), Some(first.to_lowercase()))
+            } else {
+                (first, None)
+            };
+            if !name.is_empty() {
+                self.verbatim_envs.entry(name).or_insert(language);
+            }
+            self.consume_trailing_groups(4)?;
+            return Ok(Some(None));
         }
         if let Some(signature) = knowledge::setup_command(cmd) {
             self.consume_text_star();
@@ -2780,12 +3009,42 @@ impl Parser {
             }
             "texed@endfile" => return Ok(Some(None)),
             "comment" => {
-                // \comment ... \endcomment (comment package, plain form)
-                while !self.is_at_end() {
-                    let done = matches!(self.current_token(), Token::Command(c) if c == "endcomment");
-                    self.advance();
-                    if done {
-                        break;
+                // \comment ... \endcomment (comment package, plain form).
+                // \endcomment often comes from a user environment's end code
+                // (\newenvironment{x}{\comment}{\endcomment}): expand that
+                // code when its \end is met; never run past an \end that
+                // closes something opened outside the comment.
+                let mut open: Vec<String> = Vec::new();
+                let mut guard = 0usize;
+                while !self.is_at_end() && guard < 5_000_000 {
+                    guard += 1;
+                    match self.current_token().clone() {
+                        Token::Command(c) if c == "endcomment" => {
+                            self.advance();
+                            break;
+                        }
+                        Token::BeginEnvironment(env) => {
+                            open.push(env);
+                            self.advance();
+                        }
+                        Token::EndEnvironment(env) => {
+                            if let Some(pos) = open.iter().rposition(|o| *o == env) {
+                                open.truncate(pos);
+                                self.advance();
+                                continue;
+                            }
+                            let end_def = self.state.environments.get(&env).map(|d| d.end_def.clone());
+                            match end_def {
+                                Some(code) if code.contains("\\endcomment") => {
+                                    self.advance();
+                                    self.splice_fragment_tokens(&code)?;
+                                }
+                                // closes an enclosing environment: stop here
+                                _ => break,
+                            }
+                        }
+                        Token::Command(c) if c == "texed@endfile" || c == "texed@popdir" => break,
+                        _ => self.advance(),
                     }
                 }
                 return Ok(Some(None));
@@ -3031,6 +3290,41 @@ impl Parser {
         }
     }
 
+    /// A short argument `{...}` (a label key, an environment name): taken
+    /// only if it closes before any paragraph break — TeX rejects `\par`
+    /// in such arguments, and an unclosed brace must not swallow the rest.
+    fn collect_short_braced_tokens(&mut self) -> Option<Vec<Token>> {
+        if !matches!(self.current_token(), Token::LeftBrace) {
+            return None;
+        }
+        let mut depth = 0usize;
+        for k in 0..4096 {
+            match self.peek_at(k)? {
+                Token::LeftBrace => depth += 1,
+                Token::RightBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(self.collect_braced_tokens());
+                    }
+                }
+                Token::ParBreak | Token::Section(..) | Token::BeginEnvironment(_) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// A braced argument's text without re-escaping (URLs are verbatim).
+    fn parse_braced_raw_text(&mut self) -> String {
+        self.collect_braced_tokens()
+            .iter()
+            .map(|t| match t {
+                Token::Text(text) => text.clone(),
+                other => self.token_to_string(other),
+            })
+            .collect()
+    }
+
     /// Concatenate consecutive text tokens at the cursor.
     fn take_text_run(&mut self) -> String {
         let mut run = String::new();
@@ -3045,13 +3339,18 @@ impl Parser {
     }
 
     /// `\setbox<register>=<box command>{...}`: a box assignment, never
-    /// typeset where it occurs.
+    /// typeset where it occurs; the content is stored for \box/\unhbox.
     fn consume_setbox(&mut self) {
         self.skip_whitespace_only();
+        let mut register = String::new();
         // register: \name or a number
         match self.current_token().clone() {
-            Token::Command(_) => self.advance(),
+            Token::Command(name) => {
+                register = name;
+                self.advance();
+            }
             Token::Text(t) => {
+                register = t.chars().take_while(|c| c.is_ascii_digit()).collect();
                 self.advance();
                 // "0=\hbox" may arrive as "0=" text
                 if let Some(rest) = t.split_once('=').map(|(_, r)| r.to_string()).filter(|r| !r.is_empty()) {
@@ -3081,7 +3380,11 @@ impl Parser {
                 self.skip_whitespace_only();
                 match self.current_token() {
                     Token::LeftBrace => {
-                        let _ = self.collect_braced_tokens();
+                        let content = self.collect_braced_tokens();
+                        let content = self.resolve_box_uses(content);
+                        if !register.is_empty() {
+                            self.boxes.insert(register, content);
+                        }
                     }
                     Token::Command(_) | Token::Text(_) => self.advance(),
                     _ => {}
@@ -3401,6 +3704,9 @@ impl Parser {
             if !self.consume_expansion_bytes(cmd, expanded.len()) || !self.consume_expansion_budget(cmd) {
                 return Ok(None);
             }
+            if self.state.macros.get(cmd).is_some_and(|d| d.literal) {
+                return Ok(Some(Inline::Text(expanded)));
+            }
             // Re-lex the expansion and splice it into the token stream so the
             // body is fully parsed (formatting, math, nested macros, ...).
             self.push_front(tex::lex_fragment(&expanded));
@@ -3607,6 +3913,7 @@ impl Parser {
                 delimiters,
                 prefix,
                 xparse: None,
+                literal: false,
             };
             match mode {
                 MacroDefinitionMode::New | MacroDefinitionMode::Renew => {
@@ -4036,8 +4343,10 @@ impl Parser {
                 let content = document_body(&content).unwrap_or(content);
                 if self.consume_expansion_budget(&format!("input:{}", filename)) {
                     let at_letter = filename.ends_with(".sty") || filename.ends_with(".cls");
+                    self.note_verbatim_envs(&content);
                     let mut tokens = Lexer::new(&content)
                         .with_at_letter(at_letter)
+                        .with_verbatim_envs(self.verbatim_envs.keys())
                         .tokenize()
                         .unwrap_or_default();
                     if matches!(tokens.last(), Some(Token::Eof)) {
@@ -4130,8 +4439,22 @@ impl Parser {
 
     /// Collect the raw tokens of a braced group (brace-aware), consuming it.
     fn collect_braced_tokens(&mut self) -> Vec<Token> {
+        // TeX skips spaces and a single newline before an undelimited
+        // argument: `\newenvironment{x}[1]\n{begin}\n{end}` is common.
+        // Only consumed when a group really follows; never past \par.
         if !matches!(self.current_token(), Token::LeftBrace) {
-            return Vec::new();
+            let mut k = 0;
+            while matches!(
+                self.peek_at(k),
+                Some(Token::Whitespace(_)) | Some(Token::Newline) | Some(Token::Comment(_))
+            ) {
+                k += 1;
+            }
+            if k > 0 && matches!(self.peek_at(k), Some(Token::LeftBrace)) {
+                self.skip_n(k);
+            } else {
+                return Vec::new();
+            }
         }
         self.advance(); // consume '{'
 
@@ -4208,7 +4531,9 @@ impl Parser {
 
     fn token_to_string(&self, token: &Token) -> String {
         match token {
-            Token::Text(t) => t.clone(),
+            // Math-mode tokens keep escapes as commands: their text is raw
+            Token::Text(t) if self.in_math_expansion => t.clone(),
+            Token::Text(t) => escape_text_token(t),
             Token::Whitespace(w) => w.clone(),
             Token::Newline => String::from("\n"),
             Token::ParBreak => String::from("\n\n"),
@@ -4369,23 +4694,31 @@ impl Parser {
             }
             
             // Environment definitions
-            "newenvironment" | "renewenvironment" => {
+            "newenvironment" | "renewenvironment" | "provideenvironment" => {
                 self.advance();
                 self.consume_text_star();
+                // Arguments may be separated by spaces/newlines/comments
+                self.skip_whitespace_only();
                 let name = self.parse_braced_text()?;
+                self.skip_whitespace_only();
                 let num_params = if matches!(self.current_token(), Token::LeftBracket) {
-                    self.parse_bracketed_text()?.trim().parse::<usize>().unwrap_or(0)
+                    self.parse_bracketed_text()?.trim().parse::<usize>().unwrap_or(0).min(9)
                 } else {
                     0
                 };
+                self.skip_whitespace_only();
                 let optional_param = if matches!(self.current_token(), Token::LeftBracket) {
                     Some(self.parse_bracketed_text()?)
                 } else {
                     None
                 };
+                self.skip_whitespace_only();
                 let begin_def = self.parse_braced_text()?;
+                self.skip_whitespace_only();
                 let end_def = self.parse_braced_text()?;
                 if !name.is_empty() {
+                    // the document's own definition replaces a built-in theorem one
+                    self.state.theorem_envs.remove(&name);
                     self.state.environments.insert(
                         name,
                         crate::state::EnvironmentDef {
@@ -4613,6 +4946,14 @@ impl Parser {
         Some(name)
     }
 
+    /// Record verbatim environments a source text defines, so files read
+    /// later lex their bodies raw.
+    fn note_verbatim_envs(&mut self, text: &str) {
+        for (name, language) in crate::lexer::scan_verbatim_env_definitions(text) {
+            self.verbatim_envs.entry(name).or_insert(language);
+        }
+    }
+
     /// Read a package/class file found next to the document (local style
     /// files hold the document's macro and theorem definitions) and splice
     /// it in. Packages not found locally are standard ones: nothing to do.
@@ -4648,8 +4989,10 @@ impl Parser {
             if !self.consume_expansion_bytes(package, content.len()) {
                 return;
             }
+            self.note_verbatim_envs(&content);
             let mut tokens = Lexer::new(&content)
                 .with_at_letter(true)
+                .with_verbatim_envs(self.verbatim_envs.keys())
                 .tokenize()
                 .unwrap_or_default();
             if matches!(tokens.last(), Some(Token::Eof)) {
@@ -4711,7 +5054,7 @@ impl Parser {
             "figure" => self.state.figure_counter,
             "table" => self.state.table_counter,
             "footnote" => self.state.footnote_counter,
-            _ => 0,
+            other => self.state.user_counters.get(other).copied().unwrap_or(0),
         }
     }
 
@@ -4769,6 +5112,32 @@ impl Parser {
     fn normalize_current_label(&mut self) {
         if self.normalizing_label {
             return;
+        }
+        // The end of a user environment runs its end code wherever it is
+        // met, so whatever its begin code opened (a figure, a tabular, a
+        // comment) is closed even inside loops scanning for that close
+        let mut guard = 0;
+        while let Some(Token::EndEnvironment(env)) = self.tokens.last() {
+            let Some(def) = self.state.environments.get(env) else {
+                break;
+            };
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let env = env.clone();
+            let end_def = def.end_def.clone();
+            let key = format!("end{}", env);
+            self.normalizing_label = true;
+            let allowed = self.consume_expansion_budget(&key);
+            self.normalizing_label = false;
+            if !allowed {
+                break;
+            }
+            self.tokens.pop();
+            self.consumed += 1;
+            let tokens = tex::lex_fragment(&end_def);
+            self.tokens.extend(tokens.into_iter().rev().filter(|t| !matches!(t, Token::Eof)));
         }
         let raw = match self.tokens.last() {
             Some(Token::Label(l)) if l.contains('\\') => l.clone(),
@@ -5530,6 +5899,54 @@ fn span_or_single(mut content: Vec<Inline>) -> Inline {
     }
 }
 
+/// The characters of inlines, for a code span (formatting dropped).
+fn inlines_to_code_text(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(t) | Inline::Code(t) | Inline::RawInline(t) => out.push_str(t),
+            Inline::Space | Inline::SoftBreak | Inline::LineBreak => out.push(' '),
+            Inline::InlineMath(m) => {
+                out.push('$');
+                out.push_str(m);
+                out.push('$');
+            }
+            Inline::Emph(c) | Inline::Strong(c) | Inline::Strikeout(c) | Inline::Underline(c)
+            | Inline::Superscript(c) | Inline::Subscript(c) | Inline::SmallCaps(c)
+            | Inline::Span { content: c, .. } | Inline::Quoted { content: c, .. }
+            | Inline::Link { text: c, .. } | Inline::Cite { content: c, .. } => {
+                out.push_str(&inlines_to_code_text(c))
+            }
+            Inline::Ref { label, .. } => out.push_str(label),
+            Inline::Image { .. } | Inline::Note(_) => {}
+        }
+    }
+    out
+}
+
+/// Serialize a text token back to LaTeX source. The lexer only puts
+/// `% $ & { }` into text tokens via escapes (`\\%` -> "%"), so they must be
+/// escaped again: re-lexing a bare `%` would start a comment, a bare `&`
+/// would split a table cell. A lone `#` also came from `\\#` (parameter
+/// text like `#1` is kept as is).
+fn escape_text_token(text: &str) -> String {
+    // (`_` is not escaped: macro bodies use it for math subscripts)
+    if text == "#" {
+        return format!("\\{}", text);
+    }
+    if !text.contains(['%', '$', '&', '{', '}']) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    for c in text.chars() {
+        if matches!(c, '%' | '$' | '&' | '{' | '}') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// `split_tex_value` for a value directly after a relation.
 pub(super) fn split_tex_value_pub(run: &str) -> (String, String) {
     split_tex_value(run, false)
@@ -5727,6 +6144,7 @@ fn is_inline_safe_block_command(cmd: &str) -> bool {
             | "DeclareDocumentCommand"
             | "newenvironment"
             | "renewenvironment"
+            | "provideenvironment"
             | "newtheorem"
             | "bibliography"
             | "addbibresource"

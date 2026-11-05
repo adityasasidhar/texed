@@ -92,11 +92,19 @@ pub struct Lexer {
     /// Tokens produced by a multi-token construct, emitted before lexing
     /// continues (stored in emission order).
     pending: Vec<Token>,
+    /// Environments defined as verbatim by the document (\lstnewenvironment,
+    /// \DefineVerbatimEnvironment, \newminted, ...).
+    verbatim_envs: std::collections::HashSet<String>,
 }
 
 impl Lexer {
     pub fn new(input: &str) -> Self {
+        let verbatim_envs = scan_verbatim_env_definitions(input)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         Self {
+            verbatim_envs,
             input: input.chars().collect(),
             position: 0,
             line: 1,
@@ -112,6 +120,19 @@ impl Lexer {
     /// resulting tokens serialize back to exactly the original math.
     pub fn with_math_mode(mut self, math_mode: bool) -> Self {
         self.math_mode = math_mode;
+        self
+    }
+
+    /// Additional environments whose bodies are verbatim (defined elsewhere
+    /// in the document, e.g. in a previously read file).
+    pub fn with_verbatim_envs<'a>(mut self, names: impl IntoIterator<Item = &'a String>) -> Self {
+        self.verbatim_envs.extend(names.into_iter().cloned());
+        self
+    }
+
+    /// Start in expl3 syntax (`_` and `:` are letters).
+    pub fn with_expl_syntax(mut self, expl: bool) -> Self {
+        self.expl_syntax = expl;
         self
     }
 
@@ -352,6 +373,44 @@ impl Lexer {
             return self.lex_verb();
         }
 
+        // Commands that define a macro from a verbatim-delimited argument:
+        // \verbtocs{\name}|text|, \verbdef\name|text|, \SaveVerb{name}|text|.
+        // The text may contain unbalanced braces, so it must be read raw.
+        if matches!(cmd_name.as_str(), "verbtocs" | "verbdef" | "SaveVerb" | "Verbdef") {
+            let start = self.position;
+            self.skip_inline_spaces_before_group();
+            let name = if !self.is_at_end() && self.current_char() == '{' {
+                self.read_simple_group().map(|n| n.trim().trim_start_matches('\\').to_string())
+            } else if !self.is_at_end() && self.current_char() == '\\' {
+                self.advance();
+                Some(self.lex_command_name())
+            } else {
+                None
+            };
+            if let Some(name) = name.filter(|n| !n.is_empty()) {
+                while !self.is_at_end() && matches!(self.current_char(), ' ' | '\t') {
+                    self.advance();
+                }
+                if !self.is_at_end() && self.current_char() != '\n' {
+                    let delim = self.current_char();
+                    self.advance();
+                    let mut content = String::new();
+                    while !self.is_at_end() && self.current_char() != delim && self.current_char() != '\n' {
+                        content.push(self.current_char());
+                        self.advance();
+                    }
+                    if !self.is_at_end() && self.current_char() == delim {
+                        self.advance();
+                    }
+                    self.pending.push(Token::Text(name));
+                    self.pending.push(Token::Verb(content));
+                    return Ok(Some(Token::Command(String::from("texed@verbdef"))));
+                }
+            }
+            self.rewind_to(start);
+            return Ok(Some(Token::Command(cmd_name)));
+        }
+
         // URL arguments are verbatim in LaTeX: % # ~ _ & are literal there
         if matches!(cmd_name.as_str(), "url" | "nolinkurl" | "path" | "burl" | "href" | "doi"
             | "email" | "uri")
@@ -526,7 +585,7 @@ impl Lexer {
 
         // Verbatim-like environments capture their body raw so that %, $, \ etc.
         // inside code are not interpreted as LaTeX.
-        if is_verbatim_environment(&env_name) {
+        if is_verbatim_environment(&env_name) || self.verbatim_envs.contains(&env_name) {
             let content = self.read_until_sequence(&format!("\\end{{{}}}", env_name));
             return Ok(Some(Token::VerbatimEnv {
                 name: env_name,
@@ -692,16 +751,18 @@ impl Lexer {
         if !self.is_at_end() && self.current_char() == '$' {
             // Display math $$...$$
             self.advance(); // consume second '$'
-            let content = self.read_until_double_dollar();
-            return Ok(Some(Token::DisplayMath(content)));
+            return Ok(Some(match self.read_until_double_dollar() {
+                Some(content) => Token::DisplayMath(content),
+                None => Token::Text(String::from("$$")),
+            }));
         }
 
         // Inline math $...$ (cannot span a paragraph break in TeX, so an
         // unterminated $ ends at the next blank line instead of eating the
         // rest of the document)
-        let (content, terminated) = self.read_math_until_checked(&['$'], true);
-        if !terminated && content.trim().is_empty() {
-            // A lone `$` with nothing after it is a literal dollar sign
+        let (content, end) = self.scan_math(&['$'], true, true);
+        if end == MathEnd::NotMath || (end != MathEnd::Closed && content.trim().is_empty()) {
+            // Not math: a literal dollar sign
             return Ok(Some(Token::Text(String::from("$"))));
         }
         Ok(Some(Token::InlineMath(content)))
@@ -712,8 +773,11 @@ impl Lexer {
         Ok(Some(Token::DisplayMath(content)))
     }
 
-    fn read_until_double_dollar(&mut self) -> String {
-        self.read_math_until(&['$', '$'], true)
+    fn read_until_double_dollar(&mut self) -> Option<String> {
+        match self.scan_math(&['$', '$'], true, true) {
+            (_, MathEnd::NotMath) => None,
+            (content, _) => Some(content),
+        }
     }
 
     /// Read math content up to (and consuming) the closing delimiter,
@@ -733,18 +797,36 @@ impl Lexer {
     /// the document; when `stop_at_par` is false the blank line is only used
     /// as the end if the delimiter never appears.
     fn read_math_until_checked(&mut self, close: &[char], stop_at_par: bool) -> (String, bool) {
+        let (content, end) = self.scan_math(close, stop_at_par, false);
+        (content, end == MathEnd::Closed)
+    }
+
+    /// Scan math content (see read_math_until_checked). With
+    /// `abort_on_structure`, a `$` that cannot be math — its "content"
+    /// would close a group it did not open, or contain `\par` — is reported
+    /// as `MathEnd::NotMath` and nothing is consumed: in TeX such a `$` is an
+    /// ordinary token (e.g. inside a macro body being defined).
+    fn scan_math(&mut self, close: &[char], stop_at_par: bool, abort_on_structure: bool) -> (String, MathEnd) {
+        let start = self.position;
         let mut content = String::new();
         let mut par_break_at: Option<(usize, usize)> = None; // (position, content len)
+        let mut depth: i64 = 0;
 
         while !self.is_at_end() {
             if self.matches_sequence(close) {
                 for _ in 0..close.len() {
                     self.advance();
                 }
-                return (content, true);
+                return (content, MathEnd::Closed);
             }
             let ch = self.current_char();
             if ch == '\\' {
+                if abort_on_structure && self.matches_sequence(&['\\', 'p', 'a', 'r'])
+                    && !self.input.get(self.position + 4).is_some_and(|c| c.is_alphabetic())
+                {
+                    self.rewind_to(start);
+                    return (String::new(), MathEnd::NotMath);
+                }
                 content.push(ch);
                 self.advance();
                 if !self.is_at_end() {
@@ -752,6 +834,17 @@ impl Lexer {
                     self.advance();
                 }
                 continue;
+            }
+            if abort_on_structure {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth < 0 {
+                        self.rewind_to(start);
+                        return (String::new(), MathEnd::NotMath);
+                    }
+                }
             }
             if ch == '%' {
                 while !self.is_at_end() && self.current_char() != '\n' {
@@ -766,7 +859,7 @@ impl Lexer {
                 }
                 if look < self.input.len() && self.input[look] == '\n' {
                     if stop_at_par {
-                        return (content, false);
+                        return (content, MathEnd::Unterminated);
                     }
                     par_break_at = Some((self.position, content.len()));
                 }
@@ -779,7 +872,7 @@ impl Lexer {
             self.rewind_to(pos);
             content.truncate(len);
         }
-        (content, false)
+        (content, MathEnd::Unterminated)
     }
 
     /// Move the cursor back to an earlier position, recomputing line info.
@@ -1057,6 +1150,116 @@ impl Lexer {
     fn is_at_end(&self) -> bool {
         self.position >= self.input.len()
     }
+}
+
+/// Find environments a text defines as verbatim, with their listing
+/// language if given: `\lstnewenvironment{code}[...]{\lstset{language=C}}{}`,
+/// `\DefineVerbatimEnvironment{code}{Verbatim}{...}`, `\newminted{py}{...}`
+/// (-> `pycode`), `\newminted[name]{lang}{...}`, `\newtcblisting{name}`,
+/// `\newenvironment{name}{\verbatim}{\endverbatim}`.
+pub fn scan_verbatim_env_definitions(text: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    if !(text.contains("lstnewenvironment")
+        || text.contains("VerbatimEnvironment")
+        || text.contains("newminted")
+        || text.contains("tcblisting")
+        || text.contains("TCBListing")
+        || text.contains("\\verbatim"))
+    {
+        return out;
+    }
+    let group_after = |s: &str| -> Option<(String, usize)> {
+        let trimmed = s.trim_start();
+        let offset = s.len() - trimmed.len();
+        let rest = trimmed.strip_prefix('{')?;
+        let end = rest.find('}')?;
+        Some((rest[..end].trim().to_string(), offset + end + 2))
+    };
+    let language_of = |s: &str| -> Option<String> {
+        let window = &s[..s.len().min(400)];
+        let pos = window.find("language")?;
+        let after = window[pos + 8..].trim_start().strip_prefix('=')?.trim_start();
+        let lang: String = after
+            .trim_start_matches('{')
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '+' | '#' | '-'))
+            .collect();
+        (!lang.is_empty()).then(|| lang.to_lowercase())
+    };
+    for (pattern, kind) in [
+        ("\\lstnewenvironment", 0),
+        ("\\DefineVerbatimEnvironment", 0),
+        ("\\RecustomVerbatimEnvironment", 0),
+        ("\\CustomVerbatimEnvironment", 0),
+        ("\\newtcblisting", 0),
+        ("\\NewTCBListing", 0),
+        ("\\DeclareTCBListing", 0),
+        ("\\newminted", 1),
+        ("\\newenvironment", 2),
+    ] {
+        let mut search = 0;
+        while let Some(pos) = text[search..].find(pattern) {
+            let start = search + pos + pattern.len();
+            search = start;
+            let rest = &text[start..];
+            match kind {
+                0 => {
+                    let rest = rest.trim_start_matches('*');
+                    let rest = if rest.trim_start().starts_with('[') {
+                        // \newtcblisting[options]{name}
+                        rest.find(']').map(|e| &rest[e + 1..]).unwrap_or(rest)
+                    } else {
+                        rest
+                    };
+                    if let Some((name, used)) = group_after(rest) {
+                        if !name.is_empty() && !name.contains('\\') {
+                            out.push((name, language_of(&rest[used..])));
+                        }
+                    }
+                }
+                1 => {
+                    // \newminted[envname]{lang}{opts} or \newminted{lang}{opts}
+                    let trimmed = rest.trim_start();
+                    let (explicit, rest) = if let Some(r) = trimmed.strip_prefix('[') {
+                        match r.find(']') {
+                            Some(e) => (Some(r[..e].trim().to_string()), &r[e + 1..]),
+                            None => (None, trimmed),
+                        }
+                    } else {
+                        (None, trimmed)
+                    };
+                    if rest.starts_with("file") {
+                        continue;
+                    }
+                    if let Some((lang, _)) = group_after(rest) {
+                        if !lang.is_empty() {
+                            let name = explicit.unwrap_or_else(|| format!("{}code", lang));
+                            out.push((name, Some(lang.to_lowercase())));
+                        }
+                    }
+                }
+                _ => {
+                    // \newenvironment{name}[..]{\verbatim}{\endverbatim}
+                    if let Some((name, used)) = group_after(rest) {
+                        let body = &rest[used..rest.len().min(used + 200)];
+                        let body_start = body.trim_start_matches(|c: char| c == '[' || c == ']' || c.is_ascii_digit() || c.is_whitespace());
+                        if body_start.starts_with("{\\verbatim") || body_start.starts_with("{\\Verbatim") || body_start.starts_with("{\\lstlisting") {
+                            out.push((name, None));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// How a math scan ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MathEnd {
+    Closed,
+    Unterminated,
+    NotMath,
 }
 
 /// Environments whose body must be captured raw at lex time so LaTeX special

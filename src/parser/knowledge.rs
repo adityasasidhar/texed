@@ -44,10 +44,9 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         | "GenericError" => sig(false, 2, false),
 
         // Counters, lengths, boxes
-        "newcounter" => sig(false, 1, true),
         "newlength" | "newsavebox" => sig(false, 1, false),
         "setlength" | "addtolength" | "settowidth" | "settoheight" | "settodepth" => sig(false, 2, false),
-        "newaliascnt" | "letcountercounter" | "counterwithin" | "counterwithout" => sig(false, 2, false),
+        "newaliascnt" | "letcountercounter" | "counterwithout" => sig(false, 2, false),
         "aliascntresetthe" => sig(false, 1, false),
 
         // Page/layout set-up
@@ -198,6 +197,10 @@ pub(super) fn tex_assignment(cmd: &str) -> Option<(usize, bool)> {
         | "mathcode" | "delcode" | "catcode" => (0, true),
         // \advance\x by 2, \multiply, \divide
         "advance" | "multiply" | "divide" => (1, true),
+        // LaTeX kernel scratch registers
+        "@tempcnta" | "@tempcntb" | "@tempdima" | "@tempdimb" | "@tempdimc" | "@tempskipa"
+        | "@tempskipb" | "count@" | "dimen@" | "dimen@i" | "dimen@ii" | "skip@" | "@tempcnt"
+        => (0, true),
         // Register allocation: one control sequence
         "newcount" | "newdimen" | "newskip" | "newmuskip" | "newtoks" | "newbox" | "newread"
         | "newwrite" | "newinsert" | "newlanguage" | "newfam" => (1, false),

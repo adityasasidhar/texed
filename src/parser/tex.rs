@@ -224,6 +224,24 @@ impl Parser {
                 self.push_front(yes);
                 return Ok(Some(None));
             }
+            "texed@verbdef" => {
+                // name + verbatim text, from \verbtocs and friends
+                if let Token::Text(name) = self.current_token().clone() {
+                    self.advance();
+                    if let Token::Verb(text) = self.current_token().clone() {
+                        self.advance();
+                        self.state.macros.insert(
+                            name,
+                            crate::state::MacroDef {
+                                body: text,
+                                literal: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                return Ok(Some(None));
+            }
             "texed@popdir" => {
                 if let Some((_, path)) = self.input_stack.pop() {
                     self.state.unmark_file_included(&path);
@@ -449,7 +467,7 @@ impl Parser {
     }
 
     /// One branch argument: a braced group's tokens, or a single token.
-    fn take_branch_tokens(&mut self) -> Vec<Token> {
+    pub(super) fn take_branch_tokens(&mut self) -> Vec<Token> {
         self.skip_whitespace_and_comments();
         if matches!(self.current_token(), Token::LeftBrace) {
             self.collect_braced_tokens()
@@ -716,7 +734,7 @@ impl Parser {
 
     /// Numeric value of `\value{x}`, `\c@x` or a counter-like command.
     fn command_numeric_value(&mut self, name: &str) -> Option<i64> {
-        if name == "value" {
+        if matches!(name, "value" | "arabic") {
             self.skip_whitespace_and_comments();
             let counter = self.parse_braced_text().ok()?;
             return Some(self.counter_value(counter.trim()) as i64);
@@ -1016,7 +1034,7 @@ impl Parser {
             counter,
             "chapter" | "section" | "subsection" | "subsubsection" | "paragraph"
                 | "subparagraph" | "equation" | "figure" | "table" | "footnote" | "page"
-        );
+        ) || self.state.user_counters.contains_key(counter);
         if !known {
             return None;
         }
@@ -1098,14 +1116,41 @@ impl Parser {
 /// re-lexed that way.
 pub(super) fn lex_fragment(fragment: &str) -> Vec<Token> {
     let at_letter = uses_at_names(fragment);
+    let expl = uses_expl_names(fragment);
     let mut tokens = Lexer::new(fragment)
         .with_at_letter(at_letter)
+        .with_expl_syntax(expl)
         .tokenize()
         .unwrap_or_default();
     if matches!(tokens.last(), Some(Token::Eof)) {
         tokens.pop();
     }
     tokens
+}
+
+/// Does the text use expl3 function names (`\clist_set:Nx`)? Such text
+/// was written under `\ExplSyntaxOn`.
+pub(super) fn uses_expl_names(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let start = i + 1;
+            let mut j = start;
+            let mut underscore = false;
+            while j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+                underscore |= bytes[j] == b'_';
+                j += 1;
+            }
+            if underscore && j < bytes.len() && bytes[j] == b':' && j > start + 1 {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Does the text refer to `@`-named control sequences (`\@foo`,
@@ -1280,6 +1325,11 @@ impl Parser {
             }
             let token = self.current_token().clone();
             match &token {
+                Token::Command(name) if self.state.macros.get(name).is_some_and(|d| d.literal) => {
+                    let body = self.state.macros[name].body.clone();
+                    self.advance();
+                    push_math_piece(&mut out, &body);
+                }
                 Token::Command(name) if self.state.macros.contains_key(name) => {
                     self.advance();
                     let expandable = self
