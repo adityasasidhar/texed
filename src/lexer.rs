@@ -1011,7 +1011,11 @@ impl Lexer {
                     look += 1;
                 }
                 if look < self.input.len() && self.input[look] == '\n' {
-                    if stop_at_par {
+                    // a blank line inside an environment of the math
+                    // (`$$\begin{matrix} rows, blank line, rows \end{matrix}$$`)
+                    // does not end it; if the math never closes, it ends at
+                    // this first blank line after all (see below)
+                    if stop_at_par && !has_open_environment(&content) {
                         return (content, MathEnd::Unterminated);
                     }
                     par_break_at = Some((self.position, content.len()));
@@ -1307,6 +1311,11 @@ impl Lexer {
     fn is_at_end(&self) -> bool {
         self.position >= self.input.len()
     }
+}
+
+/// Whether math text has a `\begin{..}` still waiting for its `\end{..}`.
+fn has_open_environment(math: &str) -> bool {
+    math.matches("\\begin{").count() > math.matches("\\end{").count()
 }
 
 /// The classic TeX/LaTeX name of an expl3 primitive or kernel helper.

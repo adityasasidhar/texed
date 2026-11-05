@@ -268,6 +268,9 @@ fn use_form(cmd: &str) -> Option<UseForm> {
         "Acrfull" | "Acf" => (UseKind::Full, false, true, false, true),
         "acrfullpl" | "acfp" => (UseKind::Full, true, false, false, true),
         "Acrfullpl" | "Acfp" => (UseKind::Full, true, true, false, true),
+        // the "first use" text: an acronym's full form, else the name
+        "glsfirst" | "glsentryfirst" => (UseKind::Full, false, false, false, false),
+        "Glsfirst" | "Glsentryfirst" => (UseKind::Full, false, true, false, false),
         "glsdesc" | "glsentrydesc" => (UseKind::Description, false, false, false, false),
         "Glsdesc" | "Glsentrydesc" => (UseKind::Description, false, true, false, false),
         "glssymbol" | "glsentrysymbol" => (UseKind::Symbol, false, false, false, false),

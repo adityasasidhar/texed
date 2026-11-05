@@ -175,14 +175,20 @@ impl Parser {
                 }
                 Token::ParBreak | Token::Newline => {
                     self.advance();
-                    if algorithm2e {
-                        // algorithm2e lines end with \; but blank lines also separate
-                        if matches!(token, Token::ParBreak) {
-                            algo.flush();
-                        }
+                    // algorithm2e lines end with \; but blank lines also separate
+                    if algorithm2e && matches!(token, Token::ParBreak) {
+                        algo.flush();
                     } else {
                         algo.current.push(Inline::Space);
                     }
+                }
+                // algorithm2e: `\\` (with an optional skip) also ends a line
+                Token::Backslash if algorithm2e => {
+                    self.advance();
+                    if matches!(self.current_token(), Token::LeftBracket) {
+                        let _ = self.collect_bracketed_tokens();
+                    }
+                    algo.flush();
                 }
                 Token::Command(cmd) => {
                     let cmd = cmd.clone();
@@ -595,9 +601,10 @@ impl Parser {
     }
 }
 
-/// Number of braced groups directly following the current command.
+/// Number of braced groups directly following the current command (the
+/// current token, at offset 0).
 fn following_group_count(p: &Parser) -> usize {
-    let mut look = 0;
+    let mut look = 1;
     let mut groups = 0;
     loop {
         while matches!(p.peek_at(look), Some(Token::Whitespace(_)) | Some(Token::Newline)) {

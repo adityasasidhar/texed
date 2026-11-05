@@ -2366,8 +2366,9 @@ impl Parser {
     fn parse_misc_package_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         match cmd {
             // \NewCommandCopy{\new}{\old} = \let\new\old (LaTeX 2023)
+            // (letltxmacro's \LetLtxMacro is the same)
             "NewCommandCopy" | "RenewCommandCopy" | "DeclareCommandCopy" | "NewEnvironmentCopy"
-            | "RenewEnvironmentCopy" | "DeclareEnvironmentCopy" => {
+            | "RenewEnvironmentCopy" | "DeclareEnvironmentCopy" | "LetLtxMacro" | "GlobalLetLtxMacro" => {
                 let mut names = Vec::new();
                 for _ in 0..2 {
                     self.skip_whitespace_and_comments();
@@ -2574,6 +2575,18 @@ impl Parser {
                 Ok(Some(symbol.map(|c| Inline::Text(c.to_string()))))
             }
             // placeholder text packages
+            // titling: the stored title/author
+            "thetitle" | "theauthor" => {
+                let key = &cmd[3..];
+                Ok(Some(self.metadata.get(key).cloned().map(Inline::Text)))
+            }
+            // elsarticle keyword separator
+            "sep" => Ok(Some(Some(Inline::Text(String::from(", "))))),
+            // beamer navigation buttons, ACM's \affaddr: their text
+            "beamergotobutton" | "beamerreturnbutton" | "beamerskipbutton" | "affaddr" => {
+                let content = self.parse_braced_inlines()?;
+                Ok(Some(Some(span_or_single(content))))
+            }
             "lipsum" | "lipsum*" | "kant" | "kant*" | "blindtext" | "Blindtext" | "blinddocument" => {
                 self.consume_text_star();
                 while matches!(self.current_token(), Token::LeftBracket) {

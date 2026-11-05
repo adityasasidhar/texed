@@ -72,7 +72,8 @@ pub(super) fn setup_command(cmd: &str) -> Option<Signature> {
         | "GenericError" => sig(false, 2, false),
 
         // Counters, lengths, boxes
-        "newlength" | "newsavebox" | "GetFileInfo" => sig(false, 1, false),
+        "newlength" | "newsavebox" | "GetFileInfo" | "fvset" | "tnoteref" => sig(false, 1, false),
+        "addappheadtotoc" => sig(false, 0, false),
         "setlength" | "addtolength" | "settowidth" | "settoheight" | "settodepth" => sig(false, 2, false),
         "newaliascnt" | "letcountercounter" | "counterwithout" => sig(false, 2, false),
         "aliascntresetthe" => sig(false, 1, false),

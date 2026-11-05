@@ -690,3 +690,16 @@ fn l3doc_function_blocks_and_expl_token_lists() {
     has("\\ExplSyntaxOn\\cs_new:Npn \\__x:n #1 {[#1]}\\NewDocumentCommand\\demo{m}{\\use:c{__x:n}{#1}}\\ExplSyntaxOff\n\\demo{hi}", "[hi]");
     lacks("\\ExplSyntaxOn\\cs_new:Npn \\__x:n #1 {[#1]}\\NewDocumentCommand\\demo{m}{\\use:c{__x:n}{#1}}\\ExplSyntaxOff\n\\demo{hi}", ":c");
 }
+
+#[test]
+fn algorithm2e_nested_bodies() {
+    let alg = "\\begin{algorithm}\n\\caption{C}\n\\While{a}{\n  first line\\\\[0.9ex]\n  second\n  line\\;\n  \\BlankLine\n  \\While{b}{\n    y\\;\n  }\n}\n\\end{algorithm}";
+    has(alg, "**while** a **do**  \n\u{a0}\u{a0}\u{a0}\u{a0}first line  \n\u{a0}\u{a0}\u{a0}\u{a0}second line  \n\u{a0}\u{a0}\u{a0}\u{a0}**while** b **do**");
+    has(alg, "**end**  \n**end**");
+}
+
+#[test]
+fn small_package_commands() {
+    let doc = "\\documentclass{article}\\title{My T}\\author{Ann}\n\\begin{document}\\LetLtxMacro{\\oldemph}{\\emph}\\oldemph{x} -- \\thetitle\\ by \\theauthor. \\beamergotobutton{Go} \\fvset{frame=single}\\addappheadtotoc\n\\end{document}";
+    has(doc, "*x* – My T by Ann. Go");
+}
