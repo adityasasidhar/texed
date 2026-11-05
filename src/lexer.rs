@@ -1333,6 +1333,19 @@ fn expl_primitive(name: &str) -> Option<&'static str> {
 /// `\newenvironment{name}{\verbatim}{\endverbatim}`.
 pub fn scan_verbatim_env_definitions(text: &str) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
+    let has_definer = |text: &str| {
+        text.contains("lstnewenvironment")
+            || text.contains("VerbatimEnvironment")
+            || text.contains("newminted")
+            || text.contains("tcblisting")
+            || text.contains("TCBListing")
+            || text.contains("\\verbatim")
+            || text.contains("verbatim_start")
+    };
+    // (cheap test first: this runs for every lexed fragment)
+    if !has_definer(text) {
+        return out;
+    }
     // Definitions inside comments or inside verbatim bodies (a tutorial's
     // example code) do not exist for TeX: scan only live source
     let stripped = strip_comments_and_verbatim(text);
@@ -1501,29 +1514,34 @@ pub fn scan_verb_command_definitions(text: &str) -> Vec<String> {
 /// scan for definitions sees only live LaTeX source.
 fn strip_comments_and_verbatim(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    'outer: while !rest.is_empty() {
-        // next comment or verbatim begin
-        let comment = find_comment_start(rest);
-        let verbatim = find_verbatim_begin(rest);
-        match (comment, verbatim) {
-            (Some(c), ref v) if v.as_ref().is_none_or(|(b, _, _)| c < *b) => {
-                out.push_str(&rest[..c]);
-                match rest[c..].find('\n') {
-                    Some(nl) => rest = &rest[c + nl..],
-                    None => break 'outer,
+    let mut pos = 0;
+    // the next verbatim begin, searched again only once passed (linear)
+    let mut verbatim = find_verbatim_begin(text).map(|(b, s, n)| (b, s, n));
+    while pos < text.len() {
+        if let Some((begin, _, _)) = &verbatim {
+            if *begin < pos {
+                verbatim = find_verbatim_begin(&text[pos..]).map(|(b, s, n)| (b + pos, s + pos, n));
+            }
+        }
+        let comment = find_comment_start(&text[pos..]).map(|c| c + pos);
+        match (comment, &verbatim) {
+            (Some(c), v) if v.as_ref().is_none_or(|(b, _, _)| c < *b) => {
+                out.push_str(&text[pos..c]);
+                match text[c..].find('\n') {
+                    Some(nl) => pos = c + nl,
+                    None => break,
                 }
             }
             (_, Some((begin, body_start, name))) => {
-                out.push_str(&rest[..begin]);
+                out.push_str(&text[pos..*begin]);
                 let end_marker = format!("\\end{{{}}}", name);
-                match rest[body_start..].find(&end_marker) {
-                    Some(e) => rest = &rest[body_start + e + end_marker.len()..],
-                    None => break 'outer,
+                match text[*body_start..].find(&end_marker) {
+                    Some(e) => pos = body_start + e + end_marker.len(),
+                    None => break,
                 }
             }
             _ => {
-                out.push_str(rest);
+                out.push_str(&text[pos..]);
                 break;
             }
         }

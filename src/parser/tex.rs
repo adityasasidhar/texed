@@ -1318,8 +1318,16 @@ impl Parser {
             .iter()
             .filter(|(active, _)| active == name)
             .count();
-        let count = self.expansion_counts.entry(name.to_string()).or_insert(0);
-        *count += 1;
+        let count = match self.expansion_counts.get_mut(name) {
+            Some(count) => {
+                *count += 1;
+                *count
+            }
+            None => {
+                self.expansion_counts.insert(name.to_string(), 1);
+                1
+            }
+        };
         let per_macro_limit = PER_MACRO_BASE_BUDGET
             .saturating_add(self.source_token_count.saturating_mul(2))
             .saturating_add(
@@ -1332,7 +1340,7 @@ impl Parser {
 
         let refused = nesting >= MAX_SAME_MACRO_NESTING
             || self.active_expansions.len() >= MAX_EXPANSION_NESTING
-            || *count > per_macro_limit
+            || count > per_macro_limit
             || self.macro_expansions >= self.macro_budget
             || self.tokens.len() > super::MAX_PENDING_TOKENS;
         if refused {

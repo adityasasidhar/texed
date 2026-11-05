@@ -4818,9 +4818,10 @@ impl Parser {
             inlines = apply_decl_style(style, inlines);
         }
 
-        // Return as a span or flatten
+        // Return as a span or flatten (moved, not cloned: a deep clone per
+        // nesting level is quadratic)
         if inlines.len() == 1 {
-            Ok(Some(inlines[0].clone()))
+            Ok(inlines.pop())
         } else if inlines.is_empty() {
             Ok(None)
         } else {
