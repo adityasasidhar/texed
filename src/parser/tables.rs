@@ -340,14 +340,14 @@ impl Parser {
                     }
                     match cmd.as_str() {
                         "endfirsthead" => {
-                            head_rows = Some(rows.drain(..).collect());
+                            head_rows = Some(std::mem::take(&mut rows));
                         }
                         "endhead" => {
                             if head_rows.is_some() {
                                 // continuation head: repeated on later pages
                                 rows.truncate(segment_start.min(rows.len()));
                             } else {
-                                head_rows = Some(rows.drain(..).collect());
+                                head_rows = Some(std::mem::take(&mut rows));
                             }
                         }
                         _ => {

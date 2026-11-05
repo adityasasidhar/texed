@@ -250,7 +250,7 @@ impl Parser {
                 caption.extend(sub_caption);
             }
             let label = sub.label.take();
-            blocks.extend(sub.blocks.drain(..));
+            blocks.append(&mut sub.blocks);
             let mut images = sub.images.into_iter();
             match images.next() {
                 Some(first) => {
@@ -271,7 +271,7 @@ impl Parser {
             }
         }
 
-        blocks.extend(part.blocks.drain(..));
+        blocks.append(&mut part.blocks);
         let had_subs = blocks.iter().any(|b| matches!(b, Block::Figure { .. }));
         let mut caption = part.caption.take();
         let mut label = part.label.take();

@@ -1465,7 +1465,7 @@ impl Parser {
                     }
                 }
             } else {
-                whole_labels.extend(row_info.labels.drain(..));
+                whole_labels.append(&mut row_info.labels);
                 whole_nonumber |= row_info.nonumber;
                 if row_info.tag.is_some() {
                     whole_tag = row_info.tag.take();
@@ -5015,7 +5015,7 @@ fn ref_type_name(
         LabelType::Figure => ("figure", false),
         LabelType::Table => ("table", false),
         LabelType::Equation if style == RefStyle::Cleveref => {
-            (if capital { "eq." } else { "eq." }, true)
+            ("eq.", true)
         }
         LabelType::Equation => ("equation", false),
         LabelType::Theorem => ("theorem", false),
@@ -5049,8 +5049,8 @@ fn ref_type_name(
 }
 
 fn pluralize(word: &str) -> String {
-    if word.ends_with("ix") {
-        format!("{}ices", &word[..word.len() - 2])
+    if let Some(stem) = word.strip_suffix("ix") {
+        format!("{}ices", stem)
     } else if word.ends_with('s') || word.ends_with('x') {
         format!("{}es", word)
     } else if word.ends_with('y') && !word.ends_with("ey") {

@@ -1068,7 +1068,7 @@ fn num(text: &str) -> Option<i64> {
 fn braced_arg<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     let rest = text.strip_prefix(prefix)?.trim_start();
     let (arg, _) = split_braced(rest);
-    Some(arg).filter(|_| rest.starts_with('{'))
+    rest.starts_with('{').then_some(arg)
 }
 
 /// Split a leading `{...}` group: returns (content, remainder).

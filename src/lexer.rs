@@ -125,10 +125,7 @@ impl Lexer {
         let mut tokens = Vec::new();
 
         while !self.is_at_end() {
-            match self.next_token()? {
-                Some(token) => tokens.push(token),
-                None => {}
-            }
+            if let Some(token) = self.next_token()? { tokens.push(token) }
             tokens.append(&mut self.pending);
         }
 

@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn test_include_system_creation() {
         let system = IncludeSystem::new();
-        assert!(system.search_paths.len() >= 1);
+        assert!(!system.search_paths.is_empty());
         assert_eq!(system.max_depth, 10);
     }
 

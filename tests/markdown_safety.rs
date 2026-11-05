@@ -292,6 +292,6 @@ fn captions_and_link_text() {
         11,
         1,
         |c| format!("\\href{{https://example.com/a(b) c}}{{{}}}", c),
-        |c, r| same_text(c, r),
+        same_text,
     );
 }

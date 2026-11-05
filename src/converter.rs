@@ -899,8 +899,7 @@ impl Default for MarkdownConverter {
 /// change Markdown semantics.
 fn escape_markdown_text(text: &str, in_table: bool) -> String {
     let mut out = String::with_capacity(text.len() + 8);
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
+    for ch in text.chars() {
         match ch {
             '\\' | '*' | '_' | '`' | '$' | '<' | '~' => {
                 out.push('\\');
