@@ -83,6 +83,14 @@ impl Parser {
     pub(super) fn parse_tex_command(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         // Aliases from \let\new\old: re-lex the target so it receives its
         // full meaning (environment tokens, \item, ...)
+        if self.state.aliases.contains_key(cmd) {
+            return self.expand_alias(cmd);
+        }
+        self.parse_tex_primitive(cmd)
+    }
+
+    /// Resolve a `\let` alias.
+    fn expand_alias(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         if let Some(target) = self.state.aliases.get(cmd).cloned() {
             if self.consume_expansion_budget(cmd) {
                 let tokens = lex_fragment(&format!("\\{}", target));
@@ -101,7 +109,12 @@ impl Parser {
             }
             return Ok(Some(None));
         }
+        Ok(None)
+    }
 
+    /// TeX-level commands (conditionals, kernel helpers, \csname, ...),
+    /// without alias resolution.
+    pub(super) fn parse_tex_primitive(&mut self, cmd: &str) -> Result<Option<Option<Inline>>> {
         match cmd {
             "global" | "long" | "outer" | "protected" | "immediate" | "expandafter"
             | "noexpand" | "unexpanded" | "ignorespaces" | "makeatletter" | "makeatother"
@@ -177,6 +190,46 @@ impl Parser {
                 return Ok(Some(None));
             }
             "@empty" | "@nil" | "@nnil" | "@sptoken" => return Ok(Some(None)),
+            // xparse value tests (arguments arrive as -NoValue- / \BooleanTrue)
+            "IfNoValueTF" | "IfNoValueT" | "IfNoValueF" | "IfValueTF" | "IfValueT"
+            | "IfValueF" | "IfBooleanTF" | "IfBooleanT" | "IfBooleanF" => {
+                self.skip_whitespace_and_comments();
+                let arg = self.parse_braced_text()?;
+                let arg = arg.trim();
+                let condition = if cmd.starts_with("IfBoolean") {
+                    arg == "\\BooleanTrue"
+                } else if cmd.starts_with("IfNoValue") {
+                    arg == "-NoValue-"
+                } else {
+                    arg != "-NoValue-"
+                };
+                let (yes, no) = if cmd.ends_with("TF") {
+                    (self.take_branch_tokens(), self.take_branch_tokens())
+                } else if cmd.ends_with('T') {
+                    (self.take_branch_tokens(), Vec::new())
+                } else {
+                    (Vec::new(), self.take_branch_tokens())
+                };
+                self.push_front(if condition { yes } else { no });
+                return Ok(Some(None));
+            }
+            "BooleanTrue" | "BooleanFalse" | "NoValue" => return Ok(Some(None)),
+            "@ifpackagelater" | "@ifclasslater" => {
+                self.skip_whitespace_and_comments();
+                let _ = self.parse_braced_text()?;
+                self.skip_whitespace_and_comments();
+                let _ = self.parse_braced_text()?;
+                let yes = self.take_branch_tokens();
+                let _no = self.take_branch_tokens();
+                self.push_front(yes);
+                return Ok(Some(None));
+            }
+            "texed@popdir" => {
+                if let Some((_, path)) = self.input_stack.pop() {
+                    self.state.unmark_file_included(&path);
+                }
+                return Ok(Some(None));
+            }
             "texed@endpackage" => {
                 if let Some(was_preamble) = self.package_preamble_restore.pop() {
                     self.in_preamble = was_preamble;
@@ -196,6 +249,18 @@ impl Parser {
                 for _ in 0..3 {
                     self.skip_whitespace_and_comments();
                     self.advance();
+                }
+                return Ok(Some(None));
+            }
+            // etoolbox \csuse{name} = \name
+            "csuse" => {
+                self.skip_whitespace_and_comments();
+                let raw = self.parse_braced_text()?;
+                // the name may itself be a macro: \csuse{\ol@sectioncs}
+                let name = self.expand_parameterless_macros(raw.trim());
+                let name = name.trim().trim_start_matches('\\').to_string();
+                if !name.is_empty() {
+                    self.push_front(vec![Token::Command(name)]);
                 }
                 return Ok(Some(None));
             }
@@ -595,6 +660,11 @@ impl Parser {
         let mut rhs = String::new();
         for _ in 0..12 {
             self.skip_whitespace_and_comments();
+            // Math mode splits text per character: merge the run first
+            if matches!(self.current_token(), Token::Text(_)) {
+                let run = self.take_text_run();
+                self.push_front(vec![Token::Text(run)]);
+            }
             match self.current_token().clone() {
                 Token::Text(t) if relation.is_none() => {
                     if let Some(pos) = t.find(['<', '=', '>']) {
@@ -612,8 +682,14 @@ impl Parser {
                     }
                 }
                 Token::Text(t) => {
-                    rhs.push_str(&t);
+                    // the right-hand number (and unit); anything after it
+                    // belongs to the conditional's body
                     self.advance();
+                    let (value, rest) = crate::parser::split_tex_value_pub(&t);
+                    rhs.push_str(&value);
+                    if !rest.is_empty() {
+                        self.push_front(vec![Token::Text(rest)]);
+                    }
                     break;
                 }
                 Token::Command(name) => {
@@ -1021,11 +1097,7 @@ impl Parser {
 /// sequences was necessarily defined with `@` as a letter, so it is
 /// re-lexed that way.
 pub(super) fn lex_fragment(fragment: &str) -> Vec<Token> {
-    let at_letter = fragment
-        .as_bytes()
-        .windows(3)
-        .any(|w| w[0] == b'\\' && w[1] == b'@' && w[2].is_ascii_alphabetic())
-        || fragment.contains("@@");
+    let at_letter = uses_at_names(fragment);
     let mut tokens = Lexer::new(fragment)
         .with_at_letter(at_letter)
         .tokenize()
@@ -1034,6 +1106,32 @@ pub(super) fn lex_fragment(fragment: &str) -> Vec<Token> {
         tokens.pop();
     }
     tokens
+}
+
+/// Does the text refer to `@`-named control sequences (`\@foo`,
+/// `\ol@sectioncs`)? Such text was written with `@` as a letter.
+pub(super) fn uses_at_names(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            let start = i + 1;
+            let mut j = start;
+            let mut has_at = false;
+            while j < bytes.len() && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'@') {
+                has_at |= bytes[j] == b'@';
+                j += 1;
+            }
+            // `\@` alone (spacing) does not count; `\@foo` and `\a@b` do
+            if has_at && j - start >= 2 {
+                return true;
+            }
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// Parse a TeX number or dimension (`12`, `-3`, `2.5pt`, `1em`) to a value
@@ -1103,7 +1201,11 @@ fn is_math_control_helper(name: &str) -> bool {
             | "else" | "fi" | "or" | "expandafter" | "noexpand" | "protect" | "relax"
             | "xspace" | "ensuremath" | "@empty" | "mathchoice" | "ifthenelse" | "iftoggle"
             | "ifbool" | "ifdef" | "ifundef" | "unskip" | "ignorespaces" | "nobreak"
-            | "leavevmode" | "@nil" | "begingroup" | "endgroup"
+            | "leavevmode" | "@nil" | "begingroup" | "endgroup" | "IfNoValueTF" | "IfNoValueT"
+            | "IfNoValueF" | "IfValueTF" | "IfValueT" | "IfValueF" | "IfBooleanTF"
+            | "IfBooleanT" | "IfBooleanF" | "BooleanTrue" | "BooleanFalse" | "csuse"
+            | "@ifpackagelater" | "@ifclasslater" | "ifdefempty" | "ifstrequal" | "ifstrempty"
+            | "ifblank" | "notbool" | "nottoggle" | "IfFileExists"
     )
 }
 
@@ -1147,7 +1249,7 @@ impl Parser {
             return math.to_string();
         }
 
-        let at_letter = math.contains("\\@");
+        let at_letter = uses_at_names(math);
         let mut tokens = Lexer::new(math)
             .with_math_mode(true)
             .with_at_letter(at_letter)
@@ -1164,8 +1266,18 @@ impl Parser {
 
         let mut out = String::with_capacity(math.len());
         let mut guard = 0usize;
-        while !self.is_at_end() && guard < 2_000_000 && out.len() < 1_000_000 {
+        // Limits proportional to the formula: notation macros expand a
+        // formula a few times over; anything far beyond is runaway
+        let step_limit = 20_000 + 400 * math.len();
+        let output_limit = 16_384 + 64 * math.len();
+        let budget_snapshot = (self.macro_expansions, self.expanded_bytes, self.expansion_counts.clone());
+        let mut aborted = false;
+        while !self.is_at_end() {
             guard += 1;
+            if guard > step_limit || out.len() > output_limit || self.tokens.len() > output_limit {
+                aborted = true;
+                break;
+            }
             let token = self.current_token().clone();
             match &token {
                 Token::Command(name) if self.state.macros.contains_key(name) => {
@@ -1187,7 +1299,7 @@ impl Parser {
                         .map(|d| crate::state::substitute_params(&d.body, &args))
                         .unwrap_or_default();
                     if self.consume_expansion_bytes(name, body.len()) && self.consume_expansion_budget(name) {
-                        let at = body.contains("\\@");
+                        let at = uses_at_names(&body);
                         let mut expansion = Lexer::new(&body)
                             .with_math_mode(true)
                             .with_at_letter(at)
@@ -1205,6 +1317,40 @@ impl Parser {
                     self.advance();
                     let target = self.state.aliases[name].clone();
                     push_math_piece(&mut out, &format!("\\{}", target));
+                }
+                // TeX box/register programming: interpreted, not emitted
+                Token::Command(name) if name == "setbox" => {
+                    self.advance();
+                    self.consume_setbox();
+                }
+                Token::Command(name)
+                    if self.tex_registers.contains(name)
+                        || crate::parser::knowledge::tex_assignment(name).is_some_and(|(_, v)| v)
+                            && !matches!(name.as_str(), "kern" | "mkern" | "mskip" | "hskip" | "raise" | "lower" | "moveleft" | "moveright") =>
+                {
+                    let name = name.clone();
+                    self.advance();
+                    let operands = crate::parser::knowledge::tex_assignment(&name).map(|(o, _)| o).unwrap_or(0);
+                    self.consume_tex_assignment(operands, true);
+                }
+                Token::Command(name) if matches!(name.as_str(), "ht" | "wd" | "dp") => {
+                    self.advance();
+                    // the box register
+                    if matches!(self.current_token(), Token::Command(_) | Token::Text(_)) {
+                        self.advance();
+                    }
+                }
+                Token::Command(name) if matches!(name.as_str(), "raise" | "lower" | "moveleft" | "moveright") => {
+                    // \raise<dimen>\hbox{...}: keep the box content only
+                    self.advance();
+                    let mut k = 0;
+                    while k < 12 && !matches!(self.current_token(), Token::Command(c) if matches!(c.as_str(), "hbox" | "vbox" | "mbox" | "box")) {
+                        if self.is_at_end() {
+                            break;
+                        }
+                        self.advance();
+                        k += 1;
+                    }
                 }
                 Token::Command(name) if name == "mathchoice" => {
                     self.advance();
@@ -1236,11 +1382,14 @@ impl Parser {
                 }
             }
         }
-        // Anything left after hitting a limit is kept verbatim
-        while !self.is_at_end() {
-            let piece = self.token_to_string(&self.current_token().clone());
-            self.advance();
-            push_math_piece(&mut out, &piece);
+        if aborted {
+            // Runaway expansion: keep the formula as written, and give the
+            // budget back so the rest of the document is unaffected
+            self.tokens.clear();
+            self.macro_expansions = budget_snapshot.0;
+            self.expanded_bytes = budget_snapshot.1;
+            self.expansion_counts = budget_snapshot.2;
+            out = math.to_string();
         }
 
         self.tokens = saved_tokens;

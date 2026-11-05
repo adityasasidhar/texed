@@ -122,6 +122,24 @@ pub struct MacroDef {
     /// Literal text that must directly follow the macro name before the
     /// first parameter (`\def\foo(#1){...}` -> "(").
     pub prefix: String,
+    /// xparse argument specification (`\NewDocumentCommand{\x}{s o m}`);
+    /// when set it replaces `num_params`/`optional_param` for parsing.
+    pub xparse: Option<Vec<XArg>>,
+}
+
+/// One xparse argument specifier.
+#[derive(Debug, Clone, PartialEq)]
+pub enum XArg {
+    /// `m`: mandatory (braced group or single token)
+    Mandatory,
+    /// `o` / `O{default}`: optional `[...]`; None default means -NoValue-
+    Optional(Option<String>),
+    /// `s`: star; `t<c>`: test for token c
+    Token(char),
+    /// `d<>` / `D<>{default}` / `r<>`: delimited
+    Delimited(char, char, Option<String>),
+    /// `v`: verbatim group
+    Verbatim,
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +511,14 @@ impl ParserState {
 
     pub fn mark_file_included(&mut self, path: String) {
         self.included_files.push(path);
+    }
+
+    /// The file is no longer being read (its content was fully consumed):
+    /// it may be included again, as long as it is not open recursively.
+    pub fn unmark_file_included(&mut self, path: &str) {
+        if let Some(pos) = self.included_files.iter().rposition(|p| p == path) {
+            self.included_files.remove(pos);
+        }
     }
 }
 

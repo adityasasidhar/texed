@@ -681,7 +681,13 @@ impl MarkdownConverter {
     fn convert_inline(&mut self, inline: &Inline) -> Result<()> {
         match inline {
             Inline::Text(text) => {
-                let escaped = escape_markdown_text(text, self.in_table);
+                // xparse's absent-argument marker is never reader-visible
+                let text = if text.contains("-NoValue-") {
+                    std::borrow::Cow::Owned(text.replace("-NoValue-", ""))
+                } else {
+                    std::borrow::Cow::Borrowed(text.as_str())
+                };
+                let escaped = escape_markdown_text(&text, self.in_table);
                 self.output.push_str(&escaped);
             }
             Inline::Space => {

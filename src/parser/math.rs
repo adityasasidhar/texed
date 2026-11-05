@@ -6,7 +6,8 @@
 
 /// Remove text-mode helpers that math renderers reject.
 pub(super) fn clean_math(math: &str) -> String {
-    if !math.contains('\\') {
+    let math = &math.replace("-NoValue-", "");
+    if !math.contains('\\') && !math.contains('$') {
         return math.to_string();
     }
     let mut out = String::with_capacity(math.len());
@@ -23,11 +24,36 @@ pub(super) fn clean_math(math: &str) -> String {
                 // \xspace, \protect, \relax, \nobreak have no meaning in math
                 "xspace" | "protect" | "relax" | "nobreak" | "allowbreak" | "ignorespaces" => {
                     i = end;
-                    // swallow one following space only if it would join words
                     continue;
                 }
                 // \ensuremath{x} inside math is just {x}
                 "ensuremath" => {
+                    i = end;
+                    continue;
+                }
+                // Text boxes holding nested $...$: math stays math, text
+                // becomes \text (a nested `$` would end the Markdown span)
+                "hbox" | "mbox" | "text" | "textrm" | "textnormal" | "textup" | "textit"
+                | "textbf" | "textsf" | "texttt" | "fbox" | "makebox" => {
+                    let mut j = end;
+                    while j < chars.len() && chars[j] == ' ' {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == '{' {
+                        if let Some(close) = matching_brace(&chars, j) {
+                            let inner: String = chars[j + 1..close].iter().collect();
+                            if inner.contains('$') {
+                                let wrapper = match name.as_str() {
+                                    "hbox" | "mbox" | "fbox" | "makebox" | "textnormal" | "textup" => "text",
+                                    other => other,
+                                };
+                                out.push_str(&split_text_math(&inner, wrapper));
+                                i = close + 1;
+                                continue;
+                            }
+                        }
+                    }
+                    out.extend(&chars[i..end]);
                     i = end;
                     continue;
                 }
@@ -38,9 +64,79 @@ pub(super) fn clean_math(math: &str) -> String {
                 }
             }
         }
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            out.push(chars[i]);
+            out.push(chars[i + 1]);
+            i += 2;
+            continue;
+        }
+        // A bare `$` cannot appear inside Markdown math
+        if chars[i] == '$' {
+            out.push_str("\\$");
+            i += 1;
+            continue;
+        }
         out.push(chars[i]);
         i += 1;
     }
+    out
+}
+
+fn matching_brace(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut k = open;
+    while k < chars.len() {
+        match chars[k] {
+            '\\' => k += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(k);
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
+}
+
+/// `a $x$ b` (text with nested math) -> `\text{a }x\text{ b}`.
+fn split_text_math(inner: &str, wrapper: &str) -> String {
+    let mut out = String::new();
+    let mut in_math = false;
+    let mut current = String::new();
+    let mut chars = inner.chars().peekable();
+    let flush = |out: &mut String, current: &mut String, in_math: bool| {
+        if current.is_empty() {
+            return;
+        }
+        if in_math {
+            out.push('{');
+            out.push_str(&clean_math(current));
+            out.push('}');
+        } else {
+            out.push_str(&format!("\\{}{{{}}}", wrapper, current));
+        }
+        current.clear();
+    };
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            current.push(c);
+            if let Some(n) = chars.next() {
+                current.push(n);
+            }
+            continue;
+        }
+        if c == '$' {
+            flush(&mut out, &mut current, in_math);
+            in_math = !in_math;
+            continue;
+        }
+        current.push(c);
+    }
+    flush(&mut out, &mut current, in_math);
     out
 }
 
@@ -104,6 +200,13 @@ mod tests {
     fn let_alias_in_math() {
         let md = convert("\\let\\eps\\varepsilon $\\eps$");
         assert!(md.contains("$\\varepsilon$"), "got: {}", md);
+    }
+
+    #[test]
+    fn nested_dollars_never_reach_output() {
+        assert_eq!(super::clean_math("\\hbox{$\\ulcorner$}x"), "{\\ulcorner}x");
+        assert_eq!(super::clean_math("\\text{if $x$ holds}"), "\\text{if }{x}\\text{ holds}");
+        assert_eq!(super::clean_math("a$b"), "a\\$b");
     }
 
     #[test]
