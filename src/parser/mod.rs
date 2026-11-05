@@ -4868,11 +4868,20 @@ impl Parser {
                         break;
                     }
                     seen_value |= used.chars().any(|c| c.is_ascii_digit());
-                    if has_rest {
+                    // `plus.66pt`: a keyword directly followed by its value
+                    let ends_with_keyword = ["plus", "minus", "by", "at", "scaled", "to", "spread"]
+                        .iter()
+                        .any(|k| used.trim_end().ends_with(k));
+                    if has_rest && !ends_with_keyword {
                         break;
                     }
                 }
                 Token::Command(name) => {
+                    // the kernel's glue keywords \@plus / \@minus
+                    if matches!(name.as_str(), "@plus" | "@minus") && seen_value {
+                        self.advance();
+                        continue;
+                    }
                     let is_value_command = self.tex_registers.contains(&name)
                         || knowledge::tex_assignment(&name).is_some_and(|(operands, v)| operands == 0 && v)
                         || matches!(name.as_str(), "z@" | "p@" | "@ne" | "m@ne" | "tw@" | "thr@@" | "sixt@@n" | "@m" | "@M" | "@MM" | "maxdimen" | "fill" | "fil" | "textwidth" | "linewidth" | "columnwidth" | "paperwidth" | "baselineskip" | "parindent" | "the" | "numexpr" | "dimexpr" | "glueexpr" | "number" | "value" | "ht" | "wd" | "dp" | "count" | "dimen" | "skip");
@@ -5005,26 +5014,9 @@ impl Parser {
 
     /// Read the character code after `\char`.
     fn read_char_code(&mut self) -> Option<char> {
-        self.skip_whitespace_only();
-        match self.current_token().clone() {
-            Token::Text(t) => {
-                self.advance();
-                let (radix, digits) = if let Some(rest) = t.strip_prefix('"') {
-                    (16, rest)
-                } else if let Some(rest) = t.strip_prefix('\'') {
-                    (8, rest)
-                } else {
-                    (10, t.as_str())
-                };
-                let numeric: String = digits.chars().take_while(|c| c.is_digit(radix)).collect();
-                let rest = digits[numeric.len()..].to_string();
-                if !rest.is_empty() {
-                    self.push_front(vec![Token::Text(rest)]);
-                }
-                u32::from_str_radix(&numeric, radix).ok().and_then(char::from_u32)
-            }
-            _ => None,
-        }
+        // decimal, "hex, 'octal, or a character constant (\char`\\)
+        let code = self.read_char_or_number()?;
+        u32::try_from(code).ok().and_then(char::from_u32)
     }
 
     /// `\endinput`/`\bye`: skip to the end of the current input file
@@ -5638,7 +5630,10 @@ impl Parser {
         // The engine's own primitives are never replaced: a document that
         // seems to redefine \def or \begin was mis-read (an active `%` read
         // as a comment, catcode tricks), and obeying would wreck the rest
-        if !name.is_empty() && !is_engine_primitive(name) {
+        // A package's logo built from kerns and boxes (\LaTeX as L\kern-.36em
+        // \raise...): the plain-text logo reads better in Markdown
+        let typeset_logo = self.macro_processor.is_builtin(name) && is_low_level_typesetting(&body);
+        if !name.is_empty() && !is_engine_primitive(name) && !typeset_logo {
             // \edef/\xdef expand their body when defined (so a definition
             // may refer to the macro's own previous value)
             let body = if std::mem::take(&mut self.macro_def_expand) {
@@ -7167,6 +7162,14 @@ fn is_builtin_structural_env(name: &str) -> bool {
             | "gather*" | "multline" | "multline*" | "eqnarray" | "eqnarray*" | "thebibliography"
             | "center" | "flushleft" | "flushright" | "minipage" | "frame" | "proof"
     )
+}
+
+/// Body text that only places glyphs (kerning, raised boxes, font
+/// switches): visual construction with no Markdown counterpart.
+fn is_low_level_typesetting(body: &str) -> bool {
+    ["\\kern", "\\raise", "\\lower", "\\hbox", "\\vbox", "\\sbox", "\\setbox", "\\fontsize", "\\@LaTeX", "\\hskip-", "\\reserved@a"]
+        .iter()
+        .any(|m| body.contains(m))
 }
 
 /// Control sequences the parser itself is built on; definitions of them

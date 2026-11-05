@@ -271,6 +271,11 @@ impl MacroProcessor {
     }
 
     /// Check if a macro is defined
+    /// Whether `name` is one of the built-in text macros (logos, ...).
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtins.contains_key(name)
+    }
+
     pub fn is_defined(&self, state: &ParserState, name: &str) -> bool {
         state.macros.contains_key(name) || self.builtins.contains_key(name)
     }

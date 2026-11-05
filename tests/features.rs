@@ -559,3 +559,15 @@ fn redefined_builtin_environment_keeps_its_parser() {
     let doc = "\\makeatletter\\renewenvironment{quote}{\\list{}{}\\item\\relax}{\\endlist}\\makeatother\\newenvironment{docspec}{\\begin{quote}}{\\end{quote}}\\begin{docspec}Inside.\\end{docspec}\n\n\\section{After}\nText.";
     has(doc, "> Inside.\n\n## After");
 }
+
+#[test]
+fn typeset_logo_redefinitions_keep_the_text_logo() {
+    has("\\def\\Bib{{\\sc B\\kern-.05em}}\\def\\BibTeX{\\Bib\\kern-.04em \\TeX}\\def\\bfBibTeX{\\textbf{Bib}\\TeX}\\let\\BibTeX=\\bfBibTeX The \\BibTeX{} style.", "The BibTeX style.");
+    has("\\makeatletter\\DeclareRobustCommand{\\LaTeX}{L\\kern-.36em\\raise.3ex\\hbox{A}\\kern-.15em\\TeX}\\makeatother Use \\LaTeX.", "Use LaTeX.");
+}
+
+#[test]
+fn glue_keywords_without_spaces() {
+    has("\\makeatletter A \\abovedisplayskip=2pt plus.66pt minus.66pt B \\belowdisplayshortskip=\\p@\\@plus 2\\p@\\@minus\\p@ C", "A B C");
+    has("{\\tt \\char`\\\\title} \\char65", "`\\title` A");
+}

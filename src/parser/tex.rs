@@ -1056,6 +1056,13 @@ impl Parser {
             }
         };
 
+        // a built-in logo keeps its text (\let\BibTeX=\bfBibTeX picks a
+        // font variant, meant for a group)
+        if self.macro_processor.is_builtin(&target)
+            && matches!(&source, Token::Command(name) if self.state.macros.contains_key(name))
+        {
+            return Ok(());
+        }
         self.state.aliases.remove(&target);
         match source {
             Token::Command(name) if name == target => {}
