@@ -60,6 +60,14 @@ fn is_known_defined(name: &str) -> bool {
     )
 }
 
+/// An operand of `\if`: a character, an unexpandable control sequence
+/// (all of which compare equal under `\if`), or end of input.
+enum IfOperand {
+    Char(char),
+    Unexpandable,
+    End,
+}
+
 /// What stopped a skipped conditional branch.
 enum BranchEnd {
     Else,
@@ -102,6 +110,73 @@ impl Parser {
                 self.parse_let()?;
                 return Ok(Some(None));
             }
+            // LaTeX kernel control helpers (optional-argument idioms)
+            "@ifnextchar" | "kernel@ifnextchar" | "new@ifnextchar" | "@ifnextchar@sp" => {
+                self.parse_ifnextchar()?;
+                return Ok(Some(None));
+            }
+            "@ifstar" | "@ifstar@sp" => {
+                let yes = self.take_branch_tokens();
+                let no = self.take_branch_tokens();
+                self.skip_whitespace_only();
+                let starred = matches!(self.current_token(), Token::Text(t) if t.starts_with('*'));
+                if starred {
+                    self.consume_text_star_prefix();
+                }
+                self.push_front(if starred { yes } else { no });
+                return Ok(Some(None));
+            }
+            "@ifundefined" | "@ifpackageloaded" | "@ifclassloaded" | "@ifpackagewith"
+            | "@ifclasswith" | "IfFileExists" | "InputIfFileExists" | "@ifdefinable"
+            | "IfPackageLoadedTF" | "IfClassLoadedTF" | "IfFormatAtLeastTF"
+            | "@ifl@t@r" | "IfPackageAtLeastTF" => {
+                self.skip_whitespace_and_comments();
+                let subject = self.parse_braced_text()?;
+                if matches!(cmd, "@ifpackagewith" | "@ifclasswith" | "@ifl@t@r" | "IfPackageAtLeastTF") {
+                    self.skip_whitespace_and_comments();
+                    let _ = self.parse_braced_text()?;
+                }
+                let yes = self.take_branch_tokens();
+                let no = self.take_branch_tokens();
+                let value = match cmd {
+                    "@ifundefined" => !self.is_defined_command(subject.trim().trim_start_matches('\\')),
+                    "@ifdefinable" => true,
+                    // We behave as a current LaTeX with the usual packages
+                    _ => true,
+                };
+                if cmd == "InputIfFileExists" {
+                    // \InputIfFileExists{file}{before}{else}: run `before`;
+                    // the file itself is resolved like \input
+                    let mut tokens = vec![Token::Command(String::from("input")), Token::LeftBrace, Token::Text(subject), Token::RightBrace];
+                    tokens.splice(0..0, yes);
+                    self.push_front(tokens);
+                    return Ok(Some(None));
+                }
+                self.push_front(if value { yes } else { no });
+                return Ok(Some(None));
+            }
+            "@firstoftwo" | "@secondoftwo" | "@firstofone" | "@gobble" | "@gobbletwo"
+            | "@gobblefour" | "use_i:nn" | "use_ii:nn" | "use:n" | "use_none:n"
+            | "use_none:nn" | "@iden" => {
+                let (keep, take) = match cmd {
+                    "@firstoftwo" | "use_i:nn" => (Some(0), 2),
+                    "@secondoftwo" | "use_ii:nn" => (Some(1), 2),
+                    "@firstofone" | "use:n" | "@iden" => (Some(0), 1),
+                    "@gobble" | "use_none:n" => (None, 1),
+                    "@gobbletwo" | "use_none:nn" => (None, 2),
+                    _ => (None, 4),
+                };
+                let mut groups = Vec::new();
+                for _ in 0..take {
+                    groups.push(self.take_branch_tokens());
+                }
+                if let Some(index) = keep {
+                    let chosen = std::mem::take(&mut groups[index]);
+                    self.push_front(chosen);
+                }
+                return Ok(Some(None));
+            }
+            "@empty" | "@nil" | "@nnil" | "@sptoken" => return Ok(Some(None)),
             "texed@endpackage" => {
                 if let Some(was_preamble) = self.package_preamble_restore.pop() {
                     self.in_preamble = was_preamble;
@@ -239,6 +314,9 @@ impl Parser {
 
     /// Is `name` a primitive-style conditional (terminated by `\fi`)?
     pub(super) fn is_tex_conditional(&self, name: &str) -> bool {
+        if name == "if" {
+            return !self.state.macros.contains_key(name);
+        }
         if name.len() <= 2 || !name.starts_with("if") || name == "iff" {
             return false;
         }
@@ -277,9 +355,66 @@ impl Parser {
         Ok(())
     }
 
+    /// `\@ifnextchar<c>{yes}{no}`: peek at the next non-space token.
+    fn parse_ifnextchar(&mut self) -> Result<()> {
+        self.skip_whitespace_only();
+        // The test character: a single token (often `[`, `(`, `*`, `\bgroup`)
+        let test = self.current_token().clone();
+        self.advance();
+        let yes = self.take_branch_tokens();
+        let no = self.take_branch_tokens();
+        // \@ifnextchar skips spaces before peeking
+        while matches!(self.current_token(), Token::Whitespace(_) | Token::Newline) {
+            self.advance();
+        }
+        let next = self.current_token();
+        let matches = match (&test, next) {
+            (Token::LeftBracket, Token::LeftBracket) => true,
+            (Token::RightBracket, Token::RightBracket) => true,
+            (Token::Command(c), Token::LeftBrace) if c == "bgroup" => true,
+            (Token::Command(c), Token::RightBrace) if c == "egroup" => true,
+            (Token::Command(a), Token::Command(b)) => a == b,
+            (Token::Text(a), Token::Text(b)) => a.chars().next() == b.chars().next(),
+            (Token::Tilde, Token::Tilde) | (Token::Ampersand, Token::Ampersand) => true,
+            (Token::Backslash, Token::Backslash) => true,
+            _ => false,
+        };
+        self.push_front(if matches { yes } else { no });
+        Ok(())
+    }
+
+    /// One branch argument: a braced group's tokens, or a single token.
+    fn take_branch_tokens(&mut self) -> Vec<Token> {
+        self.skip_whitespace_and_comments();
+        if matches!(self.current_token(), Token::LeftBrace) {
+            self.collect_braced_tokens()
+        } else if self.is_at_end() {
+            Vec::new()
+        } else {
+            let token = self.current_token().clone();
+            self.advance();
+            vec![token]
+        }
+    }
+
+    /// Consume a leading `*` from the current text token.
+    fn consume_text_star_prefix(&mut self) {
+        if let Token::Text(t) = self.current_token().clone() {
+            if let Some(rest) = t.strip_prefix('*') {
+                self.advance();
+                if !rest.is_empty() {
+                    self.push_front(vec![Token::Text(rest.to_string())]);
+                }
+            }
+        }
+    }
+
     /// Determine a conditional's truth value, consuming its operands.
     /// `None` means it cannot be decided statically.
     fn evaluate_conditional(&mut self, cmd: &str) -> Result<Option<bool>> {
+        if cmd == "ifmmode" {
+            return Ok(Some(self.in_math_expansion));
+        }
         // \newif booleans first: a document's own \ifdraft wins over defaults
         if let Some(value) = cmd
             .strip_prefix("if")
@@ -310,14 +445,20 @@ impl Parser {
                 Ok(self.compare_ifx(a, b))
             }
             "if" | "ifcat" => {
-                let a = self.next_significant_token();
-                let b = self.next_significant_token();
-                let a = a.map(|t| self.token_to_string(&t));
-                let b = b.map(|t| self.token_to_string(&t));
-                Ok(match (a, b) {
-                    (Some(a), Some(b)) => Some(a.chars().next() == b.chars().next()),
-                    _ => None,
-                })
+                let a = self.read_if_operand(0);
+                let b = self.read_if_operand(0);
+                Ok(Some(match (a, b) {
+                    (IfOperand::Char(x), IfOperand::Char(y)) => {
+                        if cmd == "if" {
+                            x == y
+                        } else {
+                            x.is_alphabetic() == y.is_alphabetic()
+                        }
+                    }
+                    (IfOperand::Unexpandable, IfOperand::Unexpandable) => true,
+                    (IfOperand::End, _) | (_, IfOperand::End) => return Ok(None),
+                    _ => false,
+                }))
             }
             "ifnum" | "ifdim" => Ok(self.read_comparison()),
             "ifodd" => Ok(self.read_tex_number().map(|n| n % 2 == 1)),
@@ -327,6 +468,79 @@ impl Parser {
                 }
                 Ok(None)
             }
+        }
+    }
+
+    /// Read one operand of `\if`/`\ifcat`, expanding as TeX does:
+    /// `\detokenize{}`/`\string` produce characters, macros expand, and an
+    /// expansion that produces nothing makes `\if` read further.
+    fn read_if_operand(&mut self, depth: usize) -> IfOperand {
+        if depth > 16 {
+            return IfOperand::End;
+        }
+        self.skip_whitespace_and_comments();
+        if self.is_at_end() {
+            return IfOperand::End;
+        }
+        let token = self.current_token().clone();
+        self.advance();
+        match token {
+            Token::Text(t) => {
+                let mut chars = t.chars();
+                let first = chars.next();
+                let rest: String = chars.collect();
+                if !rest.is_empty() {
+                    self.push_front(vec![Token::Text(rest)]);
+                }
+                first.map_or(IfOperand::End, IfOperand::Char)
+            }
+            Token::Command(name) if matches!(name.as_str(), "detokenize" | "unexpanded") => {
+                self.skip_whitespace_and_comments();
+                let text = self.parse_braced_text().unwrap_or_default();
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    self.read_if_operand(depth + 1)
+                } else {
+                    let mut chars = text.chars();
+                    let first = chars.next().unwrap();
+                    let rest: String = chars.collect();
+                    if !rest.is_empty() {
+                        self.push_front(vec![Token::Text(rest)]);
+                    }
+                    IfOperand::Char(first)
+                }
+            }
+            Token::Command(name) if name == "string" => {
+                let next = self.current_token().clone();
+                self.advance();
+                match next {
+                    Token::Command(_) => IfOperand::Char('\\'),
+                    Token::Text(t) => t.chars().next().map_or(IfOperand::End, IfOperand::Char),
+                    _ => IfOperand::Unexpandable,
+                }
+            }
+            Token::Command(name) if self.state.macros.contains_key(&name) => {
+                let args = self.parse_macro_arguments(&name).unwrap_or_default();
+                let body = self
+                    .state
+                    .macros
+                    .get(&name)
+                    .map(|d| crate::state::substitute_params(&d.body, &args))
+                    .unwrap_or_default();
+                if self.consume_expansion_budget(&name) {
+                    self.push_front(lex_fragment(&body));
+                    self.read_if_operand(depth + 1)
+                } else {
+                    IfOperand::Unexpandable
+                }
+            }
+            Token::LeftBrace => IfOperand::Char('{'),
+            Token::RightBrace => IfOperand::Char('}'),
+            Token::LeftBracket => IfOperand::Char('['),
+            Token::RightBracket => IfOperand::Char(']'),
+            Token::Ampersand => IfOperand::Char('&'),
+            Token::Tilde => IfOperand::Unexpandable,
+            _ => IfOperand::Unexpandable,
         }
     }
 
@@ -800,9 +1014,22 @@ impl Parser {
     }
 }
 
-/// Lex a fragment into tokens (without the trailing Eof).
+/// Lex a macro body / fragment into tokens (without the trailing Eof).
+///
+/// Bodies are stored as text, so the `\makeatletter` state in force when a
+/// macro was defined is gone; a body that refers to `\@name` control
+/// sequences was necessarily defined with `@` as a letter, so it is
+/// re-lexed that way.
 pub(super) fn lex_fragment(fragment: &str) -> Vec<Token> {
-    let mut tokens = Lexer::new(fragment).tokenize().unwrap_or_default();
+    let at_letter = fragment
+        .as_bytes()
+        .windows(3)
+        .any(|w| w[0] == b'\\' && w[1] == b'@' && w[2].is_ascii_alphabetic())
+        || fragment.contains("@@");
+    let mut tokens = Lexer::new(fragment)
+        .with_at_letter(at_letter)
+        .tokenize()
+        .unwrap_or_default();
     if matches!(tokens.last(), Some(Token::Eof)) {
         tokens.pop();
     }
@@ -864,4 +1091,174 @@ fn split_braced(text: &str) -> (&str, &str) {
         }
     }
     (&text[1..], "")
+}
+
+/// Control helpers evaluated when expanding macros inside math.
+fn is_math_control_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "@ifnextchar" | "kernel@ifnextchar" | "new@ifnextchar" | "@ifstar" | "@ifundefined"
+            | "@ifpackageloaded" | "@ifclassloaded" | "@firstoftwo" | "@secondoftwo"
+            | "@firstofone" | "@gobble" | "@gobbletwo" | "@gobblefour" | "@iden" | "csname"
+            | "else" | "fi" | "or" | "expandafter" | "noexpand" | "protect" | "relax"
+            | "xspace" | "ensuremath" | "@empty" | "mathchoice" | "ifthenelse" | "iftoggle"
+            | "ifbool" | "ifdef" | "ifundef" | "unskip" | "ignorespaces" | "nobreak"
+            | "leavevmode" | "@nil" | "begingroup" | "endgroup"
+    )
+}
+
+impl Parser {
+    /// Expand document macros inside a math formula with the full TeX
+    /// token engine (delimited parameters, `\@ifnextchar`, conditionals,
+    /// `\let` aliases), serializing the result back to math source.
+    /// Commands that are not document macros are left untouched for the
+    /// math renderer.
+    pub(super) fn expand_math_with_engine(&mut self, math: &str, display: bool) -> String {
+        let needs_engine = math.contains('\\') && {
+            let bytes = math.as_bytes();
+            let mut i = 0;
+            let mut found = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < bytes.len() && (bytes[end].is_ascii_alphabetic() || bytes[end] == b'@') {
+                        end += 1;
+                    }
+                    if end > start {
+                        let name = &math[start..end];
+                        if self.state.macros.contains_key(name)
+                            || self.state.aliases.contains_key(name)
+                            || self.is_tex_conditional(name)
+                            || is_math_control_helper(name)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    i = end.max(i + 1);
+                } else {
+                    i += 1;
+                }
+            }
+            found
+        };
+        if !needs_engine {
+            return math.to_string();
+        }
+
+        let at_letter = math.contains("\\@");
+        let mut tokens = Lexer::new(math)
+            .with_math_mode(true)
+            .with_at_letter(at_letter)
+            .tokenize()
+            .unwrap_or_default();
+        if matches!(tokens.last(), Some(Token::Eof)) {
+            tokens.pop();
+        }
+
+        let saved_tokens = std::mem::replace(&mut self.tokens, super::reverse_tokens(tokens));
+        let saved_expansions = std::mem::take(&mut self.active_expansions);
+        let saved_cond = std::mem::take(&mut self.cond_depth);
+        let saved_in_math = std::mem::replace(&mut self.in_math_expansion, true);
+
+        let mut out = String::with_capacity(math.len());
+        let mut guard = 0usize;
+        while !self.is_at_end() && guard < 2_000_000 && out.len() < 1_000_000 {
+            guard += 1;
+            let token = self.current_token().clone();
+            match &token {
+                Token::Command(name) if self.state.macros.contains_key(name) => {
+                    self.advance();
+                    let expandable = self
+                        .state
+                        .macros
+                        .get(name)
+                        .is_some_and(|d| d.num_params <= 9);
+                    if !expandable {
+                        push_math_piece(&mut out, &format!("\\{}", name));
+                        continue;
+                    }
+                    let args = self.parse_macro_arguments(name).unwrap_or_default();
+                    let body = self
+                        .state
+                        .macros
+                        .get(name)
+                        .map(|d| crate::state::substitute_params(&d.body, &args))
+                        .unwrap_or_default();
+                    if self.consume_expansion_bytes(name, body.len()) && self.consume_expansion_budget(name) {
+                        let at = body.contains("\\@");
+                        let mut expansion = Lexer::new(&body)
+                            .with_math_mode(true)
+                            .with_at_letter(at)
+                            .tokenize()
+                            .unwrap_or_default();
+                        if matches!(expansion.last(), Some(Token::Eof)) {
+                            expansion.pop();
+                        }
+                        self.push_front(expansion);
+                    } else {
+                        push_math_piece(&mut out, &format!("\\{}", name));
+                    }
+                }
+                Token::Command(name) if self.state.aliases.contains_key(name) => {
+                    self.advance();
+                    let target = self.state.aliases[name].clone();
+                    push_math_piece(&mut out, &format!("\\{}", target));
+                }
+                Token::Command(name) if name == "mathchoice" => {
+                    self.advance();
+                    let mut styles = Vec::new();
+                    for _ in 0..4 {
+                        styles.push(self.take_branch_tokens());
+                    }
+                    let chosen = std::mem::take(&mut styles[if display { 0 } else { 1 }]);
+                    self.push_front(chosen);
+                }
+                Token::Command(name)
+                    if matches!(name.as_str(), "xspace" | "protect" | "relax" | "ensuremath"
+                        | "expandafter" | "noexpand" | "unskip" | "ignorespaces" | "nobreak"
+                        | "leavevmode" | "@empty" | "@nil" | "begingroup" | "endgroup") =>
+                {
+                    self.advance();
+                }
+                Token::Command(name)
+                    if is_math_control_helper(name) || self.is_tex_conditional(name) =>
+                {
+                    let name = name.clone();
+                    self.advance();
+                    let _ = self.parse_tex_command(&name);
+                }
+                other => {
+                    let piece = self.token_to_string(other);
+                    self.advance();
+                    push_math_piece(&mut out, &piece);
+                }
+            }
+        }
+        // Anything left after hitting a limit is kept verbatim
+        while !self.is_at_end() {
+            let piece = self.token_to_string(&self.current_token().clone());
+            self.advance();
+            push_math_piece(&mut out, &piece);
+        }
+
+        self.tokens = saved_tokens;
+        self.active_expansions = saved_expansions;
+        self.cond_depth = saved_cond;
+        self.in_math_expansion = saved_in_math;
+        out
+    }
+}
+
+/// Append serialized math, separating a control word from a following
+/// letter so `\alpha` + `b` never fuses into `\alphab`.
+fn push_math_piece(out: &mut String, piece: &str) {
+    if piece.chars().next().is_some_and(|c| c.is_alphabetic()) {
+        let tail: Vec<char> = out.chars().rev().take_while(|c| c.is_alphabetic() || *c == '@').collect();
+        if !tail.is_empty() && out[..out.len() - tail.iter().map(|c| c.len_utf8()).sum::<usize>()].ends_with('\\') {
+            out.push(' ');
+        }
+    }
+    out.push_str(piece);
 }

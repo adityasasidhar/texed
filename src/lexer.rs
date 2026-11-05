@@ -86,6 +86,9 @@ pub struct Lexer {
     at_letter: bool,
     /// expl3 syntax (`\ExplSyntaxOn`): `_` and `:` are letters
     expl_syntax: bool,
+    /// Lexing math content: no text ligatures or smart quotes, escaped
+    /// characters keep their backslash, no raw environment capture.
+    math_mode: bool,
 }
 
 impl Lexer {
@@ -97,7 +100,15 @@ impl Lexer {
             column: 1,
             at_letter: false,
             expl_syntax: false,
+            math_mode: false,
         }
+    }
+
+    /// Lex math content (for macro expansion inside formulas): the
+    /// resulting tokens serialize back to exactly the original math.
+    pub fn with_math_mode(mut self, math_mode: bool) -> Self {
+        self.math_mode = math_mode;
+        self
     }
 
     /// Treat `@` as a letter from the start (for .sty/.cls files).
@@ -129,6 +140,45 @@ impl Lexer {
 
         let ch = self.current_char();
         
+        if self.math_mode {
+            match ch {
+                '\\' => return self.lex_command(),
+                '{' => {
+                    self.advance();
+                    return Ok(Some(Token::LeftBrace));
+                }
+                '}' => {
+                    self.advance();
+                    return Ok(Some(Token::RightBrace));
+                }
+                '[' => {
+                    self.advance();
+                    return Ok(Some(Token::LeftBracket));
+                }
+                ']' => {
+                    self.advance();
+                    return Ok(Some(Token::RightBracket));
+                }
+                '&' => {
+                    self.advance();
+                    return Ok(Some(Token::Ampersand));
+                }
+                ' ' | '\t' | '\r' | '\n' => {
+                    let mut ws = String::new();
+                    while !self.is_at_end() && matches!(self.current_char(), ' ' | '\t' | '\r' | '\n') {
+                        ws.push(self.current_char());
+                        self.advance();
+                    }
+                    return Ok(Some(Token::Whitespace(ws)));
+                }
+                _ => {
+                    // Each other character is its own token (as in TeX math)
+                    self.advance();
+                    return Ok(Some(Token::Text(ch.to_string())));
+                }
+            }
+        }
+
         // Handle smart quotes
         if ch == '`' {
             if self.peek_char() == Some('`') {
@@ -201,6 +251,12 @@ impl Lexer {
             return Ok(Some(Token::Backslash));
         }
 
+        if self.math_mode && !ch.is_alphabetic() && !(ch == '@' && self.at_letter) {
+            // Control symbols are kept verbatim in math: \, \; \! \| \{ \$ ...
+            self.advance();
+            return Ok(Some(Token::Command(ch.to_string())));
+        }
+
         if ch == '[' {
             self.advance();
             return self.lex_display_math_bracket();
@@ -261,6 +317,22 @@ impl Lexer {
             // Unknown control symbol: keep the symbol itself as text
             self.advance();
             return Ok(Some(Token::Text(ch.to_string())));
+        }
+
+        if self.math_mode {
+            // In math only environment names need structure; everything
+            // else is a plain control word
+            return Ok(Some(match cmd_name.as_str() {
+                "begin" | "end" => {
+                    self.skip_inline_spaces_before_group();
+                    match self.read_simple_group() {
+                        Some(name) if cmd_name == "begin" => Token::BeginEnvironment(name),
+                        Some(name) => Token::EndEnvironment(name),
+                        None => Token::Command(cmd_name),
+                    }
+                }
+                _ => Token::Command(cmd_name),
+            }));
         }
 
         // \verb|...| and friends capture raw content with arbitrary delimiters

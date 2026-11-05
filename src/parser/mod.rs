@@ -26,7 +26,7 @@ const MAX_PENDING_TOKENS: usize = 4_000_000;
 /// Baseline for the total bytes all macro expansions may produce; the
 /// effective budget adds a multiple of the source size. Guards against
 /// macros whose arguments grow on every recursion (`\a{#1#1}`).
-const BASE_EXPANSION_BYTES: usize = 8 * 1024 * 1024;
+const BASE_EXPANSION_BYTES: usize = 64 * 1024 * 1024;
 
 
 /// Maximum recursion depth of block/inline parsing. Real documents nest a
@@ -83,7 +83,7 @@ pub enum Block {
         display_name: String,
         number: Option<String>,
         label: Option<String>,
-        title: Option<String>,
+        title: Option<Vec<Inline>>,
         content: Vec<Block>,
     },
     RawBlock(String),
@@ -186,6 +186,8 @@ pub struct Parser {
     list_depth: usize,
     /// Before `\begin{document}` (only when the source has one).
     in_preamble: bool,
+    /// Expanding macros inside math (`\ifmmode` is true).
+    in_math_expansion: bool,
     /// `\end{document}` was reached (possibly inside an included file).
     document_ended: bool,
     /// Preamble state to restore when each loaded package ends.
@@ -246,6 +248,7 @@ impl Parser {
             macro_def_tex_style: false,
             list_depth: 0,
             in_preamble: false,
+            in_math_expansion: false,
             document_ended: false,
             package_preamble_restore: Vec::new(),
             cond_depth: 0,
@@ -354,7 +357,12 @@ impl Parser {
                     self.resolve_references_in_inlines(caption);
                 }
             }
-            Block::TheoremLike { content, .. } => self.resolve_references_in_blocks(content),
+            Block::TheoremLike { content, title, .. } => {
+                if let Some(title) = title {
+                    self.resolve_references_in_inlines(title);
+                }
+                self.resolve_references_in_blocks(content)
+            }
             Block::CodeBlock { .. }
             | Block::Verbatim(_)
             | Block::DisplayMath(_)
@@ -651,8 +659,9 @@ impl Parser {
                 Ok(None)
             }
             Token::DisplayMath(content) => {
-                let content = self.expand_macros_in_math(content);
+                let content = content.clone();
                 self.advance();
+                let content = self.expand_macros_in_math(&content);
                 Ok(Some(Block::DisplayMath(content)))
             }
             Token::VerbatimEnv { name, content } => {
@@ -674,6 +683,8 @@ impl Parser {
             | Token::Cite { .. }
             | Token::Verb(_)
             | Token::Tilde
+            | Token::LeftBracket
+            | Token::RightBracket
             | Token::Backslash => self.parse_paragraph(),
             _ => {
                 self.advance();
@@ -837,12 +848,7 @@ impl Parser {
         if fragment.trim().is_empty() {
             return Ok(());
         }
-        let mut lexer = Lexer::new(fragment);
-        let mut tokens = lexer.tokenize()?;
-        if matches!(tokens.last(), Some(Token::Eof)) {
-            tokens.pop();
-        }
-        self.push_front(tokens);
+        self.push_front(tex::lex_fragment(fragment));
         Ok(())
     }
 
@@ -1838,19 +1844,25 @@ impl Parser {
                 within: None,
             });
         let number = self.state.next_theorem_number(env_type);
-        let title = if matches!(self.current_token(), Token::LeftBracket) {
-            self.advance();
-            let title_text = self.read_until_token(Token::RightBracket);
-            if matches!(self.current_token(), Token::RightBracket) {
-                self.advance();
+        // Optional [title], parsed as inline LaTeX (may hold math, \cite, ...)
+        let mut label = None;
+        let mut lookahead = 0;
+        while matches!(self.peek_at(lookahead), Some(Token::Whitespace(_))) {
+            lookahead += 1;
+        }
+        let title = if matches!(self.peek_at(lookahead), Some(Token::LeftBracket)) {
+            self.skip_n(lookahead);
+            let tokens = self.collect_bracketed_tokens();
+            let (inlines, title_label) = self.parse_inline_fragment_tokens(tokens)?;
+            if title_label.is_some() {
+                label = title_label;
             }
-            Some(title_text)
+            Some(trim_inline_whitespace(inlines)).filter(|t| !t.is_empty())
         } else {
             None
         };
 
         let mut content = Vec::new();
-        let mut label = None;
 
         while !self.is_at_end() {
             self.skip_whitespace_and_comments();
@@ -1879,7 +1891,7 @@ impl Parser {
                 theorem_label.clone(),
                 LabelType::Other(theorem_def.display_name.clone()),
                 theorem_number.clone(),
-                title.clone(),
+                title.as_ref().map(|t| self.inlines_to_plain_text(t)),
             );
         }
 
@@ -1983,9 +1995,10 @@ impl Parser {
                 Ok(Some(Inline::Space))
             }
             Token::InlineMath(content) => {
-                let content = self.expand_macros_in_math(content);
+                let content = content.clone();
                 self.advance();
-                Ok(Some(Inline::InlineMath(content)))
+                let expanded = self.expand_math_with_engine(&content, false);
+                Ok(Some(Inline::InlineMath(math::clean_math(&expanded))))
             }
             Token::Command(cmd) => self.parse_inline_command(cmd.clone()),
             Token::LeftBrace => self.parse_braced_group(),
@@ -2941,12 +2954,7 @@ impl Parser {
             }
             // Re-lex the expansion and splice it into the token stream so the
             // body is fully parsed (formatting, math, nested macros, ...).
-            let mut lexer = Lexer::new(&expanded);
-            let mut tokens = lexer.tokenize()?;
-            if matches!(tokens.last(), Some(Token::Eof)) {
-                tokens.pop();
-            }
-            self.push_front(tokens);
+            self.push_front(tex::lex_fragment(&expanded));
             Ok(None)
         } else {
             Ok(Some(Inline::Text(format!("\\{}", cmd))))
@@ -3508,6 +3516,7 @@ impl Parser {
                         tokens.pop();
                     }
                     tokens.push(Token::Command(String::from("texed@endfile")));
+                    self.account_source_tokens(&tokens);
                     self.push_front(tokens);
                 }
             }
@@ -3524,8 +3533,9 @@ impl Parser {
     /// Expand user-defined macros inside math content, so constructs like
     /// \newcommand{\R}{\mathbb{R}} render in Markdown math (KaTeX/MathJax
     /// don't know document macros).
-    fn expand_macros_in_math(&self, content: &str) -> String {
-        math::expand_math(content, &self.state.macros)
+    fn expand_macros_in_math(&mut self, content: &str) -> String {
+        let expanded = self.expand_math_with_engine(content, true);
+        math::clean_math(&expanded)
     }
 
     /// Parse a string of LaTeX as a sequence of inlines, sharing all parser
@@ -3635,6 +3645,10 @@ impl Parser {
         child.macro_expansions = self.macro_expansions;
         child.macro_budget = self.macro_budget.saturating_add(child.macro_budget);
         child.expanded_bytes = self.expanded_bytes;
+        child.source_token_count = self.source_token_count.saturating_add(child.source_token_count);
+        for (name, count) in &self.source_command_counts {
+            *child.source_command_counts.entry(name.clone()).or_insert(0) += count;
+        }
 
         let include_base = self
             .include_system
@@ -3650,6 +3664,8 @@ impl Parser {
         self.macro_expansions = child.macro_expansions;
         self.macro_budget = child.macro_budget;
         self.expanded_bytes = child.expanded_bytes;
+        self.source_token_count = child.source_token_count;
+        self.source_command_counts = std::mem::take(&mut child.source_command_counts);
         self.in_preamble = child.in_preamble;
         if child.document_ended {
             self.tokens.clear();
@@ -4079,6 +4095,7 @@ impl Parser {
             }
             // Package code is set-up only, even if it contains stray text
             tokens.push(Token::Command(String::from("texed@endpackage")));
+            self.account_source_tokens(&tokens);
             let was_preamble = self.in_preamble;
             self.in_preamble = true;
             self.package_preamble_restore.push(was_preamble);
@@ -4086,9 +4103,23 @@ impl Parser {
         }
     }
 
+    /// Tokens read from another source file count as source: they grow the
+    /// expansion budgets like the main file's tokens do.
+    fn account_source_tokens(&mut self, tokens: &[Token]) {
+        self.source_token_count = self.source_token_count.saturating_add(tokens.len());
+        self.macro_budget = self
+            .macro_budget
+            .saturating_add(tokens.len().saturating_mul(4));
+        for token in tokens {
+            if let Token::Command(name) = token {
+                *self.source_command_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
     /// Charge `bytes` of expansion output against the document's budget.
     fn consume_expansion_bytes(&mut self, name: &str, bytes: usize) -> bool {
-        let limit = BASE_EXPANSION_BYTES.saturating_add(self.source_token_count.saturating_mul(256));
+        let limit = BASE_EXPANSION_BYTES.saturating_add(self.source_token_count.saturating_mul(1024));
         self.expanded_bytes = self.expanded_bytes.saturating_add(bytes);
         if self.expanded_bytes > limit {
             if self.refused_macros.insert(name.to_string()) {
@@ -4272,6 +4303,40 @@ fn text_symbol_command(cmd: &str) -> Option<&'static str> {
         "textbackslash" => "\\",
         "textasciitilde" => "~",
         "textasciicircum" => "^",
+        "textasciigrave" => "`",
+        "textasciiacute" => "\u{00B4}",
+        "textasciidieresis" => "\u{00A8}",
+        "textquotedbl" => "\"",
+        "textquotesingle" => "'",
+        "textbraceleft" => "{",
+        "textbraceright" => "}",
+        "textdollar" => "$",
+        "textnumbersign" => "#",
+        "textpercent" => "%",
+        "textampersand" => "&",
+        "textasteriskcentered" => "*",
+        "textbullet" => "\u{2022}",
+        "textonehalf" => "\u{00BD}",
+        "textonequarter" => "\u{00BC}",
+        "textthreequarters" => "\u{00BE}",
+        "textordfeminine" => "\u{00AA}",
+        "textordmasculine" => "\u{00BA}",
+        "textlangle" => "\u{27E8}",
+        "textrangle" => "\u{27E9}",
+        "textleftarrow" => "\u{2190}",
+        "textrightarrow" => "\u{2192}",
+        "textuparrow" => "\u{2191}",
+        "textdownarrow" => "\u{2193}",
+        "textcelsius" => "\u{2103}",
+        "textbaht" => "\u{0E3F}",
+        "textwon" => "\u{20A9}",
+        "textnaira" => "\u{20A6}",
+        "textlira" => "\u{20A4}",
+        "textrecipe" => "\u{211E}",
+        "textestimated" => "\u{212E}",
+        "textinterrobang" => "\u{203D}",
+        "textreferencemark" => "\u{203B}",
+        "textmusicalnote" => "\u{266A}",
         "textbar" => "|",
         "textless" => "<",
         "textgreater" => ">",

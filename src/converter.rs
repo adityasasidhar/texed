@@ -9,6 +9,13 @@ pub struct MarkdownConverter {
     output: String,
     in_table: bool,
     frontmatter: bool,
+    /// Nesting of emphasis/strong while rendering inlines (LaTeX toggles:
+    /// \emph inside \emph is upright)
+    emph_depth: usize,
+    strong_depth: usize,
+    /// Kind of the list block just emitted, so two adjacent lists of the
+    /// same kind are kept apart instead of merging in Markdown
+    last_list: Option<char>,
 }
 
 impl MarkdownConverter {
@@ -17,6 +24,9 @@ impl MarkdownConverter {
             output: String::new(),
             in_table: false,
             frontmatter: true,
+            emph_depth: 0,
+            strong_depth: 0,
+            last_list: None,
         }
     }
 
@@ -31,7 +41,7 @@ impl MarkdownConverter {
     pub fn render_inlines_fragment(inlines: &[Inline]) -> String {
         let mut converter = Self::new();
         let _ = converter.convert_inlines(inlines);
-        converter.output.trim().to_string()
+        finalize_brackets(&escape_line_starts(converter.output.trim()))
     }
 
     pub fn convert(&mut self, document: Document) -> Result<String> {
@@ -64,7 +74,8 @@ impl MarkdownConverter {
             let mut numbers: Vec<&usize> = document.footnotes.keys().collect();
             numbers.sort();
             for num in numbers {
-                writeln!(self.output, "[^{}]: {}", num, document.footnotes[num]).unwrap();
+                let text = document.footnotes[num].replace('\n', "\n    ");
+                writeln!(self.output, "[^{}]: {}", num, text).unwrap();
             }
         }
 
@@ -75,10 +86,32 @@ impl MarkdownConverter {
             self.output.push_str(bibliography);
         }
 
-        Ok(std::mem::take(&mut self.output))
+        // Literal brackets not yet resolved by a paragraph-level pass
+        Ok(finalize_brackets(&std::mem::take(&mut self.output)))
     }
 
     fn convert_block(&mut self, block: &Block) -> Result<()> {
+        let list_kind = match block {
+            Block::BulletList(_) => Some('-'),
+            Block::OrderedList { .. } => Some('1'),
+            Block::DescriptionList(_) => Some('-'),
+            Block::Composite(_) | Block::Null => {
+                return self.convert_block_inner(block);
+            }
+            _ => None,
+        };
+        if let (Some(kind), Some(last)) = (list_kind, self.last_list) {
+            if kind == last && self.output.ends_with("\n\n") {
+                // Two consecutive lists of one kind would merge into one
+                self.output.push_str("<!-- -->\n\n");
+            }
+        }
+        self.convert_block_inner(block)?;
+        self.last_list = list_kind;
+        Ok(())
+    }
+
+    fn convert_block_inner(&mut self, block: &Block) -> Result<()> {
         match block {
             Block::Section { level, title, label } => {
                 self.convert_section(*level, title, label.as_deref())?;
@@ -154,12 +187,29 @@ impl MarkdownConverter {
         // so \section (level 1) maps to ##, \subsection to ###, and so on.
         let md_level = (level + 1).min(6);
 
+        // A heading is one line: line breaks in the title become spaces
+        let heading = self.render_inlines_trimmed(title)?;
+        let mut heading = heading
+            .split('\n')
+            .map(|line| line.trim_end_matches(' '))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if heading.is_empty() && label.is_none() {
+            return Ok(());
+        }
+        // A trailing " #" would be read as a closing sequence
+        if heading.ends_with('#') {
+            let trimmed = heading.trim_end_matches('#');
+            if trimmed.is_empty() || trimmed.ends_with(' ') {
+                let hashes = heading.len() - trimmed.len();
+                heading = format!("{}{}", trimmed, "\\#".repeat(hashes));
+            }
+        }
+
         for _ in 0..md_level {
             self.output.push('#');
         }
         self.output.push(' ');
-
-        let heading = self.render_inlines_trimmed(title)?;
         self.output.push_str(&heading);
 
         if let Some(label) = label {
@@ -177,6 +227,7 @@ impl MarkdownConverter {
 
         let text = self.render_inlines_trimmed(inlines)?;
         if !text.is_empty() {
+            let text = finalize_brackets(&escape_line_starts(&text));
             self.output.push_str(&text);
             self.output.push_str("\n\n");
         }
@@ -248,29 +299,29 @@ impl MarkdownConverter {
         Ok(())
     }
 
+    /// Description lists render as bullet items led by the bold term:
+    /// `- **Term**: description` (portable, unlike definition-list syntax).
     fn convert_description_list(&mut self, items: &[(Vec<Inline>, Vec<Block>)]) -> Result<()> {
         for (term, description) in items {
-            // Term in bold
-            self.output.push_str("**");
-            self.convert_inlines(term)?;
-            self.output.push_str("**\n");
-
-            // Description indented
-            for block in description {
-                self.output.push_str(": ");
-                
-                let saved_output = std::mem::take(&mut self.output);
-                self.convert_block(block)?;
-                let desc_content = self.output.trim_end().to_string();
-                self.output = saved_output;
-
-                self.output.push_str(&desc_content);
-                self.output.push('\n');
+            let term_text = self.render_inlines_trimmed(term)?;
+            let mut blocks: Vec<Block> = description.clone();
+            if !term_text.is_empty() {
+                let mut lead = vec![Inline::Strong(term.clone())];
+                match blocks.first_mut() {
+                    Some(Block::Paragraph(inlines)) => {
+                        lead.push(Inline::Text(String::from(":")));
+                        if !inlines.is_empty() {
+                            lead.push(Inline::Space);
+                        }
+                        lead.append(inlines);
+                        *inlines = lead;
+                    }
+                    _ => blocks.insert(0, Block::Paragraph(lead)),
+                }
             }
-
-            self.output.push('\n');
+            self.convert_list_item("- ", &blocks)?;
         }
-
+        self.output.push('\n');
         Ok(())
     }
 
@@ -299,13 +350,25 @@ impl MarkdownConverter {
     }
 
     fn convert_code_block(&mut self, language: Option<&str>, content: &str) -> Result<()> {
-        self.output.push_str("```");
+        // The fence must be longer than any backtick run in the code
+        let longest = longest_run(content, '`');
+        let fence = "`".repeat((longest + 1).max(3));
+        self.output.push_str(&fence);
         if let Some(lang) = language {
-            self.output.push_str(lang);
+            let lang: String = lang
+                .trim()
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '`')
+                .collect();
+            self.output.push_str(&lang);
         }
         self.output.push('\n');
-        self.output.push_str(content.trim_end());
-        self.output.push_str("\n```\n\n");
+        let body = content.trim_end();
+        let body = body.strip_prefix('\n').unwrap_or(body);
+        self.output.push_str(body);
+        self.output.push('\n');
+        self.output.push_str(&fence);
+        self.output.push_str("\n\n");
         Ok(())
     }
 
@@ -314,8 +377,17 @@ impl MarkdownConverter {
     }
 
     fn convert_display_math(&mut self, content: &str) -> Result<()> {
+        // A blank line would end the math block in Markdown renderers
+        let body: Vec<&str> = content
+            .trim()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        if body.is_empty() {
+            return Ok(());
+        }
         self.output.push_str("$$\n");
-        self.output.push_str(content.trim());
+        self.output.push_str(&body.join("\n").replace("$$", "$ $"));
         self.output.push_str("\n$$\n\n");
         Ok(())
     }
@@ -458,13 +530,12 @@ impl MarkdownConverter {
 
     fn convert_figure(&mut self, caption: Option<&Vec<Inline>>, path: &str, label: Option<&str>) -> Result<()> {
         self.output.push_str("![");
-        
         if let Some(cap) = caption {
-            self.convert_inlines(cap)?;
+            let alt = self.render_inlines_trimmed(cap)?;
+            self.output.push_str(&escape_all_brackets(&alt.replace('\n', " ")));
         }
-        
         self.output.push_str("](");
-        self.output.push_str(path);
+        self.output.push_str(&markdown_url(path));
         self.output.push(')');
 
         if let Some(label) = label {
@@ -481,9 +552,13 @@ impl MarkdownConverter {
         display_name: &str,
         number: Option<&str>,
         label: Option<&str>,
-        title: Option<&str>,
+        title: Option<&[Inline]>,
         content: &[Block],
     ) -> Result<()> {
+        let title = match title {
+            Some(inlines) => Some(self.render_inlines_trimmed(inlines)?.replace('\n', " ")),
+            None => None,
+        };
         // Convert to blockquote with bold header
         self.output.push_str("> **");
         if display_name.is_empty() {
@@ -496,9 +571,9 @@ impl MarkdownConverter {
             self.output.push_str(n);
         }
         
-        if let Some(t) = title {
+        if let Some(t) = title.filter(|t| !t.is_empty()) {
             self.output.push_str(" (");
-            self.output.push_str(t);
+            self.output.push_str(&t);
             self.output.push(')');
         }
 
@@ -537,6 +612,55 @@ impl MarkdownConverter {
         Ok(())
     }
 
+    /// Render `content` wrapped in a Markdown delimiter run (`*`, `**`,
+    /// `~~`), falling back to the equivalent HTML tag where CommonMark's
+    /// flanking rules would make the delimiters inert. Whitespace at the
+    /// edges is moved outside; empty content renders nothing.
+    fn convert_delimited(&mut self, content: &[Inline], delimiter: &str, tag: &str) -> Result<()> {
+        let saved = std::mem::take(&mut self.output);
+        let result = self.convert_inlines(content);
+        let inner = std::mem::replace(&mut self.output, saved);
+        result?;
+
+        let leading_ws = inner.len() - inner.trim_start().len();
+        let trailing_ws = inner.len() - inner.trim_end().len();
+        let core = inner.trim();
+        if core.is_empty() {
+            if !inner.is_empty() && !self.output.ends_with(' ') && !self.output.is_empty() {
+                self.output.push(' ');
+            }
+            return Ok(());
+        }
+        if leading_ws > 0 && !self.output.ends_with([' ', '\n']) && !self.output.is_empty() {
+            self.output.push(' ');
+        }
+
+        let delim_char = delimiter.chars().next().unwrap();
+        let prev = self.output.chars().next_back();
+        let first = core.chars().next().unwrap();
+        let last = core.chars().next_back().unwrap();
+        let use_html = core.contains('\n')
+            // adjacent delimiter runs (`*a***b**`) are ambiguous
+            || prev == Some(delim_char)
+            || first == delim_char
+            || last == delim_char
+            // `x*(y)*`: an opening run between a letter and punctuation is
+            // not left-flanking
+            || (prev.is_some_and(|c| c.is_alphanumeric()) && is_md_punctuation(first))
+            || (is_md_punctuation(last) && prev.is_some_and(|c| c.is_alphanumeric()));
+        if use_html {
+            write!(self.output, "<{}>{}</{}>", tag, core, tag).unwrap();
+        } else {
+            self.output.push_str(delimiter);
+            self.output.push_str(core);
+            self.output.push_str(delimiter);
+        }
+        if trailing_ws > 0 {
+            self.output.push(' ');
+        }
+        Ok(())
+    }
+
     fn render_inlines_trimmed(&mut self, inlines: &[Inline]) -> Result<String> {
         let saved_output = std::mem::take(&mut self.output);
         self.convert_inlines(inlines)?;
@@ -571,19 +695,31 @@ impl MarkdownConverter {
                 }
             }
             Inline::Emph(content) => {
-                self.output.push('*');
-                self.convert_inlines(content)?;
-                self.output.push('*');
+                if self.emph_depth > 0 {
+                    // \emph inside \emph switches back to upright
+                    self.emph_depth -= 1;
+                    let result = self.convert_inlines(content);
+                    self.emph_depth += 1;
+                    result?;
+                } else {
+                    self.emph_depth += 1;
+                    let result = self.convert_delimited(content, "*", "em");
+                    self.emph_depth -= 1;
+                    result?;
+                }
             }
             Inline::Strong(content) => {
-                self.output.push_str("**");
-                self.convert_inlines(content)?;
-                self.output.push_str("**");
+                if self.strong_depth > 0 {
+                    self.convert_inlines(content)?;
+                } else {
+                    self.strong_depth += 1;
+                    let result = self.convert_delimited(content, "**", "strong");
+                    self.strong_depth -= 1;
+                    result?;
+                }
             }
             Inline::Strikeout(content) => {
-                self.output.push_str("~~");
-                self.convert_inlines(content)?;
-                self.output.push_str("~~");
+                self.convert_delimited(content, "~~", "del")?;
             }
             Inline::Underline(content) => {
                 // Markdown doesn't have native underline, use HTML
@@ -613,16 +749,29 @@ impl MarkdownConverter {
                 } else {
                     code.clone()
                 };
-                // Code containing backticks needs a longer fence and padding
-                if code.contains('`') {
-                    self.output.push_str("`` ");
-                    self.output.push_str(&code);
-                    self.output.push_str(" ``");
+                let code = code.replace('\n', " ");
+                if code.is_empty() {
+                    // `` is not a code span
                 } else {
-                    self.output.push('`');
+                    // The fence must be longer than any backtick run inside;
+                    // pad when the code starts/ends with a backtick or space
+                    let fence = "`".repeat(longest_run(&code, '`') + 1);
+                    let pad = code.starts_with('`')
+                        || code.ends_with('`')
+                        || (code.starts_with(' ') && code.ends_with(' ') && !code.trim().is_empty());
+                    self.output.push_str(&fence);
+                    if pad {
+                        self.output.push(' ');
+                    }
                     self.output.push_str(&code);
-                    self.output.push('`');
+                    if pad {
+                        self.output.push(' ');
+                    }
+                    self.output.push_str(&fence);
                 }
+            }
+            Inline::InlineMath(math) if math.trim().is_empty() => {
+                // `$$` would open display math in Markdown: emit nothing
             }
             Inline::InlineMath(math) => {
                 let math = if self.in_table {
@@ -631,14 +780,32 @@ impl MarkdownConverter {
                     math.clone()
                 };
                 self.output.push('$');
-                self.output.push_str(math.trim());
+                self.output.push_str(&math.trim().replace('\n', " "));
                 self.output.push('$');
             }
             Inline::Link { text, url, title } => {
+                let rendered = self.render_inlines_trimmed(text)?;
+                let plain_url = url.trim();
+                // \url{https://...}: an autolink is the cleanest form
+                if title.is_none()
+                    && is_autolinkable(plain_url)
+                    && text.len() == 1
+                    && matches!(&text[0], Inline::Text(t) if t.trim() == plain_url)
+                {
+                    self.output.push('<');
+                    self.output.push_str(plain_url);
+                    self.output.push('>');
+                    return Ok(());
+                }
+                let rendered = if rendered.is_empty() {
+                    escape_markdown_text(plain_url, false)
+                } else {
+                    rendered
+                };
                 self.output.push('[');
-                self.convert_inlines(text)?;
+                self.output.push_str(&escape_all_brackets(&rendered.replace('\n', " ")));
                 self.output.push_str("](");
-                self.output.push_str(url);
+                self.output.push_str(&markdown_url(plain_url));
                 if let Some(t) = title {
                     self.output.push_str(" \"");
                     self.output.push_str(t);
@@ -647,10 +814,11 @@ impl MarkdownConverter {
                 self.output.push(')');
             }
             Inline::Image { alt, url, title } => {
+                let rendered = self.render_inlines_trimmed(alt)?;
                 self.output.push_str("![");
-                self.convert_inlines(alt)?;
+                self.output.push_str(&escape_all_brackets(&rendered.replace('\n', " ")));
                 self.output.push_str("](");
-                self.output.push_str(url);
+                self.output.push_str(&markdown_url(url.trim()));
                 if let Some(t) = title {
                     self.output.push_str(" \"");
                     self.output.push_str(t);
@@ -724,10 +892,11 @@ impl Default for MarkdownConverter {
 /// Kept minimal: only characters that realistically appear in LaTeX text and
 /// change Markdown semantics.
 fn escape_markdown_text(text: &str, in_table: bool) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '*' | '_' | '`' | '$' => {
+            '\\' | '*' | '_' | '`' | '$' | '<' | '~' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -735,10 +904,168 @@ fn escape_markdown_text(text: &str, in_table: bool) -> String {
                 out.push('\\');
                 out.push(ch);
             }
+            // `&name;` / `&#123;` would be decoded as an HTML entity; the
+            // following text may be a separate token, so decide later
+            '&' => out.push(AMPERSAND),
+            // Brackets only form links in specific patterns; decided once
+            // the whole paragraph is known (see finalize_brackets)
+            '[' => out.push(OPEN_BRACKET),
+            ']' => out.push(CLOSE_BRACKET),
             _ => out.push(ch),
         }
     }
     out
+}
+
+/// Placeholders for literal brackets from document text (Unicode private
+/// use characters, never present in real output).
+const OPEN_BRACKET: char = '\u{F8F0}';
+const CLOSE_BRACKET: char = '\u{F8F1}';
+const AMPERSAND: char = '\u{F8F2}';
+
+/// Resolve literal-bracket placeholders: plain brackets, unless the text
+/// contains a sequence Markdown would read as link syntax (`](`, `][`,
+/// `]:`), in which case every literal bracket is escaped.
+fn finalize_brackets(text: &str) -> String {
+    let text = &finalize_ampersands(text);
+    if !text.contains([OPEN_BRACKET, CLOSE_BRACKET]) {
+        return text.to_string();
+    }
+    let risky = text
+        .char_indices()
+        .any(|(i, c)| c == CLOSE_BRACKET && text[i + c.len_utf8()..].starts_with(['(', '[', ':', OPEN_BRACKET]));
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            OPEN_BRACKET if risky => out.push_str("\\["),
+            CLOSE_BRACKET if risky => out.push_str("\\]"),
+            OPEN_BRACKET => out.push('['),
+            CLOSE_BRACKET => out.push(']'),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Resolve literal-ampersand placeholders: escaped only where they would
+/// start an HTML entity reference (`&amp;`, `&#35;`, `&#x41;`).
+fn finalize_ampersands(text: &str) -> String {
+    if !text.contains(AMPERSAND) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        if c != AMPERSAND {
+            out.push(c);
+            continue;
+        }
+        let rest = &text[i + c.len_utf8()..];
+        let name_len = rest
+            .char_indices()
+            .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || *ch == '#')
+            .count();
+        if name_len > 0 && rest[name_len..].starts_with(';') {
+            out.push_str("\\&");
+        } else {
+            out.push('&');
+        }
+    }
+    out
+}
+
+/// Escape every literal bracket (inside link text and image alt text).
+fn escape_all_brackets(text: &str) -> String {
+    finalize_ampersands(text)
+        .replace(OPEN_BRACKET, "\\[")
+        .replace(CLOSE_BRACKET, "\\]")
+}
+
+/// Escape characters at the start of each line that Markdown would read as
+/// block syntax: headings, quotes, list markers, setext underlines.
+fn escape_line_starts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 4);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let (lead, rest) = line.split_at(indent);
+        out.push_str(lead);
+        out.push_str(&escape_block_start(rest));
+    }
+    out
+}
+
+fn escape_block_start(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let Some(&first) = bytes.first() else {
+        return String::new();
+    };
+    let followed_by_space_or_end = |n: usize| bytes.get(n).is_none_or(|b| *b == b' ' || *b == b'\t');
+    match first {
+        b'#' => {
+            let hashes = bytes.iter().take_while(|&&b| b == b'#').count();
+            if hashes <= 6 && followed_by_space_or_end(hashes) {
+                return format!("\\{}", line);
+            }
+        }
+        b'>' => return format!("\\{}", line),
+        b'-' | b'+' | b'*' if followed_by_space_or_end(1) => return format!("\\{}", line),
+        b'=' | b'-' if line.trim_end().bytes().all(|b| b == first) => return format!("\\{}", line),
+        b'0'..=b'9' => {
+            let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits <= 9 && matches!(bytes.get(digits), Some(b'.') | Some(b')')) && followed_by_space_or_end(digits + 1) {
+                return format!("{}\\{}", &line[..digits], &line[digits..]);
+            }
+        }
+        _ => {}
+    }
+    line.to_string()
+}
+
+/// ASCII punctuation as defined by CommonMark (for flanking rules).
+fn is_md_punctuation(c: char) -> bool {
+    c.is_ascii_punctuation() || matches!(c, '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}' | '\u{2013}' | '\u{2014}' | '\u{2026}')
+}
+
+/// Length of the longest run of `ch` in `text`.
+fn longest_run(text: &str, ch: char) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for c in text.chars() {
+        if c == ch {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+/// Is this URL safe to emit as an autolink `<url>`?
+fn is_autolinkable(url: &str) -> bool {
+    let has_scheme = url
+        .split_once(':')
+        .is_some_and(|(scheme, rest)| {
+            (2..=32).contains(&scheme.len())
+                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+                && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                && !rest.is_empty()
+        });
+    has_scheme && !url.contains(|c: char| c.is_whitespace() || c == '<' || c == '>' || c.is_control())
+}
+
+/// Make a URL safe as a Markdown link destination.
+fn markdown_url(url: &str) -> String {
+    let needs_brackets = url.contains(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>')
+        || url.is_empty();
+    let url = url.replace('\n', "");
+    if needs_brackets {
+        format!("<{}>", url.replace('<', "%3C").replace('>', "%3E"))
+    } else {
+        url
+    }
 }
 
 /// Quote a YAML scalar when needed.

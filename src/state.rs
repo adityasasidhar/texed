@@ -513,6 +513,14 @@ pub fn substitute_params(body: &str, args: &[String]) -> String {
                     chars.next();
                     let index = d as usize - '1' as usize;
                     if let Some(arg) = args.get(index) {
+                        // `\foo#1` with #1 = "x" must not become `\foox`:
+                        // in TeX they are separate tokens, so separate them
+                        // with a (tokenizer-ignored) space
+                        if arg.starts_with(|c: char| c.is_alphabetic() || c == '@')
+                            && ends_with_control_word(&out)
+                        {
+                            out.push(' ');
+                        }
                         out.push_str(arg);
                     }
                 }
@@ -523,6 +531,16 @@ pub fn substitute_params(body: &str, args: &[String]) -> String {
         }
     }
     out
+}
+
+/// Does the text end with a control word (`\\name`)?
+fn ends_with_control_word(text: &str) -> bool {
+    let trimmed = text.trim_end_matches(|c: char| c.is_alphabetic() || c == '@');
+    trimmed.len() < text.len() && trimmed.ends_with('\\') && {
+        // the backslash itself must not be escaped (`\\\\foo` is a line break + foo)
+        let backslashes = trimmed.chars().rev().take_while(|&c| c == '\\').count();
+        backslashes % 2 == 1
+    }
 }
 
 /// Sectioning level of a counter name (`chapter` = 0, `section` = 1, ...).
