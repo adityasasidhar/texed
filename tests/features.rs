@@ -665,3 +665,14 @@ fn document_environment_wrapping_a_list_wins() {
     let doc = "\\newenvironment{itemize*}{\\begin{itemize}\\setlength{\\itemsep}{0pt}}{\\end{itemize}}\n\\begin{itemize*}\\item a\\item b\\end{itemize*}\n\nAfter.";
     has(doc, "- a\n- b\n\nAfter.");
 }
+
+#[test]
+fn chapter_fragment_showing_document_markup() {
+    // a chapter (no \documentclass) whose examples mention \begin{document}
+    let chapter = "\\chapter{Basics}\nIntro text.\n\\begin{code}\n  \\ltx|\\begin{document}|\n\\end{code}\nMiddle text.\n\\begin{code}\n  \\ltx|\\end{document}|\n\\end{code}\nFinal text.";
+    has(chapter, "Intro text.");
+    has(chapter, "Middle text.");
+    has(chapter, "Final text.");
+    // a real fragment preamble still is one
+    lacks("\\usepackage{amsmath}\\newcommand\\x{y}\nSetup junk\n\\begin{document}\nBody\\end{document}", "Setup junk");
+}

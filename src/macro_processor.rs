@@ -76,6 +76,9 @@ impl MacroProcessor {
             ("biber", "Biber"),
             ("TikZ", "TikZ"),
             ("PGF", "PGF"),
+            // pgfmanual's own names, for chapters converted on their own
+            ("tikzname", "TikZ"),
+            ("pgfname", "PGF"),
             ("ExTeX", "ExTeX"),
             ("TeXLive", "TeX Live"),
             ("MiKTeX", "MiKTeX"),

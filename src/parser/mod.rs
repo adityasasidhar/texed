@@ -201,6 +201,8 @@ pub struct Parser {
     list_depth: usize,
     /// Before `\begin{document}` (only when the source has one).
     in_preamble: bool,
+    /// A `\begin{document}` was reached (its `\end` then ends the input).
+    document_begun: bool,
     /// Expanding macros inside math (`\ifmmode` is true).
     in_math_expansion: bool,
     /// Re-entrancy guard for label-key expansion.
@@ -308,6 +310,7 @@ impl Parser {
             macro_def_expand: false,
             list_depth: 0,
             in_preamble: false,
+            document_begun: false,
             in_math_expansion: false,
             normalizing_label: false,
             tex_registers: HashSet::new(),
@@ -356,10 +359,7 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Document> {
-        self.in_preamble = self
-            .tokens
-            .iter()
-            .any(|t| matches!(t, Token::BeginEnvironment(env) if env == "document"));
+        self.in_preamble = has_preamble(self.tokens.iter().rev());
         let mut blocks = self.parse_blocks()?;
 
         // Bibliography must load before the resolution pass: author-year
@@ -733,7 +733,10 @@ impl Parser {
             // TeX stops reading at \end{document} — the real one: at top
             // level of the main file (an \end{document} nested in another
             // environment or in an included file is part of an example)
-            Token::EndEnvironment(env) if env == "document" && self.depth <= 1 && self.input_stack.is_empty() => {
+            // (a fragment that never began a document shows one in an example)
+            Token::EndEnvironment(env)
+                if env == "document" && self.depth <= 1 && self.input_stack.is_empty() && self.document_begun =>
+            {
                 self.tokens.clear();
                 self.document_ended = true;
                 Ok(None)
@@ -966,6 +969,7 @@ impl Parser {
             "document" => {
                 // The body starts: content is typeset from here on
                 self.in_preamble = false;
+                self.document_begun = true;
                 Ok(None)
             }
             "abstract" => self.parse_abstract(),
@@ -6775,7 +6779,9 @@ impl Parser {
                 Token::EndEnvironment(env) => {
                     if let Some(pos) = open.iter().rposition(|o| o == env) {
                         open.truncate(pos);
-                    } else if env == "document" || self.state.environments.contains_key(env) || !env.is_empty() {
+                    } else if env == "document" && !self.document_begun {
+                        // a fragment's code example (lshort's \ltx|\end{document}|)
+                    } else if !env.is_empty() {
                         // closes an enclosing environment: stop here
                         break;
                     }
@@ -8375,6 +8381,30 @@ fn is_overlay_spec(text: &str) -> bool {
         && text[1..text.len() - 1]
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '+' | ',' | '|' | '.' | '@' | ' ' | '(' | ')'))
+}
+
+/// Whether the source (tokens in document order) has a preamble: a
+/// `\begin{document}` after a top-level `\documentclass`, or in a class-less fragment
+/// one outside any environment and before any sectioning. A chapter showing `\begin{document}` in a
+/// code example (lshort's `\ltx|\begin{document}|`) has none.
+fn has_preamble<'a>(tokens: impl Iterator<Item = &'a Token>) -> bool {
+    let mut depth = 0usize;
+    let mut class = false;
+    let mut sectioned = false;
+    for token in tokens {
+        match token {
+            Token::BeginEnvironment(env) if env == "document" => {
+                return class || (depth == 0 && !sectioned);
+            }
+            Token::BeginEnvironment(_) => depth += 1,
+            Token::EndEnvironment(_) => depth = depth.saturating_sub(1),
+            Token::Command(cmd) if depth == 0 && (cmd == "documentclass" || cmd == "documentstyle") => class = true,
+            Token::Section(..) => sectioned = true,
+            Token::Command(cmd) if sectioning_level(cmd).is_some() => sectioned = true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The body of a complete LaTeX document (between `\begin{document}` and
