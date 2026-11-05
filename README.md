@@ -8,9 +8,9 @@ A fast and comprehensive command-line tool written in Rust to convert LaTeX docu
 
 ## Features
 
-- **Converts real documents**: papers, theses, books (tested on the Stacks Project, the HoTT book, the C++ standard draft, LaTeX's own documentation, journal templates and LaTeX 2.09-era sources), beamer slides, package documentation
+- **Converts real documents**: papers, theses, books (tested on ~9,600 files: the Stacks Project, the HoTT book, the C++ standard draft, the Open Logic Project, *The Not So Short Introduction to LaTeX*, the TikZ manual, LaTeX's own documentation, journal templates and LaTeX 2.09-era sources), beamer slides, package documentation, `subfiles` chapters
 - **Faithful numbering and cross-references**: sections, `\section*`, `\appendix` (A, B, ...), per-chapter numbering in books, equations (per row in `align`), floats numbered by `\caption`, theorems with shared/scoped counters, subfigures (`1a`), cleveref-style `\cref{a,b}` → "sections 1 and 2"
-- **A real TeX macro layer**: `\newcommand`, `\def` with delimited parameters, `\let`, `\newif` and `\if...\else...\fi`, `\@ifnextchar`, `\csname`, xparse, local `.sty` files — and document macros are expanded *inside math* so formulas render in KaTeX/MathJax
+- **A real TeX macro layer**: `\newcommand`, `\def` with delimited parameters, `\let`, `\expandafter`, `\newif` and `\if...\else...\fi`, `\@ifnextchar`, `\csname`, xparse, expl3 (`\cs_new:Npn`, token lists, `\use:x`), etoolbox lists, babel shorthands, local `.sty` files — and document macros are expanded *inside math* so formulas render in KaTeX/MathJax
 - **Packages**: amsmath, amsthm/thmtools, hyperref, cleveref, graphicx, subcaption/subfig, booktabs, longtable, threeparttable, multirow, listings, minted, algorithmicx/algorithm2e, siunitx, glossaries/acronym/acro, natbib/biblatex, beamer, TikZ (kept as code), etoolbox/ifthen, and many more
 - **Markdown-safe output**: literal text can never turn into Markdown syntax — verified by round-tripping random special-character text through a CommonMark parser
 - **Robust by construction**: never panics, hangs, or blows up on malformed or adversarial input (see [Robustness](#robustness))
@@ -284,7 +284,8 @@ fn main() {
 - `\part`, `\chapter`, `\section`, `\subsection`, `\subsubsection`, `\paragraph`, `\subparagraph` (starred variants too; H1 is reserved for the document title, so `\section` maps to `##`)
 - `\title`, `\author` (incl. `\and`/`\And`/`\AND`), `\date`, `\maketitle`, `\thanks` — emitted as YAML frontmatter plus a title block
 - `\label`, `\ref`, `\eqref`, `\autoref`, `\nameref`, `\pageref`, `\cref`/`\Cref`/`\vref`, `\crefrange`, `\namecref`, `\labelcref` — resolved in a second pass, so **forward references work**; cleveref lists are grouped and pluralized (`\cref{a,b,f}` → "sections 1 and 2 and fig. 3")
-- `\input`/`\include`/`\import`/`\subfile` (also mid-paragraph or inside a table), `\usepackage`/`\RequirePackage`/`\documentclass` (local `.sty`/`.cls` files next to the document are read, so their macros and theorem definitions apply), `\graphicspath`, `\endinput`
+- `\input`/`\include`/`\import`/`\subfile` (also mid-paragraph or inside a table), `\usepackage`/`\RequirePackage`/`\documentclass` (local `.sty`/`.cls` files next to the document are read, so their macros and theorem definitions apply), `\graphicspath`, `\endinput`, `\IfFileExists`/`\InputIfFileExists` (local files checked)
+- `\documentclass[main]{subfiles}`: a chapter converted on its own reads the main document's preamble
 - Preamble handling: material before `\begin{document}` is set-up only; text after `\end{document}` is ignored, exactly as in LaTeX
 - Numbering: `\appendix`, per-chapter numbering in book/report classes, `\setcounter`, `\addtocounter`, `\numberwithin`, `\thesection`/`\arabic`/`\roman`/`\alph`
 - `\keywords` and `keywords`/`IEEEkeywords` environments
@@ -296,7 +297,9 @@ fn main() {
 - Declaration groups: `{\bf ...}`, `{\em ...}`, `{\itshape ...}`, `{\scshape ...}`, ...
 - `\verb|...|`, `\verb*`, `\lstinline` with arbitrary delimiters
 - `\MakeUppercase`/`\MakeLowercase`, `\enquote`, `\mbox`/`\fbox`/`\parbox`/`\makebox`/`\raisebox`/`\resizebox`/`\scalebox` (content preserved)
-- `\textcolor`/`\colorbox` (content preserved)
+- `\textcolor`/`\colorbox`/`\fcolorbox` (content preserved)
+- babel: German shorthands (`"a` → ä, `"s` → ß, `` "` `` → „) with `german`/`ngerman`, `\defineshorthand`
+- `\marginpar`, `\marginnote`, `\todo`, reledmac apparatus notes → footnotes; pifont `\ding`, `\email`, `\lipsum`
 
 ### Special Characters & Typography
 - Escapes: `\%`, `\$`, `\&`, `\#`, `\_`, `\{`, `\}`, `\textbackslash`, ...
@@ -330,9 +333,10 @@ fn main() {
 ### Other Environments
 - `quote`, `quotation`, `displayquote`, `verse`, `abstract`
 - `verbatim` (captured raw — `%`, `$`, `\` inside code are safe), `lstlisting` (with `language=`), `minted`, `alltt`, `comment` (dropped)
-- `center`, `flushleft`, `flushright`, `minipage`, `multicols`, `titlepage` (transparent)
+- `center`, `flushleft`, `flushright`, `minipage`, `multicols`, `titlepage`, `trivlist`, `preview`, `letter` (transparent); `tabbing` (lines and `\>` cells)
+- Floats declared by `\newfloat`/`\DeclareFloatingEnvironment` and minted's `listing`: numbered captions (`**Listing 3.1:** ...`) and cross-references
 - Theorem-like: built-in `theorem`/`lemma`/`proof`/... plus `\newtheorem{...}[shared]{...}[within]` with correct scoped numbering
-- `tikzpicture`, `tikzcd`, `circuitikz`, `pspicture`, `forest` preserved verbatim as LaTeX code blocks; asymptote/gnuplot/luacode/pycode as code blocks
+- `tikzpicture`, `tikzcd`, `circuitikz`, `pspicture`, `forest`, `picture`, bussproofs `prooftree` preserved verbatim as LaTeX code blocks; asymptote/gnuplot/luacode/pycode as code blocks; `\inputminted`/`\lstinputlisting` read the file
 - Undefined theorem-like names (`defn`, `prop`, `rmk*`, ...) render as theorems; unknown environments are preserved as fenced LaTeX
 - Pseudocode: `algorithm` floats with `algorithmic`/`algpseudocode` (`\State`, `\If`...`\EndIf`, `\Procedure`, ...), classic `\STATE`/`\IF`, and `algorithm2e` (`\If{c}{...}`, `\eIf`, `\ForEach`, `\KwIn`, `\;`) → numbered, indented lines with bold keywords and live math
 - beamer: frames become headings (`\frametitle`, subtitles), `block`/`alertblock`, `columns`; overlay specifications (`\item<2->`, `\only`, `\uncover`, `\alt`, `\pause`) are resolved to the final slide
@@ -349,7 +353,8 @@ fn main() {
 - `\cite`, `\citep`, `\citet`, `\citeauthor`, `\citeyear`, `\parencite`, `\textcite`, ... with prenotes/postnotes
 - **Numeric and author-year styles**: `\bibliographystyle{plainnat/apalike/...}` and `\usepackage[style=authoryear]{biblatex}` switch to natbib-style rendering — `Knuth (1984)`, `(Lamport, 1994; Knuth, 1984)`, `(see Goossens et al., 1993, p. 5)`
 - Citations render in a post-parse pass, so numbers stay consistent with the References list even when the style/bibliography is declared at the end of the document
-- `.bib` files via `\bibliography`/`\addbibresource` (robust character-level BibTeX parser: single-line entries, nested braces, quoted values, `@string`/`@comment`) → rendered References section
+- `.bib` files via `\bibliography`/`\addbibresource` (robust BibTeX parser: single-line entries, nested braces, quoted values, `@string` abbreviations, `#` concatenation, month names, recovery from unclosed entries) → References section; field values are LaTeX and rendered like document text (accents, `\emph`, `\url`, escaping)
+- biblatex `\citetitle`, `\citeurl`, `\fullcite`, `\cites` (multicite), `\citefield`
 - `thebibliography`/`\bibitem` → numbered References section with resolved `[n]` markers
 
 ### Units, Acronyms, Glossaries
